@@ -260,7 +260,11 @@ class parsl_task_queue():
                 results_list.append(task.result())
                 del self.task_list[taski]
             elif task_status == 'failed':
-                failed_number += failed_number
+                failed_number += 1
+                try:
+                    task.result()
+                except Exception as exc:
+                    print('Task failed with exception: {:s}: {:s}'.format(type(exc).__name__, str(exc)))
                 del self.task_list[taski]
 
         return results_list, failed_number

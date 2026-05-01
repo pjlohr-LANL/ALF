@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import pickle
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -106,8 +107,13 @@ def _load_manifest_from_cache(
         formula_filter=formula_filter,
     )
     if cache_path is not None and cache_path.exists():
-        with open(cache_path, "rb") as handle:
-            manifest = pickle.load(handle)
+        try:
+            with open(cache_path, "rb") as handle:
+                manifest = pickle.load(handle)
+        except (EOFError, pickle.UnpicklingError, OSError):
+            return None
+        if not isinstance(manifest, dict) or "h5_groups" not in manifest or "seed" not in manifest:
+            return None
         _MANIFEST_CACHE[cache_key] = manifest
         return manifest
     return None
@@ -134,8 +140,10 @@ def _store_manifest_in_cache(
         formula_filter=formula_filter,
     )
     if cache_path is not None:
-        with open(cache_path, "wb") as handle:
+        with tempfile.NamedTemporaryFile("wb", dir=cache_path.parent, delete=False) as handle:
+            temp_path = Path(handle.name)
             pickle.dump(manifest, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temp_path, cache_path)
 
 
 def _build_h5_manifest(

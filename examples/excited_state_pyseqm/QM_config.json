@@ -1,0 +1,5 @@
+{
+  "method": "AM1",
+  "scf_eps": 1.0e-10,
+  "cis_tol": 1.0e-8
+}

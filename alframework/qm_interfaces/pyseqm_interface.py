@@ -122,10 +122,13 @@ def _pyseqm_device(gpus_per_node: int | None = None):
 
     if not torch.cuda.is_available():
         return torch.device("cpu")
-    if gpus_per_node is None or int(gpus_per_node) <= 0:
+    visible_device_count = int(torch.cuda.device_count())
+    if visible_device_count <= 0:
+        return torch.device("cpu")
+    if visible_device_count == 1:
         return torch.device("cuda:0")
     worker_rank = int(os.environ.get("PARSL_WORKER_RANK", "0"))
-    return torch.device(f"cuda:{worker_rank % int(gpus_per_node)}")
+    return torch.device(f"cuda:{worker_rank % visible_device_count}")
 
 
 def label_excited_state_molecule(
