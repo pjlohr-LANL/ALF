@@ -67,6 +67,26 @@ ML_task_queue = parsl_task_queue()
 builder_task_queue = parsl_task_queue()
 sampler_task_queue = parsl_task_queue()
 
+
+def _flatten_molecule_output(output):
+    """Normalize stage outputs that may be a MoleculesObject or nested lists."""
+    if isinstance(output, MoleculesObject):
+        return [output]
+    if isinstance(output, list):
+        flattened = []
+        for item in output:
+            flattened.extend(_flatten_molecule_output(item))
+        return flattened
+    assert isinstance(output, MoleculesObject), 'output must be a MoleculesObject instance or list of MoleculesObjects'
+
+
+def _first_valid_molecule(output):
+    molecules = _flatten_molecule_output(output)
+    for molecule in molecules:
+        if molecule.get_atoms() is not None:
+            return molecule
+    raise RuntimeError("Sampler returned no valid MoleculesObject with atoms.")
+
 if (args.test_builder or args.test_qm or args.test_sampler or args.test_ml) and 'parsl_debug_configuration' in master_config:
     parsl_configuration = load_module_from_string(master_config['parsl_debug_configuration'])
 else: 
@@ -183,14 +203,28 @@ if args.test_sampler:
     sampler_task_queue.add_task(sampler_task(**task_input))
     sampled_configuration = sampler_task_queue.task_list[0].result()
     queue_output = sampler_task_queue.get_task_results()
-    test_configuration = queue_output[0][0]
-    assert isinstance(test_configuration, MoleculesObject), 'test_configuration must be a MoleculesObject instance'
-    print("Sampler testing returned:")
-    print(test_configuration)
+    sampler_output = queue_output[0][0]
+    sampler_molecules = _flatten_molecule_output(sampler_output)
+    if isinstance(sampler_output, list):
+        print("Sampler testing returned list with {:d} molecule(s):".format(len(sampler_molecules)))
+        for molecule in sampler_molecules:
+            print(molecule.get_moleculeid())
+    valid_sampler_molecules = [molecule for molecule in sampler_molecules if molecule.get_atoms() is not None]
+    if valid_sampler_molecules:
+        test_configuration = valid_sampler_molecules[0]
+        assert isinstance(test_configuration, MoleculesObject), 'test_configuration must be a MoleculesObject instance'
+        print("Sampler testing returned:")
+        print(test_configuration)
+    else:
+        print("Sampler testing returned no valid MoleculesObject with atoms.")
+        if args.test_qm:
+            raise RuntimeError("Cannot run QM test because sampler returned no valid candidate.")
     testing = True
 
 #def ase_calculator_task(input_system,configuration_list,directory,command,properties=['energy','forces']):
 if args.test_qm:
+    if not isinstance(test_configuration, MoleculesObject):
+        test_configuration = _first_valid_molecule(test_configuration)
     task_input = build_input_dict(qm_task.func,
                                   [{"molecule_object": test_configuration, "QM_config": QM_config},
                                    *all_configs, status],
@@ -410,9 +444,10 @@ while True:
     if sampler_task_queue.get_completed_number() > master_config['minimum_QM']:
         sampler_results, failed = sampler_task_queue.get_task_results()
         status['lifetime_failed_sampler_tasks'] = status['lifetime_failed_sampler_tasks'] + failed
-        for structure in sampler_results: #may need [0]
-            assert isinstance(structure, MoleculesObject), 'structure must be a MoleculesObject instance'
-            if structure.get_atoms() is not None:
+        for sampler_output in sampler_results:
+            for structure in _flatten_molecule_output(sampler_output):
+                if structure.get_atoms() is None:
+                    continue
                 task_input = build_input_dict(qm_task.func,
                                               [{"molecule_object": structure, "QM_config": QM_config}, master_config,
                                                *all_configs, status],

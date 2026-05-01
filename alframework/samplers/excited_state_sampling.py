@@ -148,6 +148,13 @@ def _sample_trajectory_interval(sampler_config: dict[str, Any], rng: np.random.G
     return int(interval)
 
 
+def _return_top_n(sampler_config: dict[str, Any]) -> int:
+    try:
+        return max(1, int(sampler_config.get("return_top_n", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _write_metadata(meta_dir: str | None, moleculeid: str, payload: dict[str, Any], metadata_format: str) -> None:
     if meta_dir is None:
         return
@@ -259,6 +266,7 @@ def run_excited_state_sampling(
     metadata_format = str(sampler_config.get("metadata_format", "pickle"))
     write_xyz = bool(sampler_config.get("write_traj_xyz", False))
     write_binary = bool(sampler_config.get("write_traj_binary", trajectory_interval is not None))
+    return_top_n = _return_top_n(sampler_config)
 
     dyn = Langevin(
         ase_atoms,
@@ -277,12 +285,11 @@ def run_excited_state_sampling(
         if write_xyz:
             xyz_handle = open(meta_root / f"metadata-{molecule_object.get_moleculeid()}.xyz", "w", encoding="utf-8")
 
-    best_record = None
+    top_candidates: list[dict[str, Any]] = []
     hard_close_contact = False
     start_time = time.time()
     temperatures: list[float] = []
     total_energies: list[float] = []
-    selected_atoms = None
 
     try:
         dyn.run(1)
@@ -341,9 +348,7 @@ def run_excited_state_sampling(
                 continue
 
             score = compute_excited_state_score(metrics, sampler_config)
-            if best_record is None or float(score) > float(best_record["score"]):
-                selected_atoms = ase_atoms.copy()
-                best_record = {
+            candidate_record = {
                     "score": float(score),
                     "step": int((step_index + 1) * ncheck),
                     "time_ps": float(current_time_ps),
@@ -352,6 +357,9 @@ def run_excited_state_sampling(
                     "temperature_target_K": float(target_temperature),
                     **metrics,
                 }
+            top_candidates.append({"record": candidate_record, "atoms": ase_atoms.copy()})
+            top_candidates.sort(key=lambda item: float(item["record"]["score"]), reverse=True)
+            del top_candidates[return_top_n:]
     finally:
         if traj_writer is not None:
             traj_writer.close()
@@ -365,10 +373,14 @@ def run_excited_state_sampling(
             slope, _ = np.polyfit(times, np.asarray(total_energies, dtype=np.float64), 1)
             drift_eV_per_ps = float(slope)
 
+    best_record = dict(top_candidates[0]["record"]) if top_candidates else None
+    top_candidate_records = [dict(candidate["record"]) for candidate in top_candidates]
     meta_dict = {
         "realtime_simulation": float(time.time() - start_time),
         "selected_state": int(selected_state),
         "best_candidate": best_record,
+        "top_candidates": top_candidate_records,
+        "return_top_n": int(return_top_n),
         "hard_close_contact": bool(hard_close_contact),
         "trajectory_temperature_trace_K": temperatures,
         "trajectory_total_energy_trace_eV": total_energies,
@@ -383,13 +395,42 @@ def run_excited_state_sampling(
     _write_metadata(meta_dir, molecule_object.get_moleculeid(), meta_dict, metadata_format)
 
     ase_atoms.calc = None
-    molecule_object.update_metadata(meta_dict)
-    if best_record is not None and not hard_close_contact:
+    if return_top_n == 1:
+        molecule_object.update_metadata(meta_dict)
+        if top_candidates and not hard_close_contact:
+            selected_atoms = top_candidates[0]["atoms"]
+            selected_atoms.calc = None
+            molecule_object.update_atoms(selected_atoms)
+        else:
+            molecule_object.update_atoms(None)
+        return molecule_object
+
+    if hard_close_contact:
+        return []
+
+    output_candidates: list[MoleculesObject] = []
+    for rank, candidate in enumerate(top_candidates):
+        selected_atoms = candidate["atoms"]
         selected_atoms.calc = None
-        molecule_object.update_atoms(selected_atoms)
-    else:
-        molecule_object.update_atoms(None)
-    return molecule_object
+        candidate_record = dict(candidate["record"])
+        candidate_metadata = dict(meta_dict)
+        candidate_metadata.update(
+            {
+                "parent_molecule_id": molecule_object.get_moleculeid(),
+                "candidate_rank": int(rank),
+                "candidate_score": float(candidate_record["score"]),
+                "candidate_step": int(candidate_record["step"]),
+                "candidate_time_ps": float(candidate_record["time_ps"]),
+                "candidate_record": candidate_record,
+            }
+        )
+        candidate_molecule = MoleculesObject(
+            selected_atoms,
+            f"{molecule_object.get_moleculeid()}-cand-{rank:02d}",
+        )
+        candidate_molecule.update_metadata(candidate_metadata)
+        output_candidates.append(candidate_molecule)
+    return output_candidates
 
 
 @python_app(executors=["alf_sampler_executor"])
