@@ -40,27 +40,35 @@ def _write_predicted_vs_target_csv(path: str | Path, predicted: Any, target: Any
         writer.writerows(zip(pred.tolist(), true.tolist()))
 
 
-def _resolve_device(device_string: str, from_multiprocessing_nGPU: int | None):
-    import torch
-
+def _configure_cuda_visible_devices(device_string: str, from_multiprocessing_nGPU: int | None) -> tuple[str, str | None]:
     requested = str(device_string).strip().lower()
-    if requested == "cpu" or not torch.cuda.is_available():
-        return torch.device("cpu"), "<cpu>"
+    if requested == "cpu":
+        return "<cpu>", None
 
     if requested == "from_multiprocessing":
         process = multiprocessing.current_process()
         gpu_index = 0
         if from_multiprocessing_nGPU is not None and int(from_multiprocessing_nGPU) > 0:
             gpu_index = (process._identity[-1] - 1) % int(from_multiprocessing_nGPU)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-        device = torch.device("cuda:0")
-        torch.cuda.set_device(device)
-        return device, str(gpu_index)
+        cuda_visible = str(gpu_index)
+    else:
+        cuda_visible = str(device_string)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_string)
+    # This must happen before torch is imported in the child process.
+    os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible
+    return cuda_visible, cuda_visible
+
+
+def _resolve_device(device_string: str, cuda_visible: str | None):
+    import torch
+
+    requested = str(device_string).strip().lower()
+    if requested == "cpu" or not torch.cuda.is_available():
+        return torch.device("cpu"), "<cpu>"
+
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
-    return device, str(device_string)
+    return device, str(cuda_visible)
 
 
 def _build_network(species_node, positions_node, cell_node, network_choice: int, network_params: dict[str, Any]):
@@ -147,6 +155,11 @@ def train_single_excited_state_model(
     ML_config: dict[str, Any],
     from_multiprocessing_nGPU: int | None = None,
 ) -> dict[str, Any]:
+    selected_cuda_visible, _ = _configure_cuda_visible_devices(
+        device_string=str(ML_config.get("device_string", "from_multiprocessing")),
+        from_multiprocessing_nGPU=from_multiprocessing_nGPU,
+    )
+
     import torch
     import hippynn
     from hippynn import plotting
@@ -163,7 +176,7 @@ def train_single_excited_state_model(
 
     device, cuda_visible = _resolve_device(
         device_string=str(ML_config.get("device_string", "from_multiprocessing")),
-        from_multiprocessing_nGPU=from_multiprocessing_nGPU,
+        cuda_visible=selected_cuda_visible,
     )
 
     seed = int(ML_config.get("random_seed", 114514)) + int(model_id)
@@ -195,6 +208,9 @@ def train_single_excited_state_model(
 
     with hippynn.tools.active_directory(str(model_root)):
         with hippynn.tools.log_terminal("training_log.txt", "wt"):
+            print(f"Model ID: {int(model_id)}")
+            print(f"CUDA_VISIBLE_DEVICES: {cuda_visible}")
+            print(f"Training device: {device}")
             species_node = inputs.SpeciesNode(db_name=species_key)
             positions_node = inputs.PositionsNode(db_name=coordinates_key)
             positions_node.requires_grad = True

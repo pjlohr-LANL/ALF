@@ -42,6 +42,11 @@ def _seed_file_names(builder_config: dict[str, Any]) -> tuple[str, str]:
     return str(names.get("R", "R.npy")), str(names.get("Z", "Z.npy"))
 
 
+def _prelabeled_seed_file_names(builder_config: dict[str, Any]) -> dict[str, str]:
+    names = dict(builder_config.get("prelabeled_seed_file_names") or {})
+    return {str(key): str(value) for key, value in names.items() if str(key).strip()}
+
+
 def _manifest_cache_key(
     *,
     h5_path: str,
@@ -57,6 +62,7 @@ def _manifest_cache_key(
         str(builder_config.get("source_priority", "h5_then_seed")),
         seed_r,
         seed_z,
+        tuple(sorted(_prelabeled_seed_file_names(builder_config).items())),
         tuple(sorted(formula_filter)) if formula_filter else None,
     )
 
@@ -78,6 +84,7 @@ def _manifest_cache_path(
                 int(current_h5_id),
                 str(builder_config.get("seed_dataset_dir")),
                 _seed_file_names(builder_config),
+                tuple(sorted(_prelabeled_seed_file_names(builder_config).items())),
                 tuple(sorted(formula_filter)) if formula_filter else None,
             )
         ).encode("utf-8")
@@ -205,6 +212,19 @@ def _build_seed_manifest(
     if R.shape[0] != Z.shape[0]:
         raise ValueError(f"Seed dataset R/Z frame counts do not match: {R.shape} vs {Z.shape}")
 
+    prelabeled_paths: dict[str, str] = {}
+    for prop_key, filename in _prelabeled_seed_file_names(builder_config).items():
+        label_path = seed_root / filename
+        if not label_path.exists():
+            raise FileNotFoundError(f"Pre-labeled seed file for {prop_key!r} does not exist: {label_path}")
+        label_array = np.load(label_path, mmap_mode="r")
+        if int(label_array.shape[0]) != int(R.shape[0]):
+            raise ValueError(
+                f"Pre-labeled seed file {label_path} has {label_array.shape[0]} frames, "
+                f"but seed R/Z have {R.shape[0]} frames."
+            )
+        prelabeled_paths[prop_key] = str(label_path)
+
     eligible_indices: np.ndarray | None = None
     if formula_filter:
         selected: list[int] = []
@@ -224,6 +244,7 @@ def _build_seed_manifest(
         "Z_path": str(z_path),
         "n_frames": int(R.shape[0]),
         "eligible_indices": eligible_indices,
+        "prelabeled_paths": prelabeled_paths,
     }
 
 
@@ -313,6 +334,69 @@ def _seed_frame_to_atoms(seed_manifest: dict[str, Any], frame_idx: int) -> tuple
         "replay_frame_index": int(frame_idx),
         "replay_formula": empirical_formula_from_numbers(numbers),
     }
+
+
+def _load_prelabeled_seed_results(
+    seed_manifest: dict[str, Any],
+    frame_idx: int,
+    properties_list: dict[str, list[Any]],
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    prelabeled_paths = dict(seed_manifest.get("prelabeled_paths") or {})
+    if not prelabeled_paths:
+        return {}, False, {"prelabeled_seed_configured": False}
+
+    Z = np.load(seed_manifest["Z_path"], mmap_mode="r")
+    numbers = np.asarray(Z[int(frame_idx)], dtype=np.int64).reshape(-1)
+    atom_mask = numbers > 0
+    n_atoms = int(np.sum(atom_mask))
+    results: dict[str, Any] = {}
+    errors: list[str] = []
+
+    for prop_key, schema in properties_list.items():
+        if prop_key not in prelabeled_paths:
+            errors.append(f"missing file for {prop_key}")
+            continue
+        prop_kind = str(schema[1]).lower() if len(schema) > 1 else ""
+        try:
+            label_array = np.load(prelabeled_paths[prop_key], mmap_mode="r")
+            raw_value = np.asarray(label_array[int(frame_idx)], dtype=np.float64)
+            if prop_kind == "system":
+                flat_value = raw_value.reshape(-1)
+                if flat_value.size != 1 or not np.all(np.isfinite(flat_value)):
+                    errors.append(f"{prop_key} has invalid system value shape {raw_value.shape}")
+                    continue
+                results[prop_key] = float(flat_value[0])
+            elif prop_kind == "atomic":
+                if raw_value.ndim != 2 or raw_value.shape[-1] != 3:
+                    errors.append(f"{prop_key} has invalid atomic value shape {raw_value.shape}")
+                    continue
+                if raw_value.shape[0] == atom_mask.shape[0]:
+                    value = raw_value[atom_mask]
+                elif raw_value.shape[0] == n_atoms:
+                    value = raw_value
+                else:
+                    errors.append(
+                        f"{prop_key} atom count {raw_value.shape[0]} does not match seed atom count {n_atoms}"
+                    )
+                    continue
+                if value.shape != (n_atoms, 3) or not np.all(np.isfinite(value)):
+                    errors.append(f"{prop_key} has non-finite or invalid force shape {value.shape}")
+                    continue
+                results[prop_key] = np.asarray(value, dtype=np.float64)
+            else:
+                errors.append(f"{prop_key} has unsupported property kind {prop_kind!r}")
+        except Exception as exc:
+            errors.append(f"{prop_key}: {type(exc).__name__}: {exc}")
+
+    valid = not errors and set(results) == set(properties_list)
+    metadata = {
+        "prelabeled_seed_configured": True,
+        "prelabeled_seed_valid": bool(valid),
+        "prelabeled_seed_keys": sorted(results),
+    }
+    if errors:
+        metadata["prelabeled_seed_errors"] = errors
+    return (results if valid else {}), bool(valid), metadata
 
 
 def _seed_all_once_frame_index(seed_manifest: dict[str, Any], moleculeid: str) -> int:
@@ -433,6 +517,17 @@ def build_excited_state_replay_structures(
             }
         )
         molecule.update_metadata(source_meta)
+        if source_kind == "seed":
+            results, converged, label_meta = _load_prelabeled_seed_results(
+                manifest["seed"],
+                int(source_meta["replay_frame_index"]),
+                properties_list,
+            )
+            molecule.update_metadata(label_meta)
+            if label_meta.get("prelabeled_seed_configured"):
+                if results:
+                    molecule.store_results(results)
+                molecule.set_converged_flag(bool(converged))
         outputs.append(molecule)
 
     return outputs

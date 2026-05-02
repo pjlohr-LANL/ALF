@@ -131,6 +131,35 @@ def _pyseqm_device(gpus_per_node: int | None = None):
     return torch.device(f"cuda:{worker_rank % visible_device_count}")
 
 
+def _has_complete_prelabeled_results(
+    molecule_object: MoleculesObject,
+    properties_list: dict[str, list[Any]],
+) -> bool:
+    if molecule_object.check_convergence() is not True:
+        return False
+
+    atoms = molecule_object.get_atoms()
+    if atoms is None:
+        return False
+
+    n_atoms = len(atoms)
+    results = molecule_object.get_results()
+    for prop_key, schema in properties_list.items():
+        if prop_key not in results:
+            return False
+        prop_kind = str(schema[1]).lower() if len(schema) > 1 else ""
+        value = np.asarray(results[prop_key], dtype=np.float64)
+        if prop_kind == "system":
+            if value.reshape(-1).size != 1 or not np.all(np.isfinite(value)):
+                return False
+        elif prop_kind == "atomic":
+            if value.shape != (n_atoms, 3) or not np.all(np.isfinite(value)):
+                return False
+        else:
+            return False
+    return True
+
+
 def label_excited_state_molecule(
     molecule_object: MoleculesObject,
     *,
@@ -141,6 +170,13 @@ def label_excited_state_molecule(
 ) -> MoleculesObject:
     if not isinstance(molecule_object, MoleculesObject):
         raise TypeError("molecule_object must be a MoleculesObject instance.")
+
+    if bool(QM_config.get("accept_prelabeled", False)) and _has_complete_prelabeled_results(
+        molecule_object,
+        properties_list,
+    ):
+        molecule_object.update_metadata({"qm_backend": "prelabeled_seed", "qm_skipped": True})
+        return molecule_object
 
     state_table = derive_state_property_table(properties_list, require_forces=False)
     atoms = molecule_object.get_atoms()
