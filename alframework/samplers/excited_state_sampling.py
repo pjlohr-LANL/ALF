@@ -450,3 +450,22 @@ def excited_state_sampling_task(
         gpus_per_node=int(gpus_per_node),
         properties_list=dict(properties_list or {}),
     )
+
+
+@python_app(executors=["alf_gpu_executor"])
+def excited_state_sampling_gpu_task(
+    molecule_object,
+    sampler_config,
+    model_path,
+    current_model_id,
+    gpus_per_node,
+    properties_list,
+):
+    return run_excited_state_sampling(
+        molecule_object=molecule_object,
+        sampler_config=dict(sampler_config or {}),
+        model_path=str(model_path),
+        current_model_id=int(current_model_id),
+        gpus_per_node=int(gpus_per_node),
+        properties_list=dict(properties_list or {}),
+    )

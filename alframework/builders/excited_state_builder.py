@@ -553,3 +553,25 @@ def excited_state_replay_builder_task(
     if moleculeids is None:
         return outputs[0]
     return outputs
+
+
+@python_app(executors=["alf_gpu_executor"])
+def excited_state_replay_builder_gpu_task(
+    moleculeid=None,
+    moleculeids=None,
+    builder_config=None,
+    properties_list=None,
+    h5_path=None,
+    current_h5_id=0,
+):
+    ids = [str(moleculeid)] if moleculeids is None else [str(value) for value in moleculeids]
+    outputs = build_excited_state_replay_structures(
+        moleculeids=ids,
+        builder_config=dict(builder_config or {}),
+        properties_list=dict(properties_list or {}),
+        h5_path=str(h5_path),
+        current_h5_id=int(current_h5_id),
+    )
+    if moleculeids is None:
+        return outputs[0]
+    return outputs

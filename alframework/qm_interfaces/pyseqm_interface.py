@@ -232,3 +232,20 @@ def pyseqm_excited_state_task(
         sampler_config=dict(sampler_config or {}),
         gpus_per_node=None if gpus_per_node is None else int(gpus_per_node),
     )
+
+
+@python_app(executors=["alf_gpu_executor"])
+def pyseqm_excited_state_gpu_task(
+    molecule_object,
+    QM_config,
+    properties_list,
+    sampler_config=None,
+    gpus_per_node=None,
+):
+    return label_excited_state_molecule(
+        molecule_object=molecule_object,
+        QM_config=dict(QM_config or {}),
+        properties_list=dict(properties_list or {}),
+        sampler_config=dict(sampler_config or {}),
+        gpus_per_node=None if gpus_per_node is None else int(gpus_per_node),
+    )
