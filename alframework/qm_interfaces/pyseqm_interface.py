@@ -342,7 +342,12 @@ def label_excited_state_molecule(
     atoms = molecule_object.get_atoms()
     coords = np.asarray(atoms.get_positions(), dtype=np.float64)[None, ...]
     species = np.asarray(atoms.get_atomic_numbers(), dtype=np.int64)[None, ...]
-    offset = float((sampler_config or {}).get("energy_offset_eV", 0.0))
+    offset = float(
+        QM_config.get(
+            "energy_offset_eV",
+            (sampler_config or {}).get("energy_offset_eV", 0.0),
+        )
+    )
     method = str(QM_config.get("method", "AM1"))
     scf_eps = float(QM_config.get("scf_eps", 1e-10))
     cis_tol = float(QM_config.get("cis_tol", 1e-8))
