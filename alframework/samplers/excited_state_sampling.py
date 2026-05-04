@@ -169,6 +169,42 @@ def _write_metadata(meta_dir: str | None, moleculeid: str, payload: dict[str, An
             json.dump(payload, handle, indent=2, default=_json_default)
 
 
+def _write_qm_candidate_xyz(
+    sampler_config: dict[str, Any],
+    parent_molecule_id: str,
+    candidate_items: list[dict[str, Any]],
+    candidate_ids: list[str],
+) -> None:
+    if not bool(sampler_config.get("write_qm_candidate_xyz", False)):
+        return
+    if not candidate_items:
+        return
+
+    output_dir = Path(str(sampler_config.get("qm_candidate_xyz_dir", "sampling/qm_candidates"))).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"qm-candidates-{parent_molecule_id}.xyz"
+
+    with open(output_path, "w", encoding="utf-8") as handle:
+        for rank, (candidate, molecule_id) in enumerate(zip(candidate_items, candidate_ids)):
+            atoms = candidate["atoms"].copy()
+            atoms.calc = None
+            record = dict(candidate["record"])
+            atoms.info.update(
+                {
+                    "molecule_id": molecule_id,
+                    "parent_molecule_id": parent_molecule_id,
+                    "candidate_rank": int(rank),
+                    "candidate_score": float(record["score"]),
+                    "candidate_step": int(record["step"]),
+                    "candidate_time_ps": float(record["time_ps"]),
+                    "selected_state": int(record["selected_state"]),
+                    "min_dist": float(record["min_dist"]),
+                    "fmax": float(record["fmax"]),
+                }
+            )
+            write(handle, atoms, format="xyz")
+
+
 def _json_default(value: Any):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -400,6 +436,12 @@ def run_excited_state_sampling(
         if top_candidates and not hard_close_contact:
             selected_atoms = top_candidates[0]["atoms"]
             selected_atoms.calc = None
+            _write_qm_candidate_xyz(
+                sampler_config,
+                molecule_object.get_moleculeid(),
+                [top_candidates[0]],
+                [molecule_object.get_moleculeid()],
+            )
             molecule_object.update_atoms(selected_atoms)
         else:
             molecule_object.update_atoms(None)
@@ -409,6 +451,8 @@ def run_excited_state_sampling(
         return []
 
     output_candidates: list[MoleculesObject] = []
+    candidate_ids = [f"{molecule_object.get_moleculeid()}-cand-{rank:02d}" for rank in range(len(top_candidates))]
+    _write_qm_candidate_xyz(sampler_config, molecule_object.get_moleculeid(), top_candidates, candidate_ids)
     for rank, candidate in enumerate(top_candidates):
         selected_atoms = candidate["atoms"]
         selected_atoms.calc = None
@@ -426,7 +470,7 @@ def run_excited_state_sampling(
         )
         candidate_molecule = MoleculesObject(
             selected_atoms,
-            f"{molecule_object.get_moleculeid()}-cand-{rank:02d}",
+            candidate_ids[rank],
         )
         candidate_molecule.update_metadata(candidate_metadata)
         output_candidates.append(candidate_molecule)

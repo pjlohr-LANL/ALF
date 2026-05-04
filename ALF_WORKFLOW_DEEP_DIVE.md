@@ -302,12 +302,17 @@ ALF explicitly supports both shapes.
 
 ### Sampler Output Contract
 
-Sampler tasks return one `MoleculesObject`.
+Sampler tasks may return:
+
+- one `MoleculesObject`
+- a list of `MoleculesObject` instances for sampler implementations that support multiple candidates
 
 Meaning of `atoms` on return:
 
 - `atoms is not None`: send this structure to QM
 - `atoms is None`: nothing needs QM labeling from this trajectory / reaction attempt
+
+Empty lists are treated as "no sampled candidate". This list-return path is primarily used by the excited-state sampler's optional `return_top_n` mode.
 
 ### QM Output Contract
 
@@ -1319,8 +1324,9 @@ Current behavior:
 - it loads a multi-state HIPPYNN ensemble from the standard ALF model directory layout
 - each trajectory propagates one selected state but evaluates uncertainty metadata for all available states
 - candidate ranking is local to one sampler task; ALF does not yet implement a global top-k ranking pool in the core runtime
+- `return_top_n` optionally returns the top N local candidate frames from one trajectory as separate `MoleculesObject` instances; the default is `1`, which preserves the original single-candidate return shape
 - the sampler writes metadata sidecars and optional trajectory files under `meta_dir`
-- if no valid candidate survives filtering, it returns the same `MoleculesObject` with `atoms=None`
+- if no valid candidate survives filtering, default mode returns the same `MoleculesObject` with `atoms=None`; `return_top_n > 1` returns an empty list
 
 Confirmed bug fixed during integration:
 
