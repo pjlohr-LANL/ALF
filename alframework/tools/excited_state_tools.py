@@ -12,6 +12,7 @@ from alframework.tools.tools import compute_empirical_formula
 
 _ENERGY_KEY_RE = re.compile(r"^sE(\d+)$")
 _FORCE_KEY_RE = re.compile(r"^F(\d+)$")
+_GAP_KEY_RE = re.compile(r"^dE(?:(\d+)[_-](\d+)|(\d)(\d))$")
 _MOLECULE_ID_INT_RE = re.compile(r"(\d+)(?!.*\d)")
 
 
@@ -99,6 +100,120 @@ def derive_state_property_table(
 
 def derive_state_ids(properties_list: dict[str, list[Any]]) -> list[int]:
     return [int(row["state"]) for row in derive_state_property_table(properties_list)]
+
+
+def gap_key_for_pair(lower_state: int, upper_state: int) -> str:
+    return f"dE{int(lower_state)}{int(upper_state)}"
+
+
+def parse_gap_key(prop_key: str) -> tuple[int, int] | None:
+    match = _GAP_KEY_RE.match(str(prop_key))
+    if match is None:
+        return None
+    if match.group(1) is not None:
+        lower_state = int(match.group(1))
+        upper_state = int(match.group(2))
+    else:
+        lower_state = int(match.group(3))
+        upper_state = int(match.group(4))
+    if lower_state == upper_state:
+        raise ValueError(f"Gap key {prop_key!r} uses the same state twice.")
+    return lower_state, upper_state
+
+
+def derive_gap_property_table(
+    properties_list: dict[str, list[Any]],
+    *,
+    gap_config: dict[str, Any] | None = None,
+    require_properties: bool = False,
+) -> list[dict[str, Any]]:
+    if not isinstance(properties_list, dict) or not properties_list:
+        raise ValueError("properties_list must be a non-empty dictionary.")
+
+    state_ids = set(derive_state_ids(properties_list))
+    config = dict(gap_config or {})
+    configured_pairs = config.get("pairs")
+    if configured_pairs is None:
+        pair_items = []
+        for prop_key in properties_list:
+            parsed = parse_gap_key(str(prop_key))
+            if parsed is not None:
+                pair_items.append(parsed)
+        pair_items = sorted(set(pair_items))
+    else:
+        pair_items = []
+        for pair in configured_pairs:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(f"Gap target pair must contain exactly two states. Got {pair!r}.")
+            pair_items.append((int(pair[0]), int(pair[1])))
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for lower_state, upper_state in pair_items:
+        lower_state = int(lower_state)
+        upper_state = int(upper_state)
+        if lower_state >= upper_state:
+            raise ValueError(f"Gap targets must be ordered lower-to-higher state. Got {(lower_state, upper_state)}.")
+        if lower_state not in state_ids or upper_state not in state_ids:
+            raise ValueError(
+                f"Gap target {(lower_state, upper_state)} references states outside available states {sorted(state_ids)}."
+            )
+        pair = (lower_state, upper_state)
+        if pair in seen:
+            continue
+        seen.add(pair)
+
+        gap_key = gap_key_for_pair(lower_state, upper_state)
+        if gap_key not in properties_list:
+            if require_properties:
+                raise ValueError(f"Gap target {gap_key!r} is not present in properties_list.")
+            continue
+
+        schema = properties_list[gap_key]
+        if not isinstance(schema, (list, tuple)) or len(schema) < 2:
+            raise ValueError(f"Property schema for {gap_key!r} must include database name and property kind.")
+        prop_kind = str(schema[1]).strip().lower()
+        if prop_kind != "system":
+            raise ValueError(f"Gap property {gap_key!r} must be a system property, not {prop_kind!r}.")
+
+        rows.append(
+            {
+                "lower_state": lower_state,
+                "upper_state": upper_state,
+                "gap_key": gap_key,
+                "gap_db_name": str(schema[0]),
+            }
+        )
+    return rows
+
+
+def validate_gap_results(
+    results: dict[str, Any],
+    properties_list: dict[str, list[Any]],
+    *,
+    gap_config: dict[str, Any] | None = None,
+    atol: float = 1e-8,
+    rtol: float = 1e-7,
+) -> list[str]:
+    errors: list[str] = []
+    for row in derive_gap_property_table(properties_list, gap_config=gap_config):
+        lower_key = f"sE{int(row['lower_state'])}"
+        upper_key = f"sE{int(row['upper_state'])}"
+        gap_key = str(row["gap_key"])
+        missing = [key for key in (lower_key, upper_key, gap_key) if key not in results]
+        if missing:
+            errors.append(f"{gap_key} validation missing keys: {missing}")
+            continue
+        lower = float(np.asarray(results[lower_key], dtype=np.float64).reshape(-1)[0])
+        upper = float(np.asarray(results[upper_key], dtype=np.float64).reshape(-1)[0])
+        gap = float(np.asarray(results[gap_key], dtype=np.float64).reshape(-1)[0])
+        expected = upper - lower
+        if not np.all(np.isfinite([lower, upper, gap])):
+            errors.append(f"{gap_key} validation found non-finite values")
+            continue
+        if not np.isclose(gap, expected, atol=float(atol), rtol=float(rtol)):
+            errors.append(f"{gap_key}={gap} does not match {upper_key}-{lower_key}={expected}")
+    return errors
 
 
 def select_excited_state(

@@ -19,6 +19,7 @@ from alframework.tools.excited_state_tools import (
     empirical_formula_from_species,
     select_excited_state,
     stable_uint32_seed,
+    validate_gap_results,
 )
 from alframework.tools.molecules_class import MoleculesObject
 
@@ -387,6 +388,9 @@ def _load_prelabeled_seed_results(
                 errors.append(f"{prop_key} has unsupported property kind {prop_kind!r}")
         except Exception as exc:
             errors.append(f"{prop_key}: {type(exc).__name__}: {exc}")
+
+    if not errors:
+        errors.extend(validate_gap_results(results, properties_list))
 
     valid = not errors and set(results) == set(properties_list)
     metadata = {

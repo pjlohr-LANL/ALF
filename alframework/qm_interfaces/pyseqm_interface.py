@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from parsl import python_app
 
-from alframework.tools.excited_state_tools import derive_state_property_table
+from alframework.tools.excited_state_tools import derive_gap_property_table, derive_state_property_table
 from alframework.tools.molecules_class import MoleculesObject
 
 
@@ -396,6 +396,10 @@ def label_excited_state_molecule(
         results[row["energy_key"]] = float(energies[0, state_index] - offset)
         if row["force_key"] is not None:
             results[row["force_key"]] = np.asarray(forces[0, state_index], dtype=np.float64)
+    for row in derive_gap_property_table(properties_list):
+        lower_key = f"sE{int(row['lower_state'])}"
+        upper_key = f"sE{int(row['upper_state'])}"
+        results[row["gap_key"]] = float(results[upper_key] - results[lower_key])
 
     molecule_object.store_results(results)
     molecule_object.update_metadata(

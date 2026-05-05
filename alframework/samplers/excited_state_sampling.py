@@ -89,10 +89,33 @@ def compute_excited_state_score(metrics: dict[str, Any], sampler_config: dict[st
     )
 
 
-def _results_to_metrics(atoms, results: dict[str, Any], state_table: list[dict[str, Any]], selected_state: int) -> dict[str, Any]:
+def _results_to_metrics(
+    atoms,
+    results: dict[str, Any],
+    state_table: list[dict[str, Any]],
+    gap_table: list[dict[str, Any]],
+    selected_state: int,
+) -> dict[str, Any]:
     energies = {int(row["state"]): float(results[f"E_mean_S{int(row['state'])}"]) for row in state_table}
     energy_stds = {int(row["state"]): float(results[f"E_std_S{int(row['state'])}"]) for row in state_table}
-    min_gap, pair = _minimum_gap(energies)
+    gap_means: dict[str, float] = {}
+    gap_stds: dict[str, float] = {}
+    gap_pairs: dict[str, list[int]] = {}
+    for row in gap_table:
+        gap_key = str(row["gap_key"])
+        mean_key = f"{gap_key}_mean"
+        std_key = f"{gap_key}_std"
+        if mean_key in results:
+            gap_means[gap_key] = float(results[mean_key])
+            gap_pairs[gap_key] = [int(row["lower_state"]), int(row["upper_state"])]
+        if std_key in results:
+            gap_stds[gap_key] = float(results[std_key])
+    if gap_means:
+        min_gap_key, min_gap = min(gap_means.items(), key=lambda item: abs(float(item[1])))
+        pair = tuple(gap_pairs[min_gap_key])
+        min_gap = abs(float(min_gap))
+    else:
+        min_gap, pair = _minimum_gap(energies)
     force_stds: dict[int, float] = {}
     for row in state_table:
         state = int(row["state"])
@@ -107,6 +130,9 @@ def _results_to_metrics(atoms, results: dict[str, Any], state_table: list[dict[s
         "selected_state": int(selected_state),
         "energies": energies,
         "energy_stds": energy_stds,
+        "gap_means": gap_means,
+        "gap_stds": gap_stds,
+        "gap_pairs": gap_pairs,
         "force_stds": force_stds,
         "uE_max": float(max(energy_stds.values())),
         "uE_rms": float(np.sqrt(np.mean(np.square(list(energy_stds.values()))))),
@@ -245,7 +271,7 @@ def run_excited_state_sampling(
         device = torch.device("cpu")
 
     rng = np.random.default_rng(stable_uint32_seed(molecule_object.get_moleculeid(), int(current_model_id)))
-    ensemble_graph, state_table = load_excited_state_ensemble(
+    ensemble_graph, state_table, gap_table = load_excited_state_ensemble(
         model_path.format(int(current_model_id)),
         properties_list=properties_list,
         device=str(device),
@@ -277,6 +303,11 @@ def run_excited_state_sampling(
         if row["force_node_base"] is not None:
             force_base = ensemble_graph.node_from_name(str(row["force_node_base"]))
             extra_properties[f"F_std_S{state}"] = force_base.std
+    for row in gap_table:
+        gap_base = ensemble_graph.node_from_name(str(row["gap_node_base"]))
+        gap_key = str(row["gap_key"])
+        extra_properties[f"{gap_key}_mean"] = gap_base.mean
+        extra_properties[f"{gap_key}_std"] = gap_base.std
 
     calculator = HippynnCalculator(
         energy=energy_node.mean,
@@ -371,7 +402,7 @@ def run_excited_state_sampling(
             if xyz_handle is not None:
                 write(xyz_handle, ase_atoms, format="xyz")
 
-            metrics = _results_to_metrics(ase_atoms, dict(ase_atoms.calc.results), state_table, selected_state)
+            metrics = _results_to_metrics(ase_atoms, dict(ase_atoms.calc.results), state_table, gap_table, selected_state)
             current_temperature = float(ase_atoms.get_temperature())
             current_total_energy = float(ase_atoms.get_potential_energy() + ase_atoms.get_kinetic_energy())
             temperatures.append(current_temperature)

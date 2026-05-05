@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from parsl import python_app
 
-from alframework.tools.excited_state_tools import derive_state_property_table
+from alframework.tools.excited_state_tools import derive_gap_property_table, derive_state_property_table
 
 
 def _flatten_to_numpy(value: Any) -> np.ndarray:
@@ -189,6 +189,13 @@ def train_single_excited_state_model(
     cell_key = None if cell_key in {None, "None"} else str(cell_key)
 
     state_table = derive_state_property_table(properties_list, require_forces=bool(ML_config.get("train_forces", True)))
+    gap_config = dict(ML_config.get("gap_targets") or {})
+    gap_targets_enabled = bool(gap_config.get("enabled", False))
+    gap_table = derive_gap_property_table(
+        properties_list,
+        gap_config=gap_config if gap_config else None,
+        require_properties=gap_targets_enabled,
+    )
     network_params = dict(ML_config.get("network_params") or {})
     if "possible_species" not in network_params:
         network_params["possible_species"], inferred_n_atoms = _infer_species_and_n_atoms(
@@ -225,6 +232,8 @@ def train_single_excited_state_model(
             )
 
             energy_outputs: list[tuple[dict[str, Any], Any]] = []
+            energy_by_state: dict[int, Any] = {}
+            gap_outputs: list[tuple[dict[str, Any], Any]] = []
             force_outputs: list[tuple[dict[str, Any], Any]] = []
             validation_losses: dict[str, Any] = {}
             plotters: list[Any] = []
@@ -243,6 +252,7 @@ def train_single_excited_state_model(
                 mol_energy = energy_node.mol_energy
                 mol_energy.db_name = str(row["energy_db_name"])
                 energy_outputs.append((row, mol_energy))
+                energy_by_state[int(row["state"])] = mol_energy
 
                 if bool(ML_config.get("train_forces", True)) and row["force_key"] is not None:
                     force_node = physics.GradientNode(
@@ -252,6 +262,20 @@ def train_single_excited_state_model(
                         db_name=str(row["force_db_name"]),
                     )
                     force_outputs.append((row, force_node))
+
+            if gap_targets_enabled:
+                for row in gap_table:
+                    lower_state = int(row["lower_state"])
+                    upper_state = int(row["upper_state"])
+                    if lower_state not in energy_by_state or upper_state not in energy_by_state:
+                        raise ValueError(
+                            f"Gap target {row['gap_key']} requires states {lower_state} and {upper_state}, "
+                            "but one of those state energy outputs is missing."
+                        )
+                    gap_output = energy_by_state[upper_state] - energy_by_state[lower_state]
+                    gap_output.name = str(row["gap_key"])
+                    gap_output.db_name = str(row["gap_db_name"])
+                    gap_outputs.append((row, gap_output))
 
             for row, energy_output in energy_outputs:
                 rmse = loss.MSELoss.of_node(energy_output) ** 0.5
@@ -282,6 +306,33 @@ def train_single_excited_state_model(
                     plotters.append(
                         DataDumper(energy_output, saved=str(export_subdir_abs / f"{row['energy_key']}.csv"))
                     )
+
+            for row, gap_output in gap_outputs:
+                gap_rmse = loss.MSELoss.of_node(gap_output) ** 0.5
+                gap_mae = loss.MAELoss.of_node(gap_output)
+                combined = gap_rmse + gap_mae
+                validation_losses[f"{row['gap_key']}_RMSE"] = gap_rmse
+                validation_losses[f"{row['gap_key']}_MAE"] = gap_mae
+                validation_losses[f"{row['gap_key']}_Loss"] = combined
+                total_loss = total_loss + float(gap_config.get("weight", 1.0)) * combined
+                if export_pdf:
+                    plotters.append(
+                        plotting.Hist2D.compare(
+                            gap_output,
+                            saved=str(export_subdir_abs / f"{row['gap_key']}.pdf"),
+                            shown=False,
+                        )
+                    )
+                if export_png:
+                    plotters.append(
+                        plotting.Hist2D.compare(
+                            gap_output,
+                            saved=str(export_subdir_abs / f"{row['gap_key']}.png"),
+                            shown=False,
+                        )
+                    )
+                if export_csv:
+                    plotters.append(DataDumper(gap_output, saved=str(export_subdir_abs / f"{row['gap_key']}.csv")))
 
             if force_outputs:
                 force_norm = math.sqrt(3.0 * float(n_atoms))
@@ -388,6 +439,7 @@ def train_single_excited_state_model(
                 "device": str(device),
                 "cuda_visible_devices": str(cuda_visible),
                 "state_table": state_table,
+                "gap_table": gap_table,
                 "metric": metric_tracker.best_metric_values,
                 "avg_epoch_time": float(np.average(metric_tracker.epoch_times)),
                 "loss": float(metric_tracker.best_metric_values["valid"]["Loss"]),
@@ -470,11 +522,12 @@ def load_excited_state_ensemble(
     ensemble_directory: str,
     properties_list: dict[str, list[Any]],
     device: str = "cuda:0",
-) -> tuple[Any, list[dict[str, Any]]]:
+) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
     del device
     import hippynn
 
     state_table = derive_state_property_table(properties_list, require_forces=False)
+    gap_table = derive_gap_property_table(properties_list)
     ensemble_root = Path(ensemble_directory).expanduser().resolve()
     ensemble_graph, _ = hippynn.graphs.make_ensemble(str(ensemble_root / "model-*"))
     resolved_rows: list[dict[str, Any]] = []
@@ -489,7 +542,19 @@ def load_excited_state_ensemble(
         if resolved["force_node_base"] is not None:
             ensemble_graph.node_from_name(resolved["force_node_base"])
         resolved_rows.append(resolved)
-    return ensemble_graph, resolved_rows
+
+    resolved_gap_rows: list[dict[str, Any]] = []
+    for row in gap_table:
+        resolved = dict(row)
+        resolved["gap_node_base"] = f"ensemble_{row['gap_db_name']}"
+        try:
+            ensemble_graph.node_from_name(resolved["gap_node_base"])
+        except Exception:
+            # Older excited-state models do not expose derived gap nodes. The
+            # sampler can still fall back to state-energy differences.
+            continue
+        resolved_gap_rows.append(resolved)
+    return ensemble_graph, resolved_rows, resolved_gap_rows
 
 
 @python_app(executors=["alf_ML_executor"])
