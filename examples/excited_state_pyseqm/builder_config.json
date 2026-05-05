@@ -1,9 +1,0 @@
-{
-  "seed_dataset_dir": "seed_dataset/",
-  "manifest_cache_dir": "manifest_cache/",
-  "source_priority": "seed_all_once",
-  "empirical_formula_filter": "H02_O01",
-  "state_selection": {
-    "mode": "cyclic"
-  }
-}

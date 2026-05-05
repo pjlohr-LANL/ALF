@@ -101,6 +101,7 @@ def _results_to_metrics(atoms, results: dict[str, Any], state_table: list[dict[s
     forces = np.asarray(atoms.get_forces(), dtype=np.float64)
     all_distances = np.asarray(atoms.get_all_distances(mic=True), dtype=np.float64)
     np.fill_diagonal(all_distances, np.inf)
+    nearest_neighbor_distances = all_distances.min(axis=1)
 
     return {
         "selected_state": int(selected_state),
@@ -116,6 +117,8 @@ def _results_to_metrics(atoms, results: dict[str, Any], state_table: list[dict[s
         "selected_energy_eV": float(energies[int(selected_state)]),
         "fmax": float(np.linalg.norm(forces, axis=1).max()),
         "min_dist": float(all_distances.min()),
+        "nearest_neighbor_distances": nearest_neighbor_distances.astype(float),
+        "max_nearest_neighbor_distance": float(nearest_neighbor_distances.max()),
     }
 
 
@@ -323,9 +326,11 @@ def run_excited_state_sampling(
 
     top_candidates: list[dict[str, Any]] = []
     hard_close_contact = False
+    geometry_reject_reason = None
     start_time = time.time()
     temperatures: list[float] = []
     total_energies: list[float] = []
+    geometry_metrics_trace: list[dict[str, Any]] = []
 
     try:
         dyn.run(1)
@@ -371,10 +376,26 @@ def run_excited_state_sampling(
             current_total_energy = float(ase_atoms.get_potential_energy() + ase_atoms.get_kinetic_energy())
             temperatures.append(current_temperature)
             total_energies.append(current_total_energy)
+            geometry_metrics_trace.append(
+                {
+                    "step": int((step_index + 1) * ncheck),
+                    "time_ps": float(current_time_ps),
+                    "min_dist": float(metrics["min_dist"]),
+                    "fmax": float(metrics["fmax"]),
+                    "max_nearest_neighbor_distance": float(metrics["max_nearest_neighbor_distance"]),
+                    "nearest_neighbor_distances": np.asarray(metrics["nearest_neighbor_distances"], dtype=float),
+                }
+            )
 
             if float(metrics["min_dist"]) < float(sampler_config.get("min_distance_cutoff", 0.3)):
                 hard_close_contact = True
+                geometry_reject_reason = "min_distance"
                 break
+            if bool(sampler_config.get("max_nearest_neighbor_distance_check", False)):
+                max_nn_cutoff = float(sampler_config["max_nearest_neighbor_distance_cutoff"])
+                if float(metrics["max_nearest_neighbor_distance"]) > max_nn_cutoff:
+                    geometry_reject_reason = "max_nearest_neighbor_distance"
+                    break
             if float(metrics["fmax"]) > float(sampler_config.get("max_force_cutoff", 10.0)):
                 break
 
@@ -411,6 +432,7 @@ def run_excited_state_sampling(
 
     best_record = dict(top_candidates[0]["record"]) if top_candidates else None
     top_candidate_records = [dict(candidate["record"]) for candidate in top_candidates]
+    last_geometry_metrics = dict(geometry_metrics_trace[-1]) if geometry_metrics_trace else {}
     meta_dict = {
         "realtime_simulation": float(time.time() - start_time),
         "selected_state": int(selected_state),
@@ -418,6 +440,10 @@ def run_excited_state_sampling(
         "top_candidates": top_candidate_records,
         "return_top_n": int(return_top_n),
         "hard_close_contact": bool(hard_close_contact),
+        "geometry_reject_reason": geometry_reject_reason,
+        "geometry_metrics_trace": geometry_metrics_trace,
+        "max_nearest_neighbor_distance": last_geometry_metrics.get("max_nearest_neighbor_distance"),
+        "nearest_neighbor_distances": last_geometry_metrics.get("nearest_neighbor_distances"),
         "trajectory_temperature_trace_K": temperatures,
         "trajectory_total_energy_trace_eV": total_energies,
         "density_trace": density_trace if "density_trace" in locals() else [],
@@ -433,7 +459,7 @@ def run_excited_state_sampling(
     ase_atoms.calc = None
     if return_top_n == 1:
         molecule_object.update_metadata(meta_dict)
-        if top_candidates and not hard_close_contact:
+        if top_candidates and geometry_reject_reason is None:
             selected_atoms = top_candidates[0]["atoms"]
             selected_atoms.calc = None
             _write_qm_candidate_xyz(
@@ -447,7 +473,7 @@ def run_excited_state_sampling(
             molecule_object.update_atoms(None)
         return molecule_object
 
-    if hard_close_contact:
+    if geometry_reject_reason is not None:
         return []
 
     output_candidates: list[MoleculesObject] = []
