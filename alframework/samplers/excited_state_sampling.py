@@ -32,6 +32,10 @@ def _uncertainty_config(sampler_config: dict[str, Any]) -> dict[str, Any]:
     return dict(sampler_config.get("uncertainty") or {})
 
 
+def _udd_config(sampler_config: dict[str, Any]) -> dict[str, Any]:
+    return dict(sampler_config.get("udd") or {})
+
+
 def _force_rms(array: np.ndarray) -> float:
     data = np.asarray(array, dtype=np.float64)
     return float(np.sqrt(np.mean(data * data)))
@@ -184,6 +188,32 @@ def _return_top_n(sampler_config: dict[str, Any]) -> int:
         return 1
 
 
+def _select_initial_udd_gap_target(results: dict[str, Any], gap_table: list[dict[str, Any]]) -> dict[str, Any]:
+    if not gap_table:
+        raise ValueError("UDD gap_std_bias requires direct ensemble gap nodes, but no gap nodes were loaded.")
+
+    candidates: list[dict[str, Any]] = []
+    for row in gap_table:
+        gap_key = str(row["gap_key"])
+        mean_key = f"{gap_key}_mean"
+        std_key = f"{gap_key}_std"
+        if mean_key not in results or std_key not in results:
+            raise ValueError(f"UDD gap_std_bias requires {mean_key!r} and {std_key!r} calculator results.")
+        mean = float(np.asarray(results[mean_key], dtype=np.float64).reshape(-1)[0])
+        std = float(np.asarray(results[std_key], dtype=np.float64).reshape(-1)[0])
+        if not np.isfinite(mean) or not np.isfinite(std):
+            raise ValueError(f"UDD gap_std_bias found non-finite values for {gap_key}: mean={mean}, std={std}.")
+        candidates.append(
+            {
+                "gap_key": gap_key,
+                "gap_pair": [int(row["lower_state"]), int(row["upper_state"])],
+                "initial_gap_mean": mean,
+                "initial_gap_std": std,
+            }
+        )
+    return min(candidates, key=lambda item: abs(float(item["initial_gap_mean"])))
+
+
 def _write_metadata(meta_dir: str | None, moleculeid: str, payload: dict[str, Any], metadata_format: str) -> None:
     if meta_dir is None:
         return
@@ -295,6 +325,7 @@ def run_excited_state_sampling(
 
     energy_node = ensemble_graph.node_from_name(str(state_row["energy_node_base"]))
     extra_properties: dict[str, Any] = {}
+    gap_node_by_key: dict[str, Any] = {}
     for row in state_table:
         state = int(row["state"])
         energy_base = ensemble_graph.node_from_name(str(row["energy_node_base"]))
@@ -306,23 +337,68 @@ def run_excited_state_sampling(
     for row in gap_table:
         gap_base = ensemble_graph.node_from_name(str(row["gap_node_base"]))
         gap_key = str(row["gap_key"])
+        gap_node_by_key[gap_key] = gap_base
         extra_properties[f"{gap_key}_mean"] = gap_base.mean
         extra_properties[f"{gap_key}_std"] = gap_base.std
-
-    calculator = HippynnCalculator(
-        energy=energy_node.mean,
-        extra_properties=extra_properties,
-        en_unit=units.eV,
-        offset=float(sampler_config.get("energy_offset_eV", 0.0)),
-    )
-    calculator.to(torch.float32)
-    calculator.to(device)
 
     if sampler_config.get("translate_to_center", False):
         positions = molecule_object.atoms.get_positions() - molecule_object.atoms.get_center_of_mass()
         molecule_object.atoms.set_positions(positions)
 
     ase_atoms = molecule_object.get_atoms().copy()
+    energy_for_md = energy_node.mean
+    udd = _udd_config(sampler_config)
+    udd_enabled = bool(udd.get("enabled", False))
+    udd_metadata: dict[str, Any] = {
+        "udd_enabled": bool(udd_enabled),
+        "udd_mode": str(udd.get("mode", "gap_std_bias")),
+        "udd_target": str(udd.get("target", "initial_min_gap_pair")),
+        "udd_bias_weight": float(udd.get("bias_weight", 0.0)),
+        "udd_gap_key": None,
+        "udd_gap_pair": None,
+        "udd_initial_gap_mean": None,
+        "udd_initial_gap_std": None,
+    }
+    if udd_enabled:
+        if str(udd_metadata["udd_mode"]).strip().lower() != "gap_std_bias":
+            raise ValueError(f"Unsupported excited-state UDD mode: {udd_metadata['udd_mode']}")
+        if str(udd_metadata["udd_target"]).strip().lower() != "initial_min_gap_pair":
+            raise ValueError(f"Unsupported excited-state UDD target: {udd_metadata['udd_target']}")
+
+        probe_calculator = HippynnCalculator(
+            energy=energy_node.mean,
+            extra_properties=extra_properties,
+            en_unit=units.eV,
+            offset=float(sampler_config.get("energy_offset_eV", 0.0)),
+        )
+        probe_calculator.to(torch.float32)
+        probe_calculator.to(device)
+        probe_atoms = ase_atoms.copy()
+        probe_atoms.calc = probe_calculator
+        probe_atoms.get_potential_energy()
+        udd_target = _select_initial_udd_gap_target(dict(probe_atoms.calc.results), gap_table)
+        probe_atoms.calc = None
+        del probe_calculator
+
+        udd_gap_key = str(udd_target["gap_key"])
+        energy_for_md = energy_node.mean - float(udd_metadata["udd_bias_weight"]) * gap_node_by_key[udd_gap_key].std
+        udd_metadata.update(
+            {
+                "udd_gap_key": udd_gap_key,
+                "udd_gap_pair": udd_target["gap_pair"],
+                "udd_initial_gap_mean": float(udd_target["initial_gap_mean"]),
+                "udd_initial_gap_std": float(udd_target["initial_gap_std"]),
+            }
+        )
+
+    calculator = HippynnCalculator(
+        energy=energy_for_md,
+        extra_properties=extra_properties,
+        en_unit=units.eV,
+        offset=float(sampler_config.get("energy_offset_eV", 0.0)),
+    )
+    calculator.to(torch.float32)
+    calculator.to(device)
     ase_atoms.calc = calculator
 
     feed = _temperature_feed_parameters(sampler_config, rng)
@@ -361,6 +437,8 @@ def run_excited_state_sampling(
     start_time = time.time()
     temperatures: list[float] = []
     total_energies: list[float] = []
+    udd_gap_mean_trace: list[float] = []
+    udd_gap_std_trace: list[float] = []
     geometry_metrics_trace: list[dict[str, Any]] = []
 
     try:
@@ -403,6 +481,12 @@ def run_excited_state_sampling(
                 write(xyz_handle, ase_atoms, format="xyz")
 
             metrics = _results_to_metrics(ase_atoms, dict(ase_atoms.calc.results), state_table, gap_table, selected_state)
+            if udd_enabled and udd_metadata["udd_gap_key"] is not None:
+                udd_gap_key = str(udd_metadata["udd_gap_key"])
+                if udd_gap_key in metrics["gap_means"]:
+                    udd_gap_mean_trace.append(float(metrics["gap_means"][udd_gap_key]))
+                if udd_gap_key in metrics["gap_stds"]:
+                    udd_gap_std_trace.append(float(metrics["gap_stds"][udd_gap_key]))
             current_temperature = float(ase_atoms.get_temperature())
             current_total_energy = float(ase_atoms.get_potential_energy() + ase_atoms.get_kinetic_energy())
             temperatures.append(current_temperature)
@@ -483,7 +567,10 @@ def run_excited_state_sampling(
         "chemical_symbols": ase_atoms.get_chemical_symbols(),
         "positions": ase_atoms.get_positions(wrap=True),
         "cell": ase_atoms.get_cell(),
+        "udd_gap_mean_trace": udd_gap_mean_trace,
+        "udd_gap_std_trace": udd_gap_std_trace,
     }
+    meta_dict.update(udd_metadata)
     meta_dict.update(molecule_object.get_metadata())
     _write_metadata(meta_dir, molecule_object.get_moleculeid(), meta_dict, metadata_format)
 

@@ -1407,3 +1407,213 @@ If future work needs to extend the excited-state path while preserving ALF:
 - preserve the sampler convention that `atoms=None` means "no QM escalation"
 
 If future work instead needs workflow-level ranking, dataset-view scheduling, or richer multi-state bookkeeping, that is likely the point where ALF would need a genuine runtime extension rather than another additive stage implementation.
+
+## 15. Excited-State Additions Since The Initial Checkpoint (2026-05-06)
+
+This section records the newer excited-state work added after the original integration checkpoint. The common theme is still the same: keep `alframework/__main__.py`, `status.txt`, HDF5 writing, Parsl task contracts, and the standard ALF queue flow intact whenever possible.
+
+### 15.1 Shared-GPU Darwin Example Layout
+
+The current larger excited-state Darwin test path is:
+
+- [`examples/excited_state_pyseqm_sharedgpu_gap_uncertainty`](./examples/excited_state_pyseqm_sharedgpu_gap_uncertainty)
+
+This example uses a 3-node Darwin allocation with two logical executor pools:
+
+- `alf_gpu_executor` for replay builders, excited-state samplers, and pyseqm QM tasks
+- `alf_ML_executor` for full-node HIPPYNN ensemble retraining
+
+The intended node layout is:
+
+- node 0: ALF master process plus shared sampler/QM GPU workers
+- node 1: shared sampler/QM GPU workers
+- node 2: dedicated ML worker that internally trains ensemble members across that node's GPUs
+
+Important behavior:
+
+- sampler and QM are no longer pinned to separate GPU nodes in this example
+- sampler/QM sharing is achieved by using excited-state-specific task wrappers decorated with `alf_gpu_executor`
+- ML remains intentionally separate because the excited-state HIPPYNN ensemble task uses multiprocessing internally across `gpus_per_node`
+
+This is still an in-allocation Slurm model. Parsl workers are launched inside the Slurm allocation; Parsl is not requesting additional nodes from the scheduler in this example.
+
+### 15.2 Pre-Labeled Seed Bootstrap And Prebuilt HDF5
+
+The excited-state replay builder now supports pre-labeled seed data through `prelabeled_seed_file_names`.
+
+For the keto 5k workflow this allows the seed dataset to provide:
+
+- coordinates and atomic numbers through `R` and `Z`
+- excited-state energies through `sE0`, `sE1`, `sE2`, `sE3`
+- excited-state forces through `F0`, `F1`, `F2`, `F3`
+- optional adjacent gaps through `dE01`, `dE12`, `dE23`
+
+The builder attaches those labels directly to seed `MoleculesObject` instances and marks them converged only if every property required by `properties_list` is present, finite, and shape-compatible.
+
+The pyseqm QM task also has a pre-labeled bypass controlled by:
+
+```json
+"accept_prelabeled": true
+```
+
+If a molecule is already converged and complete for the requested `properties_list`, pyseqm returns it without running a new label calculation.
+
+For large seed bootstraps, the faster path is the package-level prebuild helper:
+
+```bash
+python -m alframework.tools.prebuild_excited_state_bootstrap_h5 \
+  --run-dir <example-dir> \
+  --master <master-config>
+```
+
+This writes `data-0000.h5` directly from the pre-labeled seed data and writes status with `current_h5_id: 1`, so ALF skips the slow bootstrap future queue and starts model training immediately.
+
+The gap-uncertainty example no longer keeps local Python wrapper scripts for this. Its Slurm wrapper calls package modules directly with `python -m`.
+
+### 15.3 Direct Gap Targets And Gap Uncertainty
+
+Adjacent energy gaps are now optional first-class system properties in the excited-state path:
+
+```json
+"dE01": ["dE01", "system", 1.0],
+"dE12": ["dE12", "system", 1.0],
+"dE23": ["dE23", "system", 1.0]
+```
+
+The helper module [`alframework/tools/excited_state_tools.py`](./alframework/tools/excited_state_tools.py) now derives and validates gap tables from `properties_list`.
+
+Important convention:
+
+```text
+dEij = sEj - sEi
+```
+
+The pyseqm excited-state task computes requested `dE##` properties after producing `sE#` labels. This keeps active-learning frames complete when gap properties are present in `properties_list`.
+
+The excited-state HIPPYNN trainer supports optional gap losses through:
+
+```json
+"gap_targets": {
+  "enabled": true,
+  "pairs": [[0, 1], [1, 2], [2, 3]],
+  "weight": 1.0
+}
+```
+
+These gaps are not independent network heads. They are derived graph nodes:
+
+```text
+dE01 = sE1_pred - sE0_pred
+dE12 = sE2_pred - sE1_pred
+dE23 = sE3_pred - sE2_pred
+```
+
+The gap loss backpropagates through the state-energy outputs. The practical benefit is that the ensemble exposes direct gap predictions and direct gap standard deviations, e.g. `ensemble_dE01.mean` and `ensemble_dE01.std`. That is different from subtracting two scalar standard deviations after the fact.
+
+The excited-state sampler records direct gap metadata when available:
+
+- `gap_means`
+- `gap_stds`
+- `gap_pairs`
+
+When direct gap means are present, the sampler's `min_gap` scoring uses those direct gap means rather than recomputing gaps from state-energy means.
+
+### 15.4 Top-N Candidate Return From One Trajectory
+
+The excited-state sampler supports:
+
+```json
+"return_top_n": 25
+```
+
+This is a local per-trajectory ranking feature, not a global ALF top-k pool.
+
+Behavior:
+
+- `return_top_n: 1` preserves the original single-`MoleculesObject` return shape
+- `return_top_n > 1` returns a list of candidate `MoleculesObject` instances
+- candidates are ranked by the existing sampler score
+- each returned candidate gets a unique id derived from the parent molecule id
+- if no candidate survives, `return_top_n > 1` returns an empty list
+
+This works because `__main__.py` already accepts list returns from samplers and flattens them before submitting QM tasks.
+
+### 15.5 Gap-Uncertainty Driven Dynamics
+
+The excited-state sampler now has optional uncertainty-driven dynamics for gap-uncertainty workflows.
+
+Config shape:
+
+```json
+"udd": {
+  "enabled": false,
+  "mode": "gap_std_bias",
+  "target": "initial_min_gap_pair",
+  "bias_weight": 0.0
+}
+```
+
+Default committed behavior is disabled.
+
+When enabled, each trajectory:
+
+1. loads direct ensemble gap nodes such as `ensemble_dE01`, `ensemble_dE12`, and `ensemble_dE23`
+2. evaluates the starting geometry once
+3. chooses the adjacent gap with the smallest absolute predicted mean gap
+4. fixes that gap as the UDD target for the trajectory
+5. runs MD with a biased HIPPYNN energy node:
+
+```text
+E_MD = E_selected_state_mean - bias_weight * std(dEij)
+```
+
+A positive `bias_weight` therefore drives the trajectory uphill in the selected gap uncertainty while still using the selected-state mean energy as the base dynamics surface.
+
+Important limitations for v1:
+
+- the UDD gap target is fixed at the start of the trajectory
+- it does not dynamically switch to a different min-gap pair during MD
+- it requires direct gap std nodes from a gap-trained ensemble
+- it affects only the sampling trajectory, not the subsequent pyseqm labels
+
+Sampler metadata now records UDD fields such as:
+
+- `udd_enabled`
+- `udd_mode`
+- `udd_target`
+- `udd_gap_key`
+- `udd_gap_pair`
+- `udd_bias_weight`
+- `udd_initial_gap_mean`
+- `udd_initial_gap_std`
+- `udd_gap_mean_trace`
+- `udd_gap_std_trace`
+
+### 15.6 Package-Level Helper Commands
+
+The newer excited-state examples should prefer package-level helper modules over local wrapper scripts.
+
+Useful commands:
+
+```bash
+python -m alframework.tools.excited_state_run_report --run-dir <example-dir>
+python -m alframework.tools.prebuild_excited_state_bootstrap_h5 --run-dir <example-dir> --master <master-config>
+python -m alframework.tools.debug_excited_state_pyseqm_bootstrap --run-dir <example-dir> --limit 1
+python -m alframework.tools.excited_state_iteration_plot_inputs --run-dir <example-dir> --overwrite
+```
+
+This keeps example directories closer to config-only run directories and keeps implementation logic in `alframework.tools`.
+
+### 15.7 Current Guidance For Extending The Excited-State Path
+
+For small feature additions, prefer extending the excited-state-specific modules rather than `__main__.py`.
+
+Safe extension points:
+
+- add optional properties through `properties_list`
+- add pyseqm postprocessing after state labels are produced
+- add optional HIPPYNN derived nodes and losses in the excited-state trainer
+- add sampler metadata and local per-trajectory candidate-selection behavior
+- add package-level helper tools under `alframework.tools`
+
+Avoid changing core ALF runtime unless the feature needs true global scheduling semantics, such as cross-trajectory global top-k selection or batch-aware QM scheduling across many pending sampler outputs.
