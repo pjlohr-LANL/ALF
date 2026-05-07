@@ -80,7 +80,7 @@ def _print_debug_report(run_dir: Path, debug_report: Path) -> None:
     print("============")
     if not debug_report.exists():
         print(f"Report: missing ({debug_report.relative_to(run_dir)})")
-        print("Create it with: ./debug_pyseqm_bootstrap.py")
+        print("Create it with: python -m alframework.tools.debug_excited_state_pyseqm_bootstrap --run-dir <run-dir>")
         return
     report = _load_json(debug_report)
     summary = report.get("summary", {})
