@@ -191,6 +191,9 @@ def train_single_excited_state_model(
     state_table = derive_state_property_table(properties_list, require_forces=bool(ML_config.get("train_forces", True)))
     gap_config = dict(ML_config.get("gap_targets") or {})
     gap_targets_enabled = bool(gap_config.get("enabled", False))
+    gap_target_mode = str(gap_config.get("mode", "derived")).strip().lower()
+    if gap_targets_enabled and gap_target_mode not in {"derived", "head"}:
+        raise ValueError(f"Unsupported gap_targets.mode: {gap_target_mode!r}. Use 'derived' or 'head'.")
     gap_table = derive_gap_property_table(
         properties_list,
         gap_config=gap_config if gap_config else None,
@@ -267,12 +270,16 @@ def train_single_excited_state_model(
                 for row in gap_table:
                     lower_state = int(row["lower_state"])
                     upper_state = int(row["upper_state"])
-                    if lower_state not in energy_by_state or upper_state not in energy_by_state:
-                        raise ValueError(
-                            f"Gap target {row['gap_key']} requires states {lower_state} and {upper_state}, "
-                            "but one of those state energy outputs is missing."
-                        )
-                    gap_output = energy_by_state[upper_state] - energy_by_state[lower_state]
+                    if gap_target_mode == "head":
+                        gap_node = targets.HEnergyNode(f"gap_{row['gap_key']}", network, module_kwargs=None)
+                        gap_output = gap_node.mol_energy
+                    else:
+                        if lower_state not in energy_by_state or upper_state not in energy_by_state:
+                            raise ValueError(
+                                f"Gap target {row['gap_key']} requires states {lower_state} and {upper_state}, "
+                                "but one of those state energy outputs is missing."
+                            )
+                        gap_output = energy_by_state[upper_state] - energy_by_state[lower_state]
                     gap_output.name = str(row["gap_key"])
                     gap_output.db_name = str(row["gap_db_name"])
                     gap_outputs.append((row, gap_output))
@@ -440,6 +447,7 @@ def train_single_excited_state_model(
                 "cuda_visible_devices": str(cuda_visible),
                 "state_table": state_table,
                 "gap_table": gap_table,
+                "gap_target_mode": gap_target_mode if gap_targets_enabled else "disabled",
                 "metric": metric_tracker.best_metric_values,
                 "avg_epoch_time": float(np.average(metric_tracker.epoch_times)),
                 "loss": float(metric_tracker.best_metric_values["valid"]["Loss"]),
