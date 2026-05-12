@@ -41,6 +41,41 @@ def _force_rms(array: np.ndarray) -> float:
     return float(np.sqrt(np.mean(data * data)))
 
 
+def _force_norm(array: np.ndarray) -> float:
+    data = np.asarray(array, dtype=np.float64)
+    return float(np.sqrt(np.sum(data * data)))
+
+
+def _make_hippynn_calculator(
+    HippynnCalculator,
+    torch,
+    *,
+    energy,
+    extra_properties: dict[str, Any] | None,
+    sampler_config: dict[str, Any],
+    device,
+    offset: float | None = None,
+):
+    calc = HippynnCalculator(
+        energy=energy,
+        extra_properties=extra_properties,
+        en_unit=units.eV,
+        offset=float(sampler_config.get("energy_offset_eV", 0.0) if offset is None else offset),
+    )
+    calc.to(torch.float32)
+    calc.to(device)
+    return calc
+
+
+def _calculator_force_norm(atoms, calculator) -> float:
+    probe_atoms = atoms.copy()
+    probe_atoms.calc = calculator
+    try:
+        return _force_norm(np.asarray(probe_atoms.get_forces(), dtype=np.float64))
+    finally:
+        probe_atoms.calc = None
+
+
 def _minimum_gap(energies: dict[int, float]) -> tuple[float, tuple[int, int]]:
     state_ids = sorted(energies)
     best_gap = float("inf")
@@ -214,6 +249,57 @@ def _select_initial_udd_gap_target(results: dict[str, Any], gap_table: list[dict
     return min(candidates, key=lambda item: abs(float(item["initial_gap_mean"])))
 
 
+def _udd_tau_settings(udd: dict[str, Any], total_md_steps: int) -> dict[str, Any]:
+    tau_mode = str(udd.get("tau_mode", "fixed")).strip().lower()
+    if tau_mode not in {"fixed", "force_relative"}:
+        raise ValueError(f"Unsupported excited-state UDD tau_mode: {tau_mode!r}. Use 'fixed' or 'force_relative'.")
+    if tau_mode == "fixed":
+        return {
+            "tau_mode": tau_mode,
+            "tau_relative": None,
+            "tau_history_steps": None,
+            "tau_update_interval": None,
+            "tau_min": None,
+            "tau_max": None,
+            "tau_force_epsilon": None,
+        }
+
+    tau_relative = float(udd.get("tau_relative", 0.05))
+    tau_history_steps = int(udd.get("tau_history_steps", 100))
+    tau_update_interval = int(udd.get("tau_update_interval", tau_history_steps))
+    tau_min = float(udd.get("tau_min", 0.0))
+    tau_max = float(udd.get("tau_max", 10.0))
+    tau_force_epsilon = float(udd.get("tau_force_epsilon", 1.0e-12))
+
+    if tau_relative <= 0.0:
+        raise ValueError("excited-state UDD force_relative mode requires tau_relative > 0.")
+    if tau_history_steps <= 0:
+        raise ValueError("excited-state UDD force_relative mode requires tau_history_steps > 0.")
+    if tau_update_interval <= 0:
+        raise ValueError("excited-state UDD force_relative mode requires tau_update_interval > 0.")
+    if tau_min < 0.0:
+        raise ValueError("excited-state UDD force_relative mode requires tau_min >= 0.")
+    if tau_max < tau_min:
+        raise ValueError("excited-state UDD force_relative mode requires tau_max >= tau_min.")
+    if tau_force_epsilon <= 0.0:
+        raise ValueError("excited-state UDD force_relative mode requires tau_force_epsilon > 0.")
+    if int(total_md_steps) < tau_history_steps:
+        raise ValueError(
+            "excited-state UDD force_relative mode requires total trajectory steps "
+            f"({int(total_md_steps)}) >= tau_history_steps ({tau_history_steps})."
+        )
+
+    return {
+        "tau_mode": tau_mode,
+        "tau_relative": float(tau_relative),
+        "tau_history_steps": int(tau_history_steps),
+        "tau_update_interval": int(tau_update_interval),
+        "tau_min": float(tau_min),
+        "tau_max": float(tau_max),
+        "tau_force_epsilon": float(tau_force_epsilon),
+    }
+
+
 def _write_metadata(meta_dir: str | None, moleculeid: str, payload: dict[str, Any], metadata_format: str) -> None:
     if meta_dir is None:
         return
@@ -346,33 +432,60 @@ def run_excited_state_sampling(
         molecule_object.atoms.set_positions(positions)
 
     ase_atoms = molecule_object.get_atoms().copy()
+    feed = _temperature_feed_parameters(sampler_config, rng)
+    dt = float(sampler_config["dt"])
+    maxt = float(sampler_config["maxt"])
+    ncheck = int(sampler_config["Ncheck"])
+    min_time = float(sampler_config.get("min_time", 0.0))
+    friction = float(sampler_config.get("friction", 0.02))
+    total_md_steps = int(np.ceil((1000.0 * maxt) / dt))
+    n_outer = int(np.ceil(float(total_md_steps) / float(ncheck)))
+    trajectory_interval = _sample_trajectory_interval(sampler_config, rng)
+    meta_dir = sampler_config.get("meta_dir")
+    metadata_format = str(sampler_config.get("metadata_format", "pickle"))
+    write_xyz = bool(sampler_config.get("write_traj_xyz", False))
+    write_binary = bool(sampler_config.get("write_traj_binary", trajectory_interval is not None))
+    return_top_n = _return_top_n(sampler_config)
+
     energy_for_md = energy_node.mean
     udd = _udd_config(sampler_config)
     udd_enabled = bool(udd.get("enabled", False))
+    udd_tau = float(udd.get("bias_weight", 0.0))
+    udd_tau_settings = _udd_tau_settings(udd, total_md_steps) if udd_enabled else _udd_tau_settings({}, total_md_steps)
+    udd_tau_mode = str(udd_tau_settings["tau_mode"])
     udd_metadata: dict[str, Any] = {
         "udd_enabled": bool(udd_enabled),
         "udd_mode": str(udd.get("mode", "gap_std_bias")),
         "udd_target": str(udd.get("target", "initial_min_gap_pair")),
-        "udd_bias_weight": float(udd.get("bias_weight", 0.0)),
+        "udd_bias_weight": float(udd_tau),
+        "udd_tau_mode": udd_tau_mode,
+        "udd_tau_relative": udd_tau_settings["tau_relative"],
+        "udd_tau_history_steps": udd_tau_settings["tau_history_steps"],
+        "udd_tau_update_interval": udd_tau_settings["tau_update_interval"],
+        "udd_tau_min": udd_tau_settings["tau_min"],
+        "udd_tau_max": udd_tau_settings["tau_max"],
+        "udd_tau_force_epsilon": udd_tau_settings["tau_force_epsilon"],
         "udd_gap_key": None,
         "udd_gap_pair": None,
         "udd_initial_gap_mean": None,
         "udd_initial_gap_std": None,
     }
+    model_force_calculator = None
+    sigma_force_calculator = None
     if udd_enabled:
         if str(udd_metadata["udd_mode"]).strip().lower() != "gap_std_bias":
             raise ValueError(f"Unsupported excited-state UDD mode: {udd_metadata['udd_mode']}")
         if str(udd_metadata["udd_target"]).strip().lower() != "initial_min_gap_pair":
             raise ValueError(f"Unsupported excited-state UDD target: {udd_metadata['udd_target']}")
 
-        probe_calculator = HippynnCalculator(
+        probe_calculator = _make_hippynn_calculator(
+            HippynnCalculator,
+            torch,
             energy=energy_node.mean,
             extra_properties=extra_properties,
-            en_unit=units.eV,
-            offset=float(sampler_config.get("energy_offset_eV", 0.0)),
+            sampler_config=sampler_config,
+            device=device,
         )
-        probe_calculator.to(torch.float32)
-        probe_calculator.to(device)
         probe_atoms = ase_atoms.copy()
         probe_atoms.calc = probe_calculator
         probe_atoms.get_potential_energy()
@@ -381,7 +494,31 @@ def run_excited_state_sampling(
         del probe_calculator
 
         udd_gap_key = str(udd_target["gap_key"])
-        energy_for_md = energy_node.mean - float(udd_metadata["udd_bias_weight"]) * gap_node_by_key[udd_gap_key].std
+        if udd_gap_key not in gap_node_by_key:
+            raise ValueError(f"UDD selected gap {udd_gap_key!r}, but no direct ensemble node was loaded for it.")
+        if udd_tau_mode == "fixed":
+            energy_for_md = energy_node.mean - float(udd_tau) * gap_node_by_key[udd_gap_key].std
+        else:
+            # Start force-relative UDD unbiased. Tau is estimated from Eq. 14
+            # using helper force norms and then applied to subsequent MD chunks.
+            energy_for_md = energy_node.mean
+            model_force_calculator = _make_hippynn_calculator(
+                HippynnCalculator,
+                torch,
+                energy=energy_node.mean,
+                extra_properties=None,
+                sampler_config=sampler_config,
+                device=device,
+            )
+            sigma_force_calculator = _make_hippynn_calculator(
+                HippynnCalculator,
+                torch,
+                energy=gap_node_by_key[udd_gap_key].std,
+                extra_properties=None,
+                sampler_config=sampler_config,
+                device=device,
+                offset=0.0,
+            )
         udd_metadata.update(
             {
                 "udd_gap_key": udd_gap_key,
@@ -391,28 +528,15 @@ def run_excited_state_sampling(
             }
         )
 
-    calculator = HippynnCalculator(
+    calculator = _make_hippynn_calculator(
+        HippynnCalculator,
+        torch,
         energy=energy_for_md,
         extra_properties=extra_properties,
-        en_unit=units.eV,
-        offset=float(sampler_config.get("energy_offset_eV", 0.0)),
+        sampler_config=sampler_config,
+        device=device,
     )
-    calculator.to(torch.float32)
-    calculator.to(device)
     ase_atoms.calc = calculator
-
-    feed = _temperature_feed_parameters(sampler_config, rng)
-    dt = float(sampler_config["dt"])
-    maxt = float(sampler_config["maxt"])
-    ncheck = int(sampler_config["Ncheck"])
-    min_time = float(sampler_config.get("min_time", 0.0))
-    friction = float(sampler_config.get("friction", 0.02))
-    trajectory_interval = _sample_trajectory_interval(sampler_config, rng)
-    meta_dir = sampler_config.get("meta_dir")
-    metadata_format = str(sampler_config.get("metadata_format", "pickle"))
-    write_xyz = bool(sampler_config.get("write_traj_xyz", False))
-    write_binary = bool(sampler_config.get("write_traj_binary", trajectory_interval is not None))
-    return_top_n = _return_top_n(sampler_config)
 
     dyn = Langevin(
         ase_atoms,
@@ -439,11 +563,75 @@ def run_excited_state_sampling(
     total_energies: list[float] = []
     udd_gap_mean_trace: list[float] = []
     udd_gap_std_trace: list[float] = []
+    udd_tau_trace: list[float] = []
+    udd_tau_raw_trace: list[float] = []
+    udd_tau_clipped_trace: list[bool] = []
+    udd_bias_force_ratio_trace: list[float] = []
+    udd_tau_update_steps: list[int] = []
+    udd_model_force_norm_sum_trace: list[float] = []
+    udd_sigma_force_norm_sum_trace: list[float] = []
+    udd_force_history: list[tuple[float, float]] = []
+    last_tau_update_step = 0
     geometry_metrics_trace: list[dict[str, Any]] = []
+
+    def _update_force_relative_udd_tau() -> None:
+        nonlocal calculator, energy_for_md, last_tau_update_step, udd_tau
+        if not (udd_enabled and udd_tau_mode == "force_relative"):
+            return
+        if model_force_calculator is None or sigma_force_calculator is None:
+            raise RuntimeError("UDD force_relative mode was enabled without initialized helper calculators.")
+
+        current_step = int(dyn.nsteps)
+        if current_step <= 0:
+            return
+        model_force_norm = _calculator_force_norm(ase_atoms, model_force_calculator)
+        sigma_force_norm = _calculator_force_norm(ase_atoms, sigma_force_calculator)
+        udd_force_history.append((model_force_norm, sigma_force_norm))
+        del udd_force_history[: -int(udd_tau_settings["tau_history_steps"])]
+
+        enough_history = len(udd_force_history) >= int(udd_tau_settings["tau_history_steps"])
+        due_for_update = (current_step - last_tau_update_step) >= int(udd_tau_settings["tau_update_interval"])
+        if not (enough_history and due_for_update):
+            return
+
+        model_sum = float(sum(item[0] for item in udd_force_history))
+        sigma_sum = float(sum(item[1] for item in udd_force_history))
+        tau_raw = float(udd_tau_settings["tau_relative"]) * model_sum / max(
+            sigma_sum,
+            float(udd_tau_settings["tau_force_epsilon"]),
+        )
+        tau_new = float(np.clip(tau_raw, float(udd_tau_settings["tau_min"]), float(udd_tau_settings["tau_max"])))
+        clipped = bool(not np.isclose(tau_new, tau_raw))
+        bias_force_ratio = tau_new * sigma_sum / max(model_sum, float(udd_tau_settings["tau_force_epsilon"]))
+
+        udd_tau = tau_new
+        udd_tau_update_steps.append(int(current_step))
+        udd_tau_trace.append(float(tau_new))
+        udd_tau_raw_trace.append(float(tau_raw))
+        udd_tau_clipped_trace.append(clipped)
+        udd_model_force_norm_sum_trace.append(float(model_sum))
+        udd_sigma_force_norm_sum_trace.append(float(sigma_sum))
+        udd_bias_force_ratio_trace.append(float(bias_force_ratio))
+        last_tau_update_step = int(current_step)
+
+        if udd_metadata["udd_gap_key"] is None:
+            raise RuntimeError("UDD force_relative mode has no selected gap key.")
+        energy_for_md = energy_node.mean - float(udd_tau) * gap_node_by_key[str(udd_metadata["udd_gap_key"])].std
+        calculator = _make_hippynn_calculator(
+            HippynnCalculator,
+            torch,
+            energy=energy_for_md,
+            extra_properties=extra_properties,
+            sampler_config=sampler_config,
+            device=device,
+        )
+        ase_atoms.calc = calculator
+
+    if udd_enabled and udd_tau_mode == "force_relative":
+        dyn.attach(_update_force_relative_udd_tau, interval=1)
 
     try:
         dyn.run(1)
-        n_outer = int(np.ceil((1000.0 * maxt) / (dt * ncheck)))
         density_trace: list[float] = []
         if feed["Rend"] is None:
             initial_density = None
@@ -481,6 +669,7 @@ def run_excited_state_sampling(
                 write(xyz_handle, ase_atoms, format="xyz")
 
             metrics = _results_to_metrics(ase_atoms, dict(ase_atoms.calc.results), state_table, gap_table, selected_state)
+            current_step = int((step_index + 1) * ncheck)
             if udd_enabled and udd_metadata["udd_gap_key"] is not None:
                 udd_gap_key = str(udd_metadata["udd_gap_key"])
                 if udd_gap_key in metrics["gap_means"]:
@@ -493,7 +682,7 @@ def run_excited_state_sampling(
             total_energies.append(current_total_energy)
             geometry_metrics_trace.append(
                 {
-                    "step": int((step_index + 1) * ncheck),
+                    "step": int(current_step),
                     "time_ps": float(current_time_ps),
                     "min_dist": float(metrics["min_dist"]),
                     "fmax": float(metrics["fmax"]),
@@ -569,6 +758,14 @@ def run_excited_state_sampling(
         "cell": ase_atoms.get_cell(),
         "udd_gap_mean_trace": udd_gap_mean_trace,
         "udd_gap_std_trace": udd_gap_std_trace,
+        "udd_final_tau": float(udd_tau) if udd_enabled else None,
+        "udd_tau_update_steps": udd_tau_update_steps,
+        "udd_tau_trace": udd_tau_trace,
+        "udd_tau_raw_trace": udd_tau_raw_trace,
+        "udd_tau_clipped_trace": udd_tau_clipped_trace,
+        "udd_model_force_norm_sum_trace": udd_model_force_norm_sum_trace,
+        "udd_sigma_force_norm_sum_trace": udd_sigma_force_norm_sum_trace,
+        "udd_bias_force_ratio_trace": udd_bias_force_ratio_trace,
     }
     meta_dict.update(udd_metadata)
     meta_dict.update(molecule_object.get_metadata())

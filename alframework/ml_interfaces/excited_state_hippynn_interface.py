@@ -188,7 +188,12 @@ def train_single_excited_state_model(
     cell_key = ML_config.get("cell_key")
     cell_key = None if cell_key in {None, "None"} else str(cell_key)
 
-    state_table = derive_state_property_table(properties_list, require_forces=bool(ML_config.get("train_forces", True)))
+    train_forces = bool(ML_config.get("train_forces", True))
+    export_force_gradients = bool(ML_config.get("export_force_gradients", train_forces))
+    state_table = derive_state_property_table(
+        properties_list,
+        require_forces=train_forces or export_force_gradients,
+    )
     gap_config = dict(ML_config.get("gap_targets") or {})
     gap_targets_enabled = bool(gap_config.get("enabled", False))
     gap_target_mode = str(gap_config.get("mode", "derived")).strip().lower()
@@ -257,7 +262,7 @@ def train_single_excited_state_model(
                 energy_outputs.append((row, mol_energy))
                 energy_by_state[int(row["state"])] = mol_energy
 
-                if bool(ML_config.get("train_forces", True)) and row["force_key"] is not None:
+                if export_force_gradients and row["force_key"] is not None:
                     force_node = physics.GradientNode(
                         str(row["force_key"]),
                         (mol_energy, positions_node),
@@ -344,32 +349,37 @@ def train_single_excited_state_model(
             if force_outputs:
                 force_norm = math.sqrt(3.0 * float(n_atoms))
                 for row, force_output in force_outputs:
-                    force_rmse = loss.MSELoss.of_node(force_output) ** 0.5
-                    force_mae = loss.MAELoss.of_node(force_output)
-                    combined = (force_rmse + force_mae) / force_norm
-                    validation_losses[f"{row['force_key']}_RMSE"] = force_rmse
-                    validation_losses[f"{row['force_key']}_MAE"] = force_mae
-                    validation_losses[f"{row['force_key']}_Loss"] = combined
-                    total_loss = total_loss + float(ML_config.get("force_weight", 1.0)) * combined
-                    if export_pdf:
-                        plotters.append(
-                            plotting.Hist2D.compare(
-                                force_output,
-                                saved=str(export_subdir_abs / f"{row['force_key']}.pdf"),
-                                shown=False,
+                    if train_forces:
+                        force_rmse = loss.MSELoss.of_node(force_output) ** 0.5
+                        force_mae = loss.MAELoss.of_node(force_output)
+                        combined = (force_rmse + force_mae) / force_norm
+                        validation_losses[f"{row['force_key']}_RMSE"] = force_rmse
+                        validation_losses[f"{row['force_key']}_MAE"] = force_mae
+                        validation_losses[f"{row['force_key']}_Loss"] = combined
+                        total_loss = total_loss + float(ML_config.get("force_weight", 1.0)) * combined
+                        if export_pdf:
+                            plotters.append(
+                                plotting.Hist2D.compare(
+                                    force_output,
+                                    saved=str(export_subdir_abs / f"{row['force_key']}.pdf"),
+                                    shown=False,
+                                )
                             )
-                        )
-                    if export_png:
-                        plotters.append(
-                            plotting.Hist2D.compare(
-                                force_output,
-                                saved=str(export_subdir_abs / f"{row['force_key']}.png"),
-                                shown=False,
+                        if export_png:
+                            plotters.append(
+                                plotting.Hist2D.compare(
+                                    force_output,
+                                    saved=str(export_subdir_abs / f"{row['force_key']}.png"),
+                                    shown=False,
+                                )
                             )
-                        )
-                    if export_csv:
-                        plotters.append(
-                            DataDumper(force_output, saved=str(export_subdir_abs / f"{row['force_key']}.csv"))
+                        if export_csv:
+                            plotters.append(
+                                DataDumper(force_output, saved=str(export_subdir_abs / f"{row['force_key']}.csv"))
+                            )
+                    else:
+                        validation_losses[f"{row['force_key']}_GradientRMS"] = (
+                            loss.MeanSq.of_node(force_output) ** 0.5
                         )
 
             l2_reg = loss.l2reg(network)
@@ -447,6 +457,8 @@ def train_single_excited_state_model(
                 "cuda_visible_devices": str(cuda_visible),
                 "state_table": state_table,
                 "gap_table": gap_table,
+                "train_forces": train_forces,
+                "export_force_gradients": export_force_gradients,
                 "gap_target_mode": gap_target_mode if gap_targets_enabled else "disabled",
                 "metric": metric_tracker.best_metric_values,
                 "avg_epoch_time": float(np.average(metric_tracker.epoch_times)),
