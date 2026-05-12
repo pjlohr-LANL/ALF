@@ -117,15 +117,48 @@ def _passes_uncertainty_gate(metrics: dict[str, Any], sampler_config: dict[str, 
     return uE_value >= min_uE or uF_value >= min_uF
 
 
-def compute_excited_state_score(metrics: dict[str, Any], sampler_config: dict[str, Any]) -> float:
+def compute_excited_state_score_components(
+    metrics: dict[str, Any],
+    sampler_config: dict[str, Any],
+    *,
+    udd_gap_key: str | None = None,
+) -> dict[str, float]:
     score_config = _score_config(sampler_config)
     uE_value, uF_value = _effective_uncertainties(metrics, score_config)
     gap_value = _gap_term(float(metrics["min_gap"]), score_config)
-    return (
-        float(score_config.get("w_energy", 1.0)) * uE_value
-        + float(score_config.get("w_force", 1.0)) * uF_value
-        + float(score_config.get("w_gap", 0.0)) * gap_value
-    )
+    components = {
+        "energy_uncertainty": float(score_config.get("w_energy", 1.0)) * uE_value,
+        "force_uncertainty": float(score_config.get("w_force", 1.0)) * uF_value,
+        "gap": float(score_config.get("w_gap", 0.0)) * gap_value,
+        "gap_uncertainty": 0.0,
+    }
+    gap_uncertainty_weight = float(score_config.get("w_gap_uncertainty", 0.0))
+    if gap_uncertainty_weight != 0.0:
+        target = str(score_config.get("gap_uncertainty_target", "udd_target")).strip().lower()
+        if target != "udd_target":
+            raise ValueError(
+                f"Unsupported excited-state gap_uncertainty_target: {target!r}. "
+                "Use 'udd_target'."
+            )
+        if udd_gap_key is None:
+            raise ValueError("w_gap_uncertainty > 0 requires UDD to select a target gap.")
+        if udd_gap_key not in metrics["gap_stds"]:
+            raise ValueError(
+                f"w_gap_uncertainty > 0 requires gap std for UDD target {udd_gap_key!r}, "
+                "but it was not present in sampler metrics."
+            )
+        components["gap_uncertainty"] = gap_uncertainty_weight * float(metrics["gap_stds"][udd_gap_key])
+    return components
+
+
+def compute_excited_state_score(
+    metrics: dict[str, Any],
+    sampler_config: dict[str, Any],
+    *,
+    udd_gap_key: str | None = None,
+) -> float:
+    components = compute_excited_state_score_components(metrics, sampler_config, udd_gap_key=udd_gap_key)
+    return float(sum(components.values()))
 
 
 def _results_to_metrics(
@@ -708,9 +741,24 @@ def run_excited_state_sampling(
             if not _passes_uncertainty_gate(metrics, sampler_config):
                 continue
 
-            score = compute_excited_state_score(metrics, sampler_config)
+            score_gap_uncertainty_key = None
+            if float(_score_config(sampler_config).get("w_gap_uncertainty", 0.0)) != 0.0:
+                if udd_metadata["udd_gap_key"] is not None:
+                    score_gap_uncertainty_key = str(udd_metadata["udd_gap_key"])
+            score_components = compute_excited_state_score_components(
+                metrics,
+                sampler_config,
+                udd_gap_key=score_gap_uncertainty_key,
+            )
+            score = float(sum(score_components.values()))
+            score_gap_uncertainty_std = None
+            if score_gap_uncertainty_key is not None:
+                score_gap_uncertainty_std = float(metrics["gap_stds"][score_gap_uncertainty_key])
             candidate_record = {
                     "score": float(score),
+                    "score_components": score_components,
+                    "score_gap_uncertainty_key": score_gap_uncertainty_key,
+                    "score_gap_uncertainty_std": score_gap_uncertainty_std,
                     "step": int((step_index + 1) * ncheck),
                     "time_ps": float(current_time_ps),
                     "selected_state": int(selected_state),
