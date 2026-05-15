@@ -36,6 +36,10 @@ def _udd_config(sampler_config: dict[str, Any]) -> dict[str, Any]:
     return dict(sampler_config.get("udd") or {})
 
 
+def _gap_seeking_config(sampler_config: dict[str, Any]) -> dict[str, Any]:
+    return dict(sampler_config.get("gap_seeking") or {})
+
+
 def _force_rms(array: np.ndarray) -> float:
     data = np.asarray(array, dtype=np.float64)
     return float(np.sqrt(np.mean(data * data)))
@@ -87,6 +91,197 @@ def _minimum_gap(energies: dict[int, float]) -> tuple[float, tuple[int, int]]:
                 best_gap = gap
                 pair = (int(state_i), int(state_j))
     return float(best_gap), pair
+
+
+def _gap_key_from_pair(pair: tuple[int, int] | list[int]) -> str:
+    lower, upper = int(pair[0]), int(pair[1])
+    return f"dE{lower}{upper}"
+
+
+def _adjacent_gap_pairs(state_ids: list[int]) -> list[tuple[int, int]]:
+    states = sorted(int(state) for state in state_ids)
+    if len(states) < 2:
+        return []
+    return [(states[idx], states[idx + 1]) for idx in range(len(states) - 1)]
+
+
+def _allowed_gap_pairs(
+    state_ids: list[int],
+    selected_state: int,
+    candidate_pairs: str,
+) -> list[tuple[int, int]]:
+    adjacent_pairs = _adjacent_gap_pairs(state_ids)
+    mode = str(candidate_pairs).strip().lower()
+    if mode == "adjacent":
+        return [pair for pair in adjacent_pairs if int(selected_state) in pair]
+    if mode in {"all", "all_adjacent"}:
+        return adjacent_pairs
+    raise ValueError(
+        f"Unsupported gap_seeking.candidate_pairs: {candidate_pairs!r}. "
+        "Use 'adjacent', 'all_adjacent', or legacy alias 'all'."
+    )
+
+
+def _gap_infos_from_metric_data(
+    metrics: dict[str, Any],
+    pairs: list[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    infos: list[dict[str, Any]] = []
+    gap_means = dict(metrics.get("gap_means") or {})
+    energies = dict(metrics.get("energies") or {})
+    for lower_state, upper_state in pairs:
+        gap_key = _gap_key_from_pair((lower_state, upper_state))
+        if gap_key in gap_means:
+            gap = float(gap_means[gap_key])
+            gap_source = "direct_gap_head"
+        elif lower_state in energies and upper_state in energies:
+            gap = float(energies[int(upper_state)]) - float(energies[int(lower_state)])
+            gap_source = "state_energy_difference"
+        else:
+            continue
+        infos.append(
+            {
+                "pair": [int(lower_state), int(upper_state)],
+                "gap_key": gap_key,
+                "gap_source": gap_source,
+                "gap_eV": float(gap),
+                "abs_gap_eV": abs(float(gap)),
+            }
+        )
+    return infos
+
+
+def _gap_infos_from_energies(
+    energies: dict[int, float],
+    pairs: list[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    infos: list[dict[str, Any]] = []
+    for lower_state, upper_state in pairs:
+        if lower_state not in energies or upper_state not in energies:
+            continue
+        gap = float(energies[int(upper_state)]) - float(energies[int(lower_state)])
+        infos.append(
+            {
+                "pair": [int(lower_state), int(upper_state)],
+                "gap_key": _gap_key_from_pair((lower_state, upper_state)),
+                "gap_source": "state_energy_difference",
+                "gap_eV": float(gap),
+                "abs_gap_eV": abs(float(gap)),
+            }
+        )
+    return infos
+
+
+def _gap_infos_from_results(
+    results: dict[str, Any],
+    pairs: list[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    infos: list[dict[str, Any]] = []
+    for lower_state, upper_state in pairs:
+        gap_key = _gap_key_from_pair((lower_state, upper_state))
+        direct_gap_key = f"{gap_key}_mean"
+        if direct_gap_key in results:
+            gap = float(np.asarray(results[direct_gap_key], dtype=np.float64).reshape(-1)[0])
+            gap_source = "direct_gap_head"
+        else:
+            energy_i_key = f"E_mean_S{int(lower_state)}"
+            energy_j_key = f"E_mean_S{int(upper_state)}"
+            if energy_i_key not in results or energy_j_key not in results:
+                raise ValueError(
+                    "Gap-seeking switch requires either direct gap result "
+                    f"{direct_gap_key!r} or state energy results {energy_i_key!r} and {energy_j_key!r}."
+                )
+            energy_i = float(np.asarray(results[energy_i_key], dtype=np.float64).reshape(-1)[0])
+            energy_j = float(np.asarray(results[energy_j_key], dtype=np.float64).reshape(-1)[0])
+            gap = energy_j - energy_i
+            gap_source = "state_energy_difference"
+        infos.append(
+            {
+                "pair": [int(lower_state), int(upper_state)],
+                "gap_key": gap_key,
+                "gap_source": gap_source,
+                "gap_eV": float(gap),
+                "abs_gap_eV": abs(float(gap)),
+            }
+        )
+    return infos
+
+
+def _gap_seeking_settings(
+    gap_seeking: dict[str, Any],
+    state_ids: list[int],
+    selected_state: int,
+) -> dict[str, Any]:
+    enabled = bool(gap_seeking.get("enabled", False))
+    mode = str(gap_seeking.get("mode", "levine_coe_martinez_switch")).strip().lower()
+    trigger_gap_threshold = float(gap_seeking.get("trigger_gap_threshold_eV", 0.05))
+    candidate_pairs = str(gap_seeking.get("candidate_pairs", "adjacent")).strip().lower()
+    switch_policy = str(gap_seeking.get("switch_policy", "stay_fixed")).strip().lower()
+    sigma = float(gap_seeking.get("sigma", 3.5))
+    alpha_eV = float(gap_seeking.get("alpha_eV", 0.05))
+    switch_check_interval = int(gap_seeking.get("switch_check_interval", 1))
+
+    if not enabled:
+        return {
+            "enabled": False,
+            "mode": mode,
+            "trigger_gap_threshold_eV": trigger_gap_threshold,
+            "candidate_pairs": candidate_pairs,
+            "switch_policy": switch_policy,
+            "sigma": sigma,
+            "alpha_eV": alpha_eV,
+            "switch_check_interval": switch_check_interval,
+            "pairs": [],
+        }
+    pairs = _allowed_gap_pairs(state_ids, int(selected_state), candidate_pairs)
+    if mode != "levine_coe_martinez_switch":
+        raise ValueError(
+            f"Unsupported gap_seeking.mode: {mode!r}. Use 'levine_coe_martinez_switch'."
+        )
+    if switch_policy != "stay_fixed":
+        raise ValueError(f"Unsupported gap_seeking.switch_policy: {switch_policy!r}. Use 'stay_fixed'.")
+    if trigger_gap_threshold <= 0.0:
+        raise ValueError("gap_seeking.trigger_gap_threshold_eV must be > 0.")
+    if sigma <= 0.0:
+        raise ValueError("gap_seeking.sigma must be > 0.")
+    if alpha_eV <= 0.0:
+        raise ValueError("gap_seeking.alpha_eV must be > 0.")
+    if switch_check_interval <= 0:
+        raise ValueError("gap_seeking.switch_check_interval must be > 0.")
+    if not pairs:
+        raise ValueError("gap_seeking requires at least one valid state-energy pair.")
+    return {
+        "enabled": True,
+        "mode": mode,
+        "trigger_gap_threshold_eV": trigger_gap_threshold,
+        "candidate_pairs": candidate_pairs,
+        "switch_policy": switch_policy,
+        "sigma": sigma,
+        "alpha_eV": alpha_eV,
+        "switch_check_interval": switch_check_interval,
+        "pairs": pairs,
+    }
+
+
+def _make_lcm_energy_node(
+    energy_node_by_state: dict[int, Any],
+    gap_node_by_pair: dict[tuple[int, int], Any],
+    pair: tuple[int, int] | list[int],
+    *,
+    sigma: float,
+    alpha_eV: float,
+):
+    lower_state, upper_state = int(pair[0]), int(pair[1])
+    if lower_state not in energy_node_by_state or upper_state not in energy_node_by_state:
+        raise ValueError(f"LCM gap seeking requested missing state pair {lower_state}, {upper_state}.")
+    energy_i = energy_node_by_state[lower_state].mean
+    energy_j = energy_node_by_state[upper_state].mean
+    gap_node = gap_node_by_pair.get((lower_state, upper_state))
+    gap = gap_node.mean if gap_node is not None else energy_j - energy_i
+    # HIPPYNN graph nodes support pow but not abs. This is a smooth |gap|
+    # surrogate for the Levine-Coe-Martinez denominator.
+    abs_gap = ((gap * gap) + 1.0e-12) ** 0.5
+    return 0.5 * (energy_i + energy_j) + float(sigma) * gap * gap / (abs_gap + float(alpha_eV))
 
 
 def _gap_term(min_gap: float, score_config: dict[str, Any]) -> float:
@@ -439,15 +634,14 @@ def run_excited_state_sampling(
         selection_config=_state_selection_config(sampler_config),
         rng=rng,
     )
-    row_by_state = {int(row["state"]): row for row in state_table}
-    state_row = row_by_state[int(selected_state)]
-
-    energy_node = ensemble_graph.node_from_name(str(state_row["energy_node_base"]))
+    energy_node_by_state: dict[int, Any] = {}
     extra_properties: dict[str, Any] = {}
     gap_node_by_key: dict[str, Any] = {}
+    gap_node_by_pair: dict[tuple[int, int], Any] = {}
     for row in state_table:
         state = int(row["state"])
         energy_base = ensemble_graph.node_from_name(str(row["energy_node_base"]))
+        energy_node_by_state[state] = energy_base
         extra_properties[f"E_mean_S{state}"] = energy_base.mean
         extra_properties[f"E_std_S{state}"] = energy_base.std
         if row["force_node_base"] is not None:
@@ -457,8 +651,10 @@ def run_excited_state_sampling(
         gap_base = ensemble_graph.node_from_name(str(row["gap_node_base"]))
         gap_key = str(row["gap_key"])
         gap_node_by_key[gap_key] = gap_base
+        gap_node_by_pair[(int(row["lower_state"]), int(row["upper_state"]))] = gap_base
         extra_properties[f"{gap_key}_mean"] = gap_base.mean
         extra_properties[f"{gap_key}_std"] = gap_base.std
+    energy_node = energy_node_by_state[int(selected_state)]
 
     if sampler_config.get("translate_to_center", False):
         positions = molecule_object.atoms.get_positions() - molecule_object.atoms.get_center_of_mass()
@@ -481,6 +677,15 @@ def run_excited_state_sampling(
     return_top_n = _return_top_n(sampler_config)
 
     energy_for_md = energy_node.mean
+    gap_seeking_settings = _gap_seeking_settings(_gap_seeking_config(sampler_config), state_ids, int(selected_state))
+    gap_seeking_enabled = bool(gap_seeking_settings["enabled"])
+    gap_seeking_switched = False
+    gap_seeking_switch_step = None
+    gap_seeking_switch_time_ps = None
+    gap_seeking_pair = None
+    gap_seeking_gap_key = None
+    gap_seeking_gap_source = None
+    gap_seeking_trigger_gap_eV = None
     udd = _udd_config(sampler_config)
     udd_enabled = bool(udd.get("enabled", False))
     udd_tau = float(udd.get("bias_weight", 0.0))
@@ -606,10 +811,14 @@ def run_excited_state_sampling(
     udd_force_history: list[tuple[float, float]] = []
     last_tau_update_step = 0
     geometry_metrics_trace: list[dict[str, Any]] = []
+    gap_seeking_min_gap_trace: list[dict[str, Any]] = []
+    gap_seeking_active_pair_gap_trace: list[dict[str, Any]] = []
 
     def _update_force_relative_udd_tau() -> None:
         nonlocal calculator, energy_for_md, last_tau_update_step, udd_tau
         if not (udd_enabled and udd_tau_mode == "force_relative"):
+            return
+        if gap_seeking_switched:
             return
         if model_force_calculator is None or sigma_force_calculator is None:
             raise RuntimeError("UDD force_relative mode was enabled without initialized helper calculators.")
@@ -660,8 +869,56 @@ def run_excited_state_sampling(
         )
         ase_atoms.calc = calculator
 
+    def _update_gap_seeking_switch() -> None:
+        nonlocal calculator, energy_for_md
+        nonlocal gap_seeking_switched, gap_seeking_switch_step, gap_seeking_switch_time_ps
+        nonlocal gap_seeking_pair, gap_seeking_gap_key, gap_seeking_gap_source, gap_seeking_trigger_gap_eV
+        if not gap_seeking_enabled or gap_seeking_switched:
+            return
+
+        current_step = int(dyn.nsteps)
+        if current_step <= 0:
+            return
+
+        ase_atoms.get_potential_energy()
+        gap_infos = _gap_infos_from_results(
+            dict(ase_atoms.calc.results),
+            list(gap_seeking_settings["pairs"]),
+        )
+        if not gap_infos:
+            raise RuntimeError("Gap-seeking switch found no valid state-energy gaps to monitor.")
+        trigger = min(gap_infos, key=lambda item: float(item["abs_gap_eV"]))
+        if float(trigger["abs_gap_eV"]) > float(gap_seeking_settings["trigger_gap_threshold_eV"]):
+            return
+
+        gap_seeking_switched = True
+        gap_seeking_switch_step = int(current_step)
+        gap_seeking_switch_time_ps = float(current_step * dt) / 1000.0
+        gap_seeking_pair = [int(value) for value in trigger["pair"]]
+        gap_seeking_gap_key = str(trigger["gap_key"])
+        gap_seeking_gap_source = str(trigger["gap_source"])
+        gap_seeking_trigger_gap_eV = float(trigger["gap_eV"])
+        energy_for_md = _make_lcm_energy_node(
+            energy_node_by_state,
+            gap_node_by_pair,
+            gap_seeking_pair,
+            sigma=float(gap_seeking_settings["sigma"]),
+            alpha_eV=float(gap_seeking_settings["alpha_eV"]),
+        )
+        calculator = _make_hippynn_calculator(
+            HippynnCalculator,
+            torch,
+            energy=energy_for_md,
+            extra_properties=extra_properties,
+            sampler_config=sampler_config,
+            device=device,
+        )
+        ase_atoms.calc = calculator
+
     if udd_enabled and udd_tau_mode == "force_relative":
         dyn.attach(_update_force_relative_udd_tau, interval=1)
+    if gap_seeking_enabled:
+        dyn.attach(_update_gap_seeking_switch, interval=int(gap_seeking_settings["switch_check_interval"]))
 
     try:
         dyn.run(1)
@@ -709,6 +966,32 @@ def run_excited_state_sampling(
                     udd_gap_mean_trace.append(float(metrics["gap_means"][udd_gap_key]))
                 if udd_gap_key in metrics["gap_stds"]:
                     udd_gap_std_trace.append(float(metrics["gap_stds"][udd_gap_key]))
+            if gap_seeking_enabled:
+                gap_infos = _gap_infos_from_metric_data(
+                    metrics,
+                    list(gap_seeking_settings["pairs"]),
+                )
+                if gap_infos:
+                    min_gap_info = min(gap_infos, key=lambda item: float(item["abs_gap_eV"]))
+                    gap_seeking_min_gap_trace.append(
+                        {
+                            "step": int(current_step),
+                            "time_ps": float(current_step * dt) / 1000.0,
+                            **min_gap_info,
+                        }
+                    )
+                    if gap_seeking_pair is not None:
+                        active_pair = [int(gap_seeking_pair[0]), int(gap_seeking_pair[1])]
+                        for gap_info in gap_infos:
+                            if [int(value) for value in gap_info["pair"]] == active_pair:
+                                gap_seeking_active_pair_gap_trace.append(
+                                    {
+                                        "step": int(current_step),
+                                        "time_ps": float(current_step * dt) / 1000.0,
+                                        **gap_info,
+                                    }
+                                )
+                                break
             current_temperature = float(ase_atoms.get_temperature())
             current_total_energy = float(ase_atoms.get_potential_energy() + ase_atoms.get_kinetic_energy())
             temperatures.append(current_temperature)
@@ -762,6 +1045,10 @@ def run_excited_state_sampling(
                     "step": int((step_index + 1) * ncheck),
                     "time_ps": float(current_time_ps),
                     "selected_state": int(selected_state),
+                    "gap_seeking_switched": bool(gap_seeking_switched),
+                    "gap_seeking_pair": gap_seeking_pair,
+                    "gap_seeking_gap_key": gap_seeking_gap_key,
+                    "gap_seeking_gap_source": gap_seeking_gap_source,
                     "temperature_K": float(current_temperature),
                     "temperature_target_K": float(target_temperature),
                     **metrics,
@@ -804,6 +1091,23 @@ def run_excited_state_sampling(
         "chemical_symbols": ase_atoms.get_chemical_symbols(),
         "positions": ase_atoms.get_positions(wrap=True),
         "cell": ase_atoms.get_cell(),
+        "gap_seeking_enabled": bool(gap_seeking_enabled),
+        "gap_seeking_mode": str(gap_seeking_settings["mode"]),
+        "gap_seeking_candidate_pairs": str(gap_seeking_settings["candidate_pairs"]),
+        "gap_seeking_switch_policy": str(gap_seeking_settings["switch_policy"]),
+        "gap_seeking_trigger_gap_threshold_eV": float(gap_seeking_settings["trigger_gap_threshold_eV"]),
+        "gap_seeking_sigma": float(gap_seeking_settings["sigma"]),
+        "gap_seeking_alpha_eV": float(gap_seeking_settings["alpha_eV"]),
+        "gap_seeking_switch_check_interval": int(gap_seeking_settings["switch_check_interval"]),
+        "gap_seeking_switched": bool(gap_seeking_switched),
+        "gap_seeking_switch_step": gap_seeking_switch_step,
+        "gap_seeking_switch_time_ps": gap_seeking_switch_time_ps,
+        "gap_seeking_pair": gap_seeking_pair,
+        "gap_seeking_gap_key": gap_seeking_gap_key,
+        "gap_seeking_gap_source": gap_seeking_gap_source,
+        "gap_seeking_trigger_gap_eV": gap_seeking_trigger_gap_eV,
+        "gap_seeking_min_gap_trace": gap_seeking_min_gap_trace,
+        "gap_seeking_active_pair_gap_trace": gap_seeking_active_pair_gap_trace,
         "udd_gap_mean_trace": udd_gap_mean_trace,
         "udd_gap_std_trace": udd_gap_std_trace,
         "udd_final_tau": float(udd_tau) if udd_enabled else None,
