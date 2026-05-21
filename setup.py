@@ -25,6 +25,10 @@ full_requirements = [
     "hippynn",
 ]
 
+gpu_dynamics_requirements = [
+    "nvalchemi-toolkit>=0.1.0",
+]
+
 setuptools.setup(
     name="alf",
     version="0.0.1",
@@ -32,7 +36,11 @@ setuptools.setup(
     author_email="",
     python_requires=">3.9",
     install_requires=install_requirements,
-    extras_require={"docs": doc_requirements, "full": full_requirements},
+    extras_require={
+        "docs": doc_requirements,
+        "full": full_requirements,
+        "gpu_dynamics": gpu_dynamics_requirements,
+    },
     license="BSD 3-Clause License",
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -45,4 +53,3 @@ setuptools.setup(
     long_description=long_description,
     packages=setuptools.find_packages(),
 )
-

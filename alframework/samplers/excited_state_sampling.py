@@ -15,7 +15,8 @@ from ase.md.langevin import Langevin
 from parsl import python_app
 
 from alframework.ml_interfaces.excited_state_hippynn_interface import load_excited_state_ensemble
-from alframework.tools.excited_state_tools import select_excited_state, stable_uint32_seed
+from alframework.samplers.sampling_timing import SamplerTiming
+from alframework.tools.excited_state_tools import gap_key_for_pair, select_excited_state, stable_uint32_seed
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.tools import annealing_schedule
 
@@ -38,6 +39,22 @@ def _udd_config(sampler_config: dict[str, Any]) -> dict[str, Any]:
 
 def _gap_seeking_config(sampler_config: dict[str, Any]) -> dict[str, Any]:
     return dict(sampler_config.get("gap_seeking") or {})
+
+
+def _dynamics_backend(sampler_config: dict[str, Any]) -> str:
+    backend = str(sampler_config.get("dynamics_backend", "ase")).strip().lower()
+    aliases = {
+        "ase_langevin": "ase",
+        "alchemi": "alchemi_baoab",
+        "nvalchemi": "alchemi_baoab",
+        "nvalchemi_langevin": "alchemi_baoab",
+    }
+    backend = aliases.get(backend, backend)
+    if backend not in {"ase", "alchemi_baoab"}:
+        raise ValueError(
+            f"Unsupported dynamics_backend {backend!r}. Use 'ase' or 'alchemi_baoab'."
+        )
+    return backend
 
 
 def _force_rms(array: np.ndarray) -> float:
@@ -80,6 +97,61 @@ def _calculator_force_norm(atoms, calculator) -> float:
         probe_atoms.calc = None
 
 
+def _required_sampler_result_keys(state_table: list[dict[str, Any]]) -> list[str]:
+    keys: list[str] = []
+    for row in state_table:
+        state = int(row["state"])
+        keys.extend([f"E_mean_S{state}", f"E_std_S{state}", f"F_std_S{state}"])
+    return keys
+
+
+def _validate_sampler_results(
+    results: dict[str, Any],
+    state_table: list[dict[str, Any]],
+    *,
+    selected_state: int,
+    step: int | None,
+    context: str,
+    gap_seeking_switched: bool,
+    gap_seeking_pair: list[int] | None,
+) -> None:
+    missing = [key for key in _required_sampler_result_keys(state_table) if key not in results]
+    if not missing:
+        return
+    available = sorted(str(key) for key in results)
+    raise RuntimeError(
+        "Excited-state sampler calculator results are missing required keys after evaluation. "
+        f"context={context!r}, step={step}, selected_state={int(selected_state)}, "
+        f"gap_seeking_switched={bool(gap_seeking_switched)}, gap_seeking_pair={gap_seeking_pair}, "
+        f"missing_keys={missing}, available_keys={available}"
+    )
+
+
+def _fresh_sampler_results(
+    atoms,
+    state_table: list[dict[str, Any]],
+    *,
+    selected_state: int,
+    step: int | None,
+    context: str,
+    gap_seeking_switched: bool,
+    gap_seeking_pair: list[int] | None,
+) -> dict[str, Any]:
+    atoms.get_potential_energy()
+    atoms.get_forces()
+    results = dict(atoms.calc.results)
+    _validate_sampler_results(
+        results,
+        state_table,
+        selected_state=selected_state,
+        step=step,
+        context=context,
+        gap_seeking_switched=gap_seeking_switched,
+        gap_seeking_pair=gap_seeking_pair,
+    )
+    return results
+
+
 def _minimum_gap(energies: dict[int, float]) -> tuple[float, tuple[int, int]]:
     state_ids = sorted(energies)
     best_gap = float("inf")
@@ -95,7 +167,7 @@ def _minimum_gap(energies: dict[int, float]) -> tuple[float, tuple[int, int]]:
 
 def _gap_key_from_pair(pair: tuple[int, int] | list[int]) -> str:
     lower, upper = int(pair[0]), int(pair[1])
-    return f"dE{lower}{upper}"
+    return gap_key_for_pair(lower, upper)
 
 
 def _adjacent_gap_pairs(state_ids: list[int]) -> list[tuple[int, int]]:
@@ -362,6 +434,8 @@ def _results_to_metrics(
     state_table: list[dict[str, Any]],
     gap_table: list[dict[str, Any]],
     selected_state: int,
+    *,
+    forces_override: np.ndarray | None = None,
 ) -> dict[str, Any]:
     energies = {int(row["state"]): float(results[f"E_mean_S{int(row['state'])}"]) for row in state_table}
     energy_stds = {int(row["state"]): float(results[f"E_std_S{int(row['state'])}"]) for row in state_table}
@@ -388,7 +462,10 @@ def _results_to_metrics(
         state = int(row["state"])
         force_stds[state] = _force_rms(np.asarray(results[f"F_std_S{state}"], dtype=np.float64))
 
-    forces = np.asarray(atoms.get_forces(), dtype=np.float64)
+    if forces_override is None:
+        forces = np.asarray(atoms.get_forces(), dtype=np.float64)
+    else:
+        forces = np.asarray(forces_override, dtype=np.float64)
     all_distances = np.asarray(atoms.get_all_distances(mic=True), dtype=np.float64)
     np.fill_diagonal(all_distances, np.inf)
     nearest_neighbor_distances = all_distances.min(axis=1)
@@ -600,7 +677,23 @@ def run_excited_state_sampling(
     properties_list: dict[str, list[Any]],
 ) -> MoleculesObject:
     import torch
-    from hippynn.interfaces.ase_interface import HippynnCalculator
+
+    dynamics_backend = _dynamics_backend(sampler_config)
+    use_alchemi = dynamics_backend == "alchemi_baoab"
+    if use_alchemi:
+        from alframework.samplers.alchemi_baoab_dynamics import (
+            ALFExcitedStateAlchemiModel,
+            AlchemiBaoabRunner,
+            alchemi_config_from_sampler,
+            build_alchemi_batch,
+            ensure_alchemi_available,
+            validate_alchemi_sampler_support,
+        )
+
+        ensure_alchemi_available()
+        HippynnCalculator = None
+    else:
+        from hippynn.interfaces.ase_interface import HippynnCalculator
 
     if not isinstance(molecule_object, MoleculesObject):
         raise TypeError("molecule_object must be a MoleculesObject instance.")
@@ -613,6 +706,12 @@ def run_excited_state_sampling(
         torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
+    timing = SamplerTiming.from_sampler_config(
+        sampler_config,
+        backend=dynamics_backend,
+        device=device,
+        batch_size=1,
+    )
 
     rng = np.random.default_rng(stable_uint32_seed(molecule_object.get_moleculeid(), int(current_model_id)))
     ensemble_graph, state_table, gap_table = load_excited_state_ensemble(
@@ -635,6 +734,7 @@ def run_excited_state_sampling(
         rng=rng,
     )
     energy_node_by_state: dict[int, Any] = {}
+    force_node_by_state: dict[int, Any] = {}
     extra_properties: dict[str, Any] = {}
     gap_node_by_key: dict[str, Any] = {}
     gap_node_by_pair: dict[tuple[int, int], Any] = {}
@@ -646,6 +746,7 @@ def run_excited_state_sampling(
         extra_properties[f"E_std_S{state}"] = energy_base.std
         if row["force_node_base"] is not None:
             force_base = ensemble_graph.node_from_name(str(row["force_node_base"]))
+            force_node_by_state[state] = force_base
             extra_properties[f"F_std_S{state}"] = force_base.std
     for row in gap_table:
         gap_base = ensemble_graph.node_from_name(str(row["gap_node_base"]))
@@ -675,8 +776,31 @@ def run_excited_state_sampling(
     write_xyz = bool(sampler_config.get("write_traj_xyz", False))
     write_binary = bool(sampler_config.get("write_traj_binary", trajectory_interval is not None))
     return_top_n = _return_top_n(sampler_config)
+    initial_temperature = annealing_schedule(0.0, maxt, feed["Tamp"], feed["Tper"], feed["Tsrt"], feed["Tend"])
+    alchemi_options = None
+    alchemi_batch = None
+    alchemi_model = None
+    alchemi_model_force_model = None
+    alchemi_sigma_force_model = None
+    if use_alchemi:
+        alchemi_options = alchemi_config_from_sampler(
+            sampler_config,
+            default_seed=stable_uint32_seed(molecule_object.get_moleculeid(), int(current_model_id) + 7919),
+        )
+        validate_alchemi_sampler_support(ase_atoms, feed, device, alchemi_options)
+        alchemi_batch = build_alchemi_batch(ase_atoms, device=device)
 
     energy_for_md = energy_node.mean
+    if use_alchemi:
+        alchemi_model = ALFExcitedStateAlchemiModel(
+            ensemble_graph=ensemble_graph,
+            energy_node=energy_for_md,
+            extra_properties=extra_properties,
+            force_node=force_node_by_state[int(selected_state)].mean,
+            species_key=alchemi_options.species_key,
+            coordinates_key=alchemi_options.coordinates_key,
+            offset_eV=float(sampler_config.get("energy_offset_eV", 0.0)),
+        )
     gap_seeking_settings = _gap_seeking_settings(_gap_seeking_config(sampler_config), state_ids, int(selected_state))
     gap_seeking_enabled = bool(gap_seeking_settings["enabled"])
     gap_seeking_switched = False
@@ -716,20 +840,25 @@ def run_excited_state_sampling(
         if str(udd_metadata["udd_target"]).strip().lower() != "initial_min_gap_pair":
             raise ValueError(f"Unsupported excited-state UDD target: {udd_metadata['udd_target']}")
 
-        probe_calculator = _make_hippynn_calculator(
-            HippynnCalculator,
-            torch,
-            energy=energy_node.mean,
-            extra_properties=extra_properties,
-            sampler_config=sampler_config,
-            device=device,
-        )
-        probe_atoms = ase_atoms.copy()
-        probe_atoms.calc = probe_calculator
-        probe_atoms.get_potential_energy()
-        udd_target = _select_initial_udd_gap_target(dict(probe_atoms.calc.results), gap_table)
-        probe_atoms.calc = None
-        del probe_calculator
+        if use_alchemi:
+            if alchemi_model is None or alchemi_batch is None:
+                raise RuntimeError("ALCHEMI backend was selected without an initialized model and batch.")
+            udd_target = _select_initial_udd_gap_target(alchemi_model.results_from_batch(alchemi_batch), gap_table)
+        else:
+            probe_calculator = _make_hippynn_calculator(
+                HippynnCalculator,
+                torch,
+                energy=energy_node.mean,
+                extra_properties=extra_properties,
+                sampler_config=sampler_config,
+                device=device,
+            )
+            probe_atoms = ase_atoms.copy()
+            probe_atoms.calc = probe_calculator
+            probe_atoms.get_potential_energy()
+            udd_target = _select_initial_udd_gap_target(dict(probe_atoms.calc.results), gap_table)
+            probe_atoms.calc = None
+            del probe_calculator
 
         udd_gap_key = str(udd_target["gap_key"])
         if udd_gap_key not in gap_node_by_key:
@@ -740,23 +869,42 @@ def run_excited_state_sampling(
             # Start force-relative UDD unbiased. Tau is estimated from Eq. 14
             # using helper force norms and then applied to subsequent MD chunks.
             energy_for_md = energy_node.mean
-            model_force_calculator = _make_hippynn_calculator(
-                HippynnCalculator,
-                torch,
-                energy=energy_node.mean,
-                extra_properties=None,
-                sampler_config=sampler_config,
-                device=device,
-            )
-            sigma_force_calculator = _make_hippynn_calculator(
-                HippynnCalculator,
-                torch,
-                energy=gap_node_by_key[udd_gap_key].std,
-                extra_properties=None,
-                sampler_config=sampler_config,
-                device=device,
-                offset=0.0,
-            )
+            if use_alchemi:
+                alchemi_model_force_model = ALFExcitedStateAlchemiModel(
+                    ensemble_graph=ensemble_graph,
+                    energy_node=energy_node.mean,
+                    extra_properties=None,
+                    force_node=force_node_by_state[int(selected_state)].mean,
+                    species_key=alchemi_options.species_key,
+                    coordinates_key=alchemi_options.coordinates_key,
+                    offset_eV=float(sampler_config.get("energy_offset_eV", 0.0)),
+                )
+                alchemi_sigma_force_model = ALFExcitedStateAlchemiModel(
+                    ensemble_graph=ensemble_graph,
+                    energy_node=gap_node_by_key[udd_gap_key].std,
+                    extra_properties=None,
+                    species_key=alchemi_options.species_key,
+                    coordinates_key=alchemi_options.coordinates_key,
+                    offset_eV=0.0,
+                )
+            else:
+                model_force_calculator = _make_hippynn_calculator(
+                    HippynnCalculator,
+                    torch,
+                    energy=energy_node.mean,
+                    extra_properties=None,
+                    sampler_config=sampler_config,
+                    device=device,
+                )
+                sigma_force_calculator = _make_hippynn_calculator(
+                    HippynnCalculator,
+                    torch,
+                    energy=gap_node_by_key[udd_gap_key].std,
+                    extra_properties=None,
+                    sampler_config=sampler_config,
+                    device=device,
+                    offset=0.0,
+                )
         udd_metadata.update(
             {
                 "udd_gap_key": udd_gap_key,
@@ -766,22 +914,41 @@ def run_excited_state_sampling(
             }
         )
 
-    calculator = _make_hippynn_calculator(
-        HippynnCalculator,
-        torch,
-        energy=energy_for_md,
-        extra_properties=extra_properties,
-        sampler_config=sampler_config,
-        device=device,
-    )
-    ase_atoms.calc = calculator
+    if use_alchemi:
+        if alchemi_model is None or alchemi_batch is None:
+            raise RuntimeError("ALCHEMI backend was selected without an initialized model and batch.")
+        alchemi_model.set_energy_node(
+            energy_for_md,
+            force_node=force_node_by_state[int(selected_state)].mean if energy_for_md is energy_node.mean else None,
+        )
+        calculator = None
+        ase_atoms.calc = None
+        dyn = AlchemiBaoabRunner(
+            model=alchemi_model,
+            batch=alchemi_batch,
+            dt_fs=dt,
+            temperature_K=initial_temperature,
+            friction_per_fs=friction,
+            random_seed=int(alchemi_options.random_seed),
+            device=device,
+        )
+    else:
+        calculator = _make_hippynn_calculator(
+            HippynnCalculator,
+            torch,
+            energy=energy_for_md,
+            extra_properties=extra_properties,
+            sampler_config=sampler_config,
+            device=device,
+        )
+        ase_atoms.calc = calculator
 
-    dyn = Langevin(
-        ase_atoms,
-        dt * units.fs,
-        friction=friction,
-        temperature_K=annealing_schedule(0.0, maxt, feed["Tamp"], feed["Tper"], feed["Tsrt"], feed["Tend"]),
-    )
+        dyn = Langevin(
+            ase_atoms,
+            dt * units.fs,
+            friction=friction,
+            temperature_K=initial_temperature,
+        )
 
     traj_writer = None
     xyz_handle = None
@@ -814,20 +981,64 @@ def run_excited_state_sampling(
     gap_seeking_min_gap_trace: list[dict[str, Any]] = []
     gap_seeking_active_pair_gap_trace: list[dict[str, Any]] = []
 
+    def _run_md_steps(steps: int) -> None:
+        with timing.scope("md_run", cuda=use_alchemi):
+            dyn.run(int(steps))
+        timing.increment("num_md_steps_completed", int(steps))
+        timing.increment("num_md_chunks", 1)
+
+    def _sync_alchemi_to_atoms() -> None:
+        if not use_alchemi:
+            return
+        with timing.scope("host_sync"):
+            dyn.sync_to_atoms(ase_atoms)
+        timing.increment("full_sync_count", 1)
+
+    def _evaluate_alchemi_results() -> dict[str, Any]:
+        with timing.scope("model_eval", cuda=True):
+            results = dyn.evaluate_results()
+        timing.increment("scalar_sync_count", 1)
+        return results
+
+    def _fresh_ase_results(*, step: int | None, context: str) -> dict[str, Any]:
+        with timing.scope("model_eval", cuda=str(device).startswith("cuda")):
+            return _fresh_sampler_results(
+                ase_atoms,
+                state_table,
+                selected_state=selected_state,
+                step=step,
+                context=context,
+                gap_seeking_switched=gap_seeking_switched,
+                gap_seeking_pair=gap_seeking_pair,
+            )
+
     def _update_force_relative_udd_tau() -> None:
         nonlocal calculator, energy_for_md, last_tau_update_step, udd_tau
         if not (udd_enabled and udd_tau_mode == "force_relative"):
             return
         if gap_seeking_switched:
             return
-        if model_force_calculator is None or sigma_force_calculator is None:
+        if use_alchemi:
+            if alchemi_model_force_model is None or alchemi_sigma_force_model is None:
+                raise RuntimeError("UDD force_relative mode was enabled without initialized ALCHEMI helper models.")
+        elif model_force_calculator is None or sigma_force_calculator is None:
             raise RuntimeError("UDD force_relative mode was enabled without initialized helper calculators.")
 
         current_step = int(dyn.nsteps)
         if current_step <= 0:
             return
-        model_force_norm = _calculator_force_norm(ase_atoms, model_force_calculator)
-        sigma_force_norm = _calculator_force_norm(ase_atoms, sigma_force_calculator)
+        if use_alchemi:
+            with timing.scope("model_eval", cuda=True):
+                model_force_norm = alchemi_model_force_model.force_norm_for_energy(dyn.batch, energy_node.mean)
+                sigma_force_norm = alchemi_sigma_force_model.force_norm_for_energy(
+                    dyn.batch,
+                    gap_node_by_key[str(udd_metadata["udd_gap_key"])].std,
+                )
+            timing.increment("scalar_sync_count", 2)
+        else:
+            with timing.scope("model_eval", cuda=str(device).startswith("cuda")):
+                model_force_norm = _calculator_force_norm(ase_atoms, model_force_calculator)
+                sigma_force_norm = _calculator_force_norm(ase_atoms, sigma_force_calculator)
         udd_force_history.append((model_force_norm, sigma_force_norm))
         del udd_force_history[: -int(udd_tau_settings["tau_history_steps"])]
 
@@ -859,15 +1070,32 @@ def run_excited_state_sampling(
         if udd_metadata["udd_gap_key"] is None:
             raise RuntimeError("UDD force_relative mode has no selected gap key.")
         energy_for_md = energy_node.mean - float(udd_tau) * gap_node_by_key[str(udd_metadata["udd_gap_key"])].std
-        calculator = _make_hippynn_calculator(
-            HippynnCalculator,
-            torch,
-            energy=energy_for_md,
-            extra_properties=extra_properties,
-            sampler_config=sampler_config,
-            device=device,
-        )
-        ase_atoms.calc = calculator
+        if use_alchemi:
+            alchemi_model.set_energy_node(
+                energy_for_md,
+                force_node=force_node_by_state[int(selected_state)].mean if energy_for_md is energy_node.mean else None,
+            )
+            results = _evaluate_alchemi_results()
+            _validate_sampler_results(
+                results,
+                state_table,
+                selected_state=selected_state,
+                step=current_step,
+                context="udd_tau_update",
+                gap_seeking_switched=gap_seeking_switched,
+                gap_seeking_pair=gap_seeking_pair,
+            )
+        else:
+            calculator = _make_hippynn_calculator(
+                HippynnCalculator,
+                torch,
+                energy=energy_for_md,
+                extra_properties=extra_properties,
+                sampler_config=sampler_config,
+                device=device,
+            )
+            ase_atoms.calc = calculator
+            _fresh_ase_results(step=current_step, context="udd_tau_update")
 
     def _update_gap_seeking_switch() -> None:
         nonlocal calculator, energy_for_md
@@ -880,11 +1108,11 @@ def run_excited_state_sampling(
         if current_step <= 0:
             return
 
-        ase_atoms.get_potential_energy()
-        gap_infos = _gap_infos_from_results(
-            dict(ase_atoms.calc.results),
-            list(gap_seeking_settings["pairs"]),
-        )
+        if use_alchemi:
+            current_results = _evaluate_alchemi_results()
+        else:
+            current_results = _fresh_ase_results(step=current_step, context="gap_seeking_monitor")
+        gap_infos = _gap_infos_from_results(current_results, list(gap_seeking_settings["pairs"]))
         if not gap_infos:
             raise RuntimeError("Gap-seeking switch found no valid state-energy gaps to monitor.")
         trigger = min(gap_infos, key=lambda item: float(item["abs_gap_eV"]))
@@ -905,15 +1133,39 @@ def run_excited_state_sampling(
             sigma=float(gap_seeking_settings["sigma"]),
             alpha_eV=float(gap_seeking_settings["alpha_eV"]),
         )
-        calculator = _make_hippynn_calculator(
-            HippynnCalculator,
-            torch,
-            energy=energy_for_md,
-            extra_properties=extra_properties,
-            sampler_config=sampler_config,
-            device=device,
-        )
-        ase_atoms.calc = calculator
+        if use_alchemi:
+            lower_state, upper_state = int(gap_seeking_pair[0]), int(gap_seeking_pair[1])
+            gap_base = gap_node_by_pair.get((lower_state, upper_state))
+            alchemi_model.set_lcm_gap_mode(
+                lower_energy_node=energy_node_by_state[lower_state].mean,
+                upper_energy_node=energy_node_by_state[upper_state].mean,
+                lower_force_node=force_node_by_state[lower_state].mean,
+                upper_force_node=force_node_by_state[upper_state].mean,
+                gap_node=gap_base.mean if gap_base is not None else None,
+                sigma=float(gap_seeking_settings["sigma"]),
+                alpha_eV=float(gap_seeking_settings["alpha_eV"]),
+            )
+            results = _evaluate_alchemi_results()
+            _validate_sampler_results(
+                results,
+                state_table,
+                selected_state=selected_state,
+                step=current_step,
+                context="gap_seeking_switch",
+                gap_seeking_switched=gap_seeking_switched,
+                gap_seeking_pair=gap_seeking_pair,
+            )
+        else:
+            calculator = _make_hippynn_calculator(
+                HippynnCalculator,
+                torch,
+                energy=energy_for_md,
+                extra_properties=extra_properties,
+                sampler_config=sampler_config,
+                device=device,
+            )
+            ase_atoms.calc = calculator
+            _fresh_ase_results(step=current_step, context="gap_seeking_switch")
 
     if udd_enabled and udd_tau_mode == "force_relative":
         dyn.attach(_update_force_relative_udd_tau, interval=1)
@@ -921,7 +1173,8 @@ def run_excited_state_sampling(
         dyn.attach(_update_gap_seeking_switch, interval=int(gap_seeking_settings["switch_check_interval"]))
 
     try:
-        dyn.run(1)
+        _run_md_steps(1)
+        _sync_alchemi_to_atoms()
         density_trace: list[float] = []
         if feed["Rend"] is None:
             initial_density = None
@@ -952,14 +1205,40 @@ def run_excited_state_sampling(
                 ase_atoms.set_cell(scale * ase_atoms.get_cell(), scale_atoms=True)
                 density_trace.append(float(target_density))
 
-            dyn.run(ncheck)
-            if traj_writer is not None:
-                traj_writer.write(ase_atoms)
-            if xyz_handle is not None:
-                write(xyz_handle, ase_atoms, format="xyz")
+            _run_md_steps(ncheck)
+            _sync_alchemi_to_atoms()
+            with timing.scope("trajectory_io"):
+                if traj_writer is not None:
+                    traj_writer.write(ase_atoms)
+                if xyz_handle is not None:
+                    write(xyz_handle, ase_atoms, format="xyz")
 
-            metrics = _results_to_metrics(ase_atoms, dict(ase_atoms.calc.results), state_table, gap_table, selected_state)
             current_step = int((step_index + 1) * ncheck)
+            if use_alchemi:
+                results = _evaluate_alchemi_results()
+                _validate_sampler_results(
+                    results,
+                    state_table,
+                    selected_state=selected_state,
+                    step=current_step,
+                    context="post_md_chunk",
+                    gap_seeking_switched=gap_seeking_switched,
+                    gap_seeking_pair=gap_seeking_pair,
+                )
+                with timing.scope("metrics"):
+                    metrics = _results_to_metrics(
+                        ase_atoms,
+                        results,
+                        state_table,
+                        gap_table,
+                        selected_state,
+                        forces_override=np.asarray(results["forces"], dtype=np.float64),
+                    )
+            else:
+                results = _fresh_ase_results(step=current_step, context="post_md_chunk")
+                with timing.scope("metrics"):
+                    metrics = _results_to_metrics(ase_atoms, results, state_table, gap_table, selected_state)
+            timing.record_chunk(step=current_step, chunk_steps=int(ncheck))
             if udd_enabled and udd_metadata["udd_gap_key"] is not None:
                 udd_gap_key = str(udd_metadata["udd_gap_key"])
                 if udd_gap_key in metrics["gap_means"]:
@@ -992,8 +1271,14 @@ def run_excited_state_sampling(
                                     }
                                 )
                                 break
-            current_temperature = float(ase_atoms.get_temperature())
-            current_total_energy = float(ase_atoms.get_potential_energy() + ase_atoms.get_kinetic_energy())
+            if use_alchemi:
+                with timing.scope("model_eval", cuda=True):
+                    current_temperature = float(dyn.temperature_K())
+                    current_total_energy = float(results["energy"] + dyn.kinetic_energy_eV())
+                timing.increment("scalar_sync_count", 2)
+            else:
+                current_temperature = float(ase_atoms.get_temperature())
+                current_total_energy = float(ase_atoms.get_potential_energy() + ase_atoms.get_kinetic_energy())
             temperatures.append(current_temperature)
             total_energies.append(current_total_energy)
             geometry_metrics_trace.append(
@@ -1072,8 +1357,12 @@ def run_excited_state_sampling(
     best_record = dict(top_candidates[0]["record"]) if top_candidates else None
     top_candidate_records = [dict(candidate["record"]) for candidate in top_candidates]
     last_geometry_metrics = dict(geometry_metrics_trace[-1]) if geometry_metrics_trace else {}
+    realtime_simulation = float(time.time() - start_time)
+    if hasattr(dyn, "nsteps"):
+        timing.set_count("num_md_steps_completed", int(getattr(dyn, "nsteps", 0)))
+    timing_metadata = timing.metadata(total_wall_s=realtime_simulation, num_atoms=len(ase_atoms))
     meta_dict = {
-        "realtime_simulation": float(time.time() - start_time),
+        "realtime_simulation": realtime_simulation,
         "selected_state": int(selected_state),
         "best_candidate": best_record,
         "top_candidates": top_candidate_records,
@@ -1088,6 +1377,8 @@ def run_excited_state_sampling(
         "density_trace": density_trace if "density_trace" in locals() else [],
         "temperature_feed_parameters": feed,
         "energy_drift_eV_per_ps": drift_eV_per_ps,
+        "dynamics_backend": dynamics_backend,
+        "alchemi_baoab_options": dict(vars(alchemi_options)) if use_alchemi and alchemi_options is not None else None,
         "chemical_symbols": ase_atoms.get_chemical_symbols(),
         "positions": ase_atoms.get_positions(wrap=True),
         "cell": ase_atoms.get_cell(),
@@ -1119,6 +1410,8 @@ def run_excited_state_sampling(
         "udd_sigma_force_norm_sum_trace": udd_sigma_force_norm_sum_trace,
         "udd_bias_force_ratio_trace": udd_bias_force_ratio_trace,
     }
+    if timing_metadata is not None:
+        meta_dict["timing"] = timing_metadata
     meta_dict.update(udd_metadata)
     meta_dict.update(molecule_object.get_metadata())
     _write_metadata(meta_dir, molecule_object.get_moleculeid(), meta_dict, metadata_format)

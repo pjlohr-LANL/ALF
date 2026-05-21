@@ -103,7 +103,11 @@ def derive_state_ids(properties_list: dict[str, list[Any]]) -> list[int]:
 
 
 def gap_key_for_pair(lower_state: int, upper_state: int) -> str:
-    return f"dE{int(lower_state)}{int(upper_state)}"
+    lower_state = int(lower_state)
+    upper_state = int(upper_state)
+    if 0 <= lower_state <= 9 and 0 <= upper_state <= 9:
+        return f"dE{lower_state}{upper_state}"
+    return f"dE{lower_state}_{upper_state}"
 
 
 def parse_gap_key(prop_key: str) -> tuple[int, int] | None:

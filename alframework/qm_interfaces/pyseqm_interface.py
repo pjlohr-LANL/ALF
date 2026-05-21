@@ -132,8 +132,8 @@ def run_pyseqm_batch(
         log_handle,
         "torch tensor creation done",
         start_time=stage_start,
-        coords_dtype=coords.dtype,
-        species_dtype=species.dtype,
+        coords_dtype=getattr(coords, "dtype", None),
+        species_dtype=getattr(species, "dtype", None),
     )
 
     _log_pyseqm_stage(log_handle, "tensor transfer to device start", start_time=stage_start, device=device)

@@ -147,6 +147,7 @@ def test_async_queue_handoff_builder_sampler_qm_h5_ml(monkeypatch, tmp_path: Pat
                 {"state": 0, "energy_node_base": "ensemble_sE0", "force_node_base": "ensemble_F0"},
                 {"state": 1, "energy_node_base": "ensemble_sE1", "force_node_base": "ensemble_F1"},
             ],
+            [],
         )
 
     def fake_train_excited_state_ensemble(**kwargs):

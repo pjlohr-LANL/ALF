@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
+import pytest
 from ase import Atoms
 from ase.calculators.calculator import Calculator, all_changes
 
@@ -109,6 +110,7 @@ def _install_fake_sampling_runtime(monkeypatch, snapshots):
                     "force_db_name": "F1",
                 },
             ],
+            [],
         )
 
     fake_torch = types.ModuleType("torch")
@@ -220,13 +222,91 @@ def test_run_excited_state_sampling_selects_highest_scoring_valid_frame(monkeypa
 
     assert result.get_atoms() is not None
     assert result.get_metadata()["selected_state"] == 0
-    assert result.get_metadata()["best_candidate"]["step"] == 2
+    assert result.get_metadata()["best_candidate"]["step"] == 1
+    assert result.get_metadata()["best_candidate"]["score"] > 0.6
     assert schedule_calls[0] == (0.0, 0.002, 0.0, 5.0, 100.0, 200.0)
     assert fake_langevin.instances[0].run_calls == [1, 1, 1]
     meta_path = tmp_path / "meta" / "metadata-traj_0000.json"
     assert meta_path.exists()
     payload = json.loads(meta_path.read_text(encoding="utf-8"))
     assert payload["best_candidate"]["score"] > 0.0
+    assert "timing" not in payload
+
+
+def test_run_excited_state_sampling_records_opt_in_ase_timing(monkeypatch, tmp_path: Path):
+    snapshots = [
+        _snapshot(
+            energy=0.0,
+            forces=np.zeros((3, 3)),
+            e0=0.00,
+            e1=0.04,
+            u0=0.00,
+            u1=0.00,
+            f0=np.zeros((3, 3)),
+            f1=np.zeros((3, 3)),
+        ),
+        _snapshot(
+            energy=0.1,
+            forces=np.zeros((3, 3)),
+            e0=0.00,
+            e1=0.03,
+            u0=0.20,
+            u1=0.10,
+            f0=np.full((3, 3), 0.10),
+            f1=np.full((3, 3), 0.05),
+        ),
+    ]
+    _install_fake_sampling_runtime(monkeypatch, snapshots)
+    monkeypatch.setattr(sampler_mod, "annealing_schedule", lambda *args: 100.0)
+
+    molecule = MoleculesObject(
+        Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]]),
+        "traj_timing_ase",
+    )
+    result = sampler_mod.run_excited_state_sampling(
+        molecule,
+        sampler_config={
+            "dt": 1.0,
+            "maxt": 0.001,
+            "Ncheck": 1,
+            "min_time": 0.0,
+            "friction": 0.02,
+            "srt_temp": [100.0, 100.0],
+            "end_temp": [100.0, 100.0],
+            "amp_temp": [0.0, 0.0],
+            "per_temp": [5.0, 5.0],
+            "amp_dens": None,
+            "per_dens": None,
+            "end_dens": None,
+            "meta_dir": str(tmp_path / "meta"),
+            "metadata_format": "json",
+            "write_traj_binary": False,
+            "write_traj_xyz": False,
+            "trajectory_frequency": 0.0,
+            "trajectory_interval": 1,
+            "min_distance_cutoff": 0.3,
+            "max_force_cutoff": 10.0,
+            "timing": {"enabled": True, "cuda_events": True, "record_chunk_timings": True},
+            "state_selection": {"mode": "fixed", "fixed_state": 0},
+            "uncertainty": {"enabled": True, "min_uE": 0.05, "min_uF": 0.05, "logic": "either"},
+            "score": {"w_energy": 1.0, "w_force": 1.0, "w_gap": 0.0, "uncertainty_aggregate": "max"},
+        },
+        model_path=str(tmp_path / "models" / "model-{:04d}"),
+        current_model_id=0,
+        gpus_per_node=0,
+        properties_list=_properties_list(),
+    )
+
+    timing = result.get_metadata()["timing"]
+    assert result.get_metadata()["realtime_simulation"] >= 0.0
+    assert timing["backend"] == "ase"
+    assert timing["cuda_events_enabled"] is False
+    assert timing["num_md_steps_completed"] == 2
+    assert timing["num_md_chunks"] == 2
+    assert timing["md_run_wall_s"] >= 0.0
+    assert timing["model_eval_wall_s"] >= 0.0
+    assert len(timing["chunk_timings"]) == 1
+    assert timing["chunk_timings"][0]["chunk_steps"] == 1
 
 
 def test_run_excited_state_sampling_returns_none_when_no_candidate_passes(monkeypatch, tmp_path: Path):
@@ -294,3 +374,231 @@ def test_run_excited_state_sampling_returns_none_when_no_candidate_passes(monkey
 
     assert result.get_atoms() is None
     assert result.get_metadata()["best_candidate"] is None
+
+
+def test_alchemi_backend_requires_optional_dependency(monkeypatch, tmp_path: Path):
+    def raise_missing_alchemi():
+        raise ImportError("install nvalchemi-toolkit")
+
+    fake_backend = types.ModuleType("alframework.samplers.alchemi_baoab_dynamics")
+    fake_backend.ALFExcitedStateAlchemiModel = object
+    fake_backend.AlchemiBaoabRunner = object
+    fake_backend.alchemi_config_from_sampler = lambda *args, **kwargs: None
+    fake_backend.build_alchemi_batch = lambda *args, **kwargs: None
+    fake_backend.validate_alchemi_sampler_support = lambda *args, **kwargs: None
+    fake_backend.ensure_alchemi_available = raise_missing_alchemi
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.float32 = "float32"
+    fake_torch.device = lambda name: type("FakeDevice", (), {"type": str(name), "__str__": lambda self: str(name)})()
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False, set_device=lambda device: None)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "alframework.samplers.alchemi_baoab_dynamics", fake_backend)
+    monkeypatch.delitem(sys.modules, "nvalchemi", raising=False)
+
+    molecule = MoleculesObject(
+        Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]]),
+        "traj_alchemi_missing",
+    )
+    with pytest.raises(ImportError, match="nvalchemi-toolkit"):
+        sampler_mod.run_excited_state_sampling(
+            molecule,
+            sampler_config={
+                "dynamics_backend": "alchemi_baoab",
+                "dt": 1.0,
+                "maxt": 0.001,
+                "Ncheck": 1,
+                "srt_temp": [100.0, 100.0],
+                "end_temp": [100.0, 100.0],
+                "amp_temp": [0.0, 0.0],
+                "per_temp": [5.0, 5.0],
+                "amp_dens": None,
+                "per_dens": None,
+                "end_dens": None,
+                "alchemi_baoab": {"allow_cpu_debug": True},
+            },
+            model_path=str(tmp_path / "models" / "model-{:04d}"),
+            current_model_id=0,
+            gpus_per_node=0,
+            properties_list=_properties_list(),
+        )
+
+
+def test_alchemi_backend_uses_fake_runner_not_ase_langevin(monkeypatch, tmp_path: Path):
+    snapshots = [
+        _snapshot(
+            energy=0.0,
+            forces=np.zeros((3, 3)),
+            e0=0.00,
+            e1=0.04,
+            u0=0.00,
+            u1=0.00,
+            f0=np.zeros((3, 3)),
+            f1=np.zeros((3, 3)),
+        ),
+        _snapshot(
+            energy=0.2,
+            forces=np.zeros((3, 3)),
+            e0=0.00,
+            e1=0.015,
+            u0=0.40,
+            u1=0.20,
+            f0=np.full((3, 3), 0.20),
+            f1=np.full((3, 3), 0.10),
+        ),
+    ]
+
+    class FakeNode:
+        def __init__(self, name):
+            self.mean = f"{name}.mean"
+            self.std = f"{name}.std"
+
+    class FakeGraph:
+        def node_from_name(self, name):
+            return FakeNode(str(name))
+
+    def fake_load_excited_state_ensemble(ensemble_directory, properties_list, device="cpu"):
+        del ensemble_directory, properties_list, device
+        return (
+            FakeGraph(),
+            [
+                {"state": 0, "energy_node_base": "ensemble_sE0", "force_node_base": "ensemble_F0"},
+                {"state": 1, "energy_node_base": "ensemble_sE1", "force_node_base": "ensemble_F1"},
+            ],
+            [],
+        )
+
+    class FakeAlchemiModel:
+        init_count = 0
+
+        def __init__(self, **kwargs):
+            del kwargs
+            self.__class__.init_count += 1
+            self.energy_nodes = []
+
+        def set_energy_node(self, energy_node, **kwargs):
+            del kwargs
+            self.energy_nodes.append(energy_node)
+
+        def results_from_batch(self, batch):
+            return deepcopy(snapshots[min(batch.index, len(snapshots) - 1)])
+
+    class FakeAlchemiRunner:
+        instances = []
+
+        def __init__(self, *, model, batch, dt_fs, temperature_K, friction_per_fs, random_seed, device):
+            del dt_fs, temperature_K, friction_per_fs, random_seed, device
+            self.model = model
+            self.batch = batch
+            self.nsteps = 0
+            self.callbacks = []
+            self.initialized_forces = True
+            self.results = self.model.results_from_batch(self.batch)
+            self.__class__.instances.append(self)
+
+        def attach(self, callback, interval=1):
+            self.callbacks.append((callback, int(interval)))
+
+        def set_temperature(self, *, temperature_K):
+            self.last_temperature = float(temperature_K)
+
+        def run(self, steps):
+            for _ in range(int(steps)):
+                self.nsteps += 1
+                self.batch.index = min(self.batch.index + 1, len(snapshots) - 1)
+                for callback, interval in self.callbacks:
+                    if self.nsteps % interval == 0:
+                        callback()
+
+        def evaluate_results(self):
+            self.results = self.model.results_from_batch(self.batch)
+            return deepcopy(self.results)
+
+        def sync_to_atoms(self, atoms):
+            atoms.set_positions(atoms.get_positions() + 0.01)
+
+        def kinetic_energy_eV(self):
+            return 0.0
+
+        def temperature_K(self):
+            return 100.0
+
+    fake_backend = types.ModuleType("alframework.samplers.alchemi_baoab_dynamics")
+    fake_backend.ALFExcitedStateAlchemiModel = FakeAlchemiModel
+    fake_backend.AlchemiBaoabRunner = FakeAlchemiRunner
+    fake_backend.ensure_alchemi_available = lambda: None
+    fake_backend.alchemi_config_from_sampler = lambda sampler_config, default_seed: types.SimpleNamespace(
+        random_seed=default_seed,
+        allow_cpu_debug=True,
+        strict_gpu=False,
+        species_key="species",
+        coordinates_key="coordinates",
+    )
+    fake_backend.validate_alchemi_sampler_support = lambda atoms, feed, device, config: None
+    fake_backend.build_alchemi_batch = lambda atoms, device: types.SimpleNamespace(index=0)
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.float32 = "float32"
+    fake_torch.device = lambda name: type("FakeDevice", (), {"type": str(name), "__str__": lambda self: str(name)})()
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False, set_device=lambda device: None)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "alframework.samplers.alchemi_baoab_dynamics", fake_backend)
+    monkeypatch.setattr(sampler_mod, "load_excited_state_ensemble", fake_load_excited_state_ensemble)
+    monkeypatch.setattr(sampler_mod, "annealing_schedule", lambda *args: 100.0)
+    monkeypatch.setattr(
+        sampler_mod,
+        "Langevin",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ASE Langevin should not run")),
+    )
+
+    molecule = MoleculesObject(
+        Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]]),
+        "traj_alchemi_fake",
+    )
+    result = sampler_mod.run_excited_state_sampling(
+        molecule,
+        sampler_config={
+            "dynamics_backend": "alchemi_baoab",
+            "dt": 1.0,
+            "maxt": 0.001,
+            "Ncheck": 1,
+            "min_time": 0.0,
+            "friction": 0.02,
+            "srt_temp": [100.0, 100.0],
+            "end_temp": [100.0, 100.0],
+            "amp_temp": [0.0, 0.0],
+            "per_temp": [5.0, 5.0],
+            "amp_dens": None,
+            "per_dens": None,
+            "end_dens": None,
+            "meta_dir": str(tmp_path / "meta"),
+            "metadata_format": "json",
+            "write_traj_binary": False,
+            "write_traj_xyz": False,
+            "trajectory_frequency": 0.0,
+            "trajectory_interval": 1,
+            "timing": {"enabled": True},
+            "min_distance_cutoff": 0.3,
+            "max_force_cutoff": 10.0,
+            "alchemi_baoab": {"allow_cpu_debug": True},
+            "state_selection": {"mode": "fixed", "fixed_state": 0},
+            "uncertainty": {"enabled": True, "min_uE": 0.05, "min_uF": 0.05, "logic": "either"},
+            "score": {"w_energy": 1.0, "w_force": 1.0, "w_gap": 0.0, "uncertainty_aggregate": "max"},
+        },
+        model_path=str(tmp_path / "models" / "model-{:04d}"),
+        current_model_id=0,
+        gpus_per_node=0,
+        properties_list=_properties_list(),
+    )
+
+    assert result.get_atoms() is not None
+    assert FakeAlchemiModel.init_count == 1
+    assert FakeAlchemiRunner.instances[0].initialized_forces is True
+    assert result.get_metadata()["best_candidate"]["step"] == 1
+    timing = result.get_metadata()["timing"]
+    assert timing["backend"] == "alchemi_baoab"
+    assert timing["num_md_steps_completed"] == 2
+    assert timing["num_md_chunks"] == 2
+    assert timing["full_sync_count"] == 2
+    assert timing["scalar_sync_count"] >= 3
+    assert timing["md_run_wall_s"] >= 0.0
