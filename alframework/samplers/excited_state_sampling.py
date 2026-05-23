@@ -57,6 +57,10 @@ def _dynamics_backend(sampler_config: dict[str, Any]) -> str:
     return backend
 
 
+def _alchemi_batch_size(sampler_config: dict[str, Any]) -> int:
+    return max(1, int(dict(sampler_config.get("alchemi_baoab") or {}).get("batch_size", 1)))
+
+
 def _force_rms(array: np.ndarray) -> float:
     data = np.asarray(array, dtype=np.float64)
     return float(np.sqrt(np.mean(data * data)))
@@ -655,6 +659,27 @@ def _write_qm_candidate_xyz(
             write(handle, atoms, format="xyz")
 
 
+def _validate_same_alchemi_batch_inputs(molecules: list[MoleculesObject]) -> None:
+    if not molecules:
+        raise ValueError("molecule_objects must contain at least one MoleculesObject.")
+    reference = molecules[0].get_atoms()
+    if reference is None:
+        raise ValueError(f"Batch molecule {molecules[0].get_moleculeid()} has no atoms.")
+    reference_numbers = np.asarray(reference.get_atomic_numbers(), dtype=int)
+    for molecule in molecules:
+        if not isinstance(molecule, MoleculesObject):
+            raise TypeError("Every batch item must be a MoleculesObject instance.")
+        atoms = molecule.get_atoms()
+        if atoms is None:
+            raise ValueError(f"Batch molecule {molecule.get_moleculeid()} has no atoms.")
+        numbers = np.asarray(atoms.get_atomic_numbers(), dtype=int)
+        if len(numbers) != len(reference_numbers) or not np.array_equal(numbers, reference_numbers):
+            raise ValueError(
+                "Batched ALCHEMI BAOAB currently requires every molecule to have "
+                "the same atom count and atomic-number order."
+            )
+
+
 def _json_default(value: Any):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -665,6 +690,447 @@ def _json_default(value: Any):
     if hasattr(value, "tolist"):
         return value.tolist()
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable.")
+
+
+def run_excited_state_sampling_batch(
+    molecule_objects: list[MoleculesObject],
+    *,
+    sampler_config: dict[str, Any],
+    model_path: str,
+    current_model_id: int,
+    gpus_per_node: int,
+    properties_list: dict[str, list[Any]],
+) -> list[MoleculesObject]:
+    import torch
+
+    dynamics_backend = _dynamics_backend(sampler_config)
+    if dynamics_backend != "alchemi_baoab":
+        raise ValueError("alchemi_baoab.batch_size > 1 requires dynamics_backend='alchemi_baoab'.")
+    if bool(_udd_config(sampler_config).get("enabled", False)):
+        raise NotImplementedError("Batched ALCHEMI BAOAB does not yet support UDD.")
+
+    from alframework.samplers.alchemi_baoab_dynamics import (
+        ALFExcitedStateAlchemiModel,
+        AlchemiBaoabRunner,
+        alchemi_config_from_sampler,
+        build_alchemi_batch_from_atoms_list,
+        ensure_alchemi_available,
+        validate_alchemi_sampler_support,
+    )
+
+    ensure_alchemi_available()
+    _validate_same_alchemi_batch_inputs(molecule_objects)
+
+    worker_rank = int(os.environ.get("PARSL_WORKER_RANK", "0"))
+    if torch.cuda.is_available() and int(gpus_per_node) > 0:
+        gpu_index = worker_rank % int(gpus_per_node)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        device = torch.device("cuda:0")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+
+    actual_batch_size = len(molecule_objects)
+    timing = SamplerTiming.from_sampler_config(
+        sampler_config,
+        backend=dynamics_backend,
+        device=device,
+        batch_size=actual_batch_size,
+    )
+
+    rngs = [
+        np.random.default_rng(stable_uint32_seed(molecule.get_moleculeid(), int(current_model_id)))
+        for molecule in molecule_objects
+    ]
+    ensemble_graph, state_table, gap_table = load_excited_state_ensemble(
+        model_path.format(int(current_model_id)),
+        properties_list=properties_list,
+        device=str(device),
+    )
+    missing_forces = [int(row["state"]) for row in state_table if row["force_node_base"] is None]
+    if missing_forces:
+        raise ValueError(
+            "excited_state_sampling_task requires force properties for every state. "
+            f"Missing force nodes for states {missing_forces}."
+        )
+    state_ids = [int(row["state"]) for row in state_table]
+    selected_states: list[int] = []
+    for molecule, rng in zip(molecule_objects, rngs):
+        selected_states.append(
+            select_excited_state(
+                moleculeid=molecule.get_moleculeid(),
+                available_states=state_ids,
+                metadata=molecule.get_metadata(),
+                selection_config=_state_selection_config(sampler_config),
+                rng=rng,
+            )
+        )
+    if len(set(selected_states)) != 1:
+        raise ValueError(
+            "Batched ALCHEMI BAOAB requires all molecules in one batch to use the same selected state. "
+            f"Found selected_states={selected_states}."
+        )
+    selected_state = int(selected_states[0])
+
+    energy_node_by_state: dict[int, Any] = {}
+    force_node_by_state: dict[int, Any] = {}
+    extra_properties: dict[str, Any] = {}
+    gap_node_by_key: dict[str, Any] = {}
+    gap_node_by_pair: dict[tuple[int, int], Any] = {}
+    for row in state_table:
+        state = int(row["state"])
+        energy_base = ensemble_graph.node_from_name(str(row["energy_node_base"]))
+        energy_node_by_state[state] = energy_base
+        extra_properties[f"E_mean_S{state}"] = energy_base.mean
+        extra_properties[f"E_std_S{state}"] = energy_base.std
+        if row["force_node_base"] is not None:
+            force_base = ensemble_graph.node_from_name(str(row["force_node_base"]))
+            force_node_by_state[state] = force_base
+            extra_properties[f"F_std_S{state}"] = force_base.std
+    for row in gap_table:
+        gap_base = ensemble_graph.node_from_name(str(row["gap_node_base"]))
+        gap_key = str(row["gap_key"])
+        gap_node_by_key[gap_key] = gap_base
+        gap_node_by_pair[(int(row["lower_state"]), int(row["upper_state"]))] = gap_base
+        extra_properties[f"{gap_key}_mean"] = gap_base.mean
+        extra_properties[f"{gap_key}_std"] = gap_base.std
+
+    atoms_list = [molecule.get_atoms().copy() for molecule in molecule_objects]
+    feeds = [_temperature_feed_parameters(sampler_config, rng) for rng in rngs]
+    dt = float(sampler_config["dt"])
+    maxt = float(sampler_config["maxt"])
+    ncheck = int(sampler_config["Ncheck"])
+    min_time = float(sampler_config.get("min_time", 0.0))
+    friction = float(sampler_config.get("friction", 0.02))
+    total_md_steps = int(np.ceil((1000.0 * maxt) / dt))
+    n_outer = int(np.ceil(float(total_md_steps) / float(ncheck)))
+    meta_dir = sampler_config.get("meta_dir")
+    metadata_format = str(sampler_config.get("metadata_format", "pickle"))
+    return_top_n = _return_top_n(sampler_config)
+    if _sample_trajectory_interval(sampler_config, rngs[0]) is not None and bool(
+        sampler_config.get("write_traj_xyz", False) or sampler_config.get("write_traj_binary", False)
+    ):
+        raise NotImplementedError("Batched ALCHEMI BAOAB does not yet support trajectory writing.")
+
+    initial_temperatures = np.asarray(
+        [
+            annealing_schedule(0.0, maxt, feed["Tamp"], feed["Tper"], feed["Tsrt"], feed["Tend"])
+            for feed in feeds
+        ],
+        dtype=np.float64,
+    )
+    alchemi_options = alchemi_config_from_sampler(
+        sampler_config,
+        default_seed=stable_uint32_seed(molecule_objects[0].get_moleculeid(), int(current_model_id) + 7919),
+    )
+    if str(alchemi_options.batched_gap_switch_policy).strip().lower() != "global_lowest_gap_trigger":
+        raise ValueError("Batched ALCHEMI BAOAB currently supports only batched_gap_switch_policy='global_lowest_gap_trigger'.")
+    for atoms, feed in zip(atoms_list, feeds):
+        validate_alchemi_sampler_support(atoms, feed, device, alchemi_options)
+    alchemi_batch = build_alchemi_batch_from_atoms_list(atoms_list, device=device)
+    alchemi_model = ALFExcitedStateAlchemiModel(
+        ensemble_graph=ensemble_graph,
+        energy_node=energy_node_by_state[selected_state].mean,
+        extra_properties=extra_properties,
+        force_node=force_node_by_state[selected_state].mean,
+        species_key=alchemi_options.species_key,
+        coordinates_key=alchemi_options.coordinates_key,
+        offset_eV=float(sampler_config.get("energy_offset_eV", 0.0)),
+        device=device,
+    )
+    dyn = AlchemiBaoabRunner(
+        model=alchemi_model,
+        batch=alchemi_batch,
+        dt_fs=dt,
+        temperature_K=torch.as_tensor(initial_temperatures, dtype=torch.float32, device=device),
+        friction_per_fs=friction,
+        random_seed=int(alchemi_options.random_seed),
+        device=device,
+    )
+
+    gap_seeking_settings = _gap_seeking_settings(_gap_seeking_config(sampler_config), state_ids, selected_state)
+    gap_seeking_enabled = bool(gap_seeking_settings["enabled"])
+    gap_seeking_switched = False
+    gap_seeking_switch_step = None
+    gap_seeking_switch_time_ps = None
+    gap_seeking_pair = None
+    gap_seeking_gap_key = None
+    gap_seeking_gap_source = None
+    gap_seeking_trigger_gap_eV = None
+    gap_seeking_trigger_molecule_id = None
+    gap_seeking_trigger_batch_index = None
+
+    active = np.ones(actual_batch_size, dtype=bool)
+    replica_stop_reasons: list[str | None] = [None for _ in molecule_objects]
+    top_candidates: list[dict[str, Any]] = []
+    per_molecule_records: list[list[dict[str, Any]]] = [[] for _ in molecule_objects]
+    per_molecule_geometry_trace: list[list[dict[str, Any]]] = [[] for _ in molecule_objects]
+    start_time = time.time()
+
+    def _evaluate_results() -> dict[str, Any]:
+        with timing.scope("model_eval", cuda=True):
+            results = dyn.evaluate_results()
+        timing.increment("scalar_sync_count", 1)
+        return results
+
+    def _run_md_steps(steps: int) -> None:
+        with timing.scope("md_run", cuda=True):
+            dyn.run(int(steps))
+        timing.increment("num_md_steps_completed", int(steps))
+        timing.increment("num_md_chunks", 1)
+
+    def _sync_graph(graph_index: int) -> None:
+        with timing.scope("host_sync"):
+            dyn.sync_graph_to_atoms(int(graph_index), atoms_list[int(graph_index)])
+        timing.increment("full_sync_count", 1)
+
+    def _update_gap_seeking_switch() -> None:
+        nonlocal gap_seeking_switched, gap_seeking_switch_step, gap_seeking_switch_time_ps
+        nonlocal gap_seeking_pair, gap_seeking_gap_key, gap_seeking_gap_source, gap_seeking_trigger_gap_eV
+        nonlocal gap_seeking_trigger_molecule_id, gap_seeking_trigger_batch_index
+        if not gap_seeking_enabled or gap_seeking_switched or not np.any(active):
+            return
+        current_step = int(dyn.nsteps)
+        if current_step <= 0:
+            return
+        triggers: list[dict[str, Any]] = []
+        _evaluate_results()
+        for graph_index in np.where(active)[0]:
+            graph_results = dyn.results_for_graph(int(graph_index))
+            gap_infos = _gap_infos_from_results(graph_results, list(gap_seeking_settings["pairs"]))
+            if not gap_infos:
+                continue
+            trigger = min(gap_infos, key=lambda item: float(item["abs_gap_eV"]))
+            if float(trigger["abs_gap_eV"]) <= float(gap_seeking_settings["trigger_gap_threshold_eV"]):
+                triggers.append({"batch_index": int(graph_index), **trigger})
+        if not triggers:
+            return
+        trigger = min(triggers, key=lambda item: float(item["abs_gap_eV"]))
+        gap_seeking_switched = True
+        gap_seeking_switch_step = int(current_step)
+        gap_seeking_switch_time_ps = float(current_step * dt) / 1000.0
+        gap_seeking_pair = [int(value) for value in trigger["pair"]]
+        gap_seeking_gap_key = str(trigger["gap_key"])
+        gap_seeking_gap_source = str(trigger["gap_source"])
+        gap_seeking_trigger_gap_eV = float(trigger["gap_eV"])
+        gap_seeking_trigger_batch_index = int(trigger["batch_index"])
+        gap_seeking_trigger_molecule_id = molecule_objects[gap_seeking_trigger_batch_index].get_moleculeid()
+        lower_state, upper_state = int(gap_seeking_pair[0]), int(gap_seeking_pair[1])
+        gap_base = gap_node_by_pair.get((lower_state, upper_state))
+        alchemi_model.set_lcm_gap_mode(
+            lower_energy_node=energy_node_by_state[lower_state].mean,
+            upper_energy_node=energy_node_by_state[upper_state].mean,
+            lower_force_node=force_node_by_state[lower_state].mean,
+            upper_force_node=force_node_by_state[upper_state].mean,
+            gap_node=gap_base.mean if gap_base is not None else None,
+            sigma=float(gap_seeking_settings["sigma"]),
+            alpha_eV=float(gap_seeking_settings["alpha_eV"]),
+        )
+        results = _evaluate_results()
+        _validate_sampler_results(
+            results,
+            state_table,
+            selected_state=selected_state,
+            step=current_step,
+            context="batched_gap_seeking_switch",
+            gap_seeking_switched=gap_seeking_switched,
+            gap_seeking_pair=gap_seeking_pair,
+        )
+
+    if gap_seeking_enabled:
+        dyn.attach(_update_gap_seeking_switch, interval=int(gap_seeking_settings["switch_check_interval"]))
+
+    _run_md_steps(1)
+    for step_index in range(n_outer):
+        if not np.any(active):
+            break
+        current_time_ps = float(step_index * ncheck * dt) / 1000.0
+        target_temperatures = np.asarray(
+            [
+                annealing_schedule(current_time_ps, maxt, feed["Tamp"], feed["Tper"], feed["Tsrt"], feed["Tend"])
+                for feed in feeds
+            ],
+            dtype=np.float64,
+        )
+        dyn.set_temperature(temperature_K=torch.as_tensor(target_temperatures, dtype=torch.float32, device=device))
+        _run_md_steps(ncheck)
+        current_step = int((step_index + 1) * ncheck)
+        _evaluate_results()
+        kinetic = np.asarray(dyn.kinetic_energy_eV(), dtype=np.float64).reshape(-1)
+        temperatures = np.asarray(dyn.temperature_K(), dtype=np.float64).reshape(-1)
+
+        for graph_index in np.where(active)[0]:
+            graph_index = int(graph_index)
+            _sync_graph(graph_index)
+            graph_results = dyn.results_for_graph(graph_index)
+            _validate_sampler_results(
+                graph_results,
+                state_table,
+                selected_state=selected_state,
+                step=current_step,
+                context="batched_post_md_chunk",
+                gap_seeking_switched=gap_seeking_switched,
+                gap_seeking_pair=gap_seeking_pair,
+            )
+            with timing.scope("metrics"):
+                metrics = _results_to_metrics(
+                    atoms_list[graph_index],
+                    graph_results,
+                    state_table,
+                    gap_table,
+                    selected_state,
+                    forces_override=np.asarray(graph_results["forces"], dtype=np.float64),
+                )
+            current_temperature = float(temperatures[graph_index])
+            current_total_energy = float(np.asarray(graph_results["energy"]).reshape(-1)[0] + kinetic[graph_index])
+            per_molecule_geometry_trace[graph_index].append(
+                {
+                    "step": int(current_step),
+                    "time_ps": float(current_time_ps),
+                    "min_dist": float(metrics["min_dist"]),
+                    "fmax": float(metrics["fmax"]),
+                    "max_nearest_neighbor_distance": float(metrics["max_nearest_neighbor_distance"]),
+                    "nearest_neighbor_distances": np.asarray(metrics["nearest_neighbor_distances"], dtype=float),
+                }
+            )
+
+            stop_reason = None
+            if float(metrics["min_dist"]) < float(sampler_config.get("min_distance_cutoff", 0.3)):
+                stop_reason = "min_distance"
+            elif bool(sampler_config.get("max_nearest_neighbor_distance_check", False)):
+                max_nn_cutoff = float(sampler_config["max_nearest_neighbor_distance_cutoff"])
+                if float(metrics["max_nearest_neighbor_distance"]) > max_nn_cutoff:
+                    stop_reason = "max_nearest_neighbor_distance"
+            if stop_reason is None and float(metrics["fmax"]) > float(sampler_config.get("max_force_cutoff", 10.0)):
+                stop_reason = "max_force"
+            if stop_reason is not None:
+                active[graph_index] = False
+                replica_stop_reasons[graph_index] = stop_reason
+                continue
+
+            if current_time_ps < min_time or not _passes_uncertainty_gate(metrics, sampler_config):
+                continue
+            score_components = compute_excited_state_score_components(metrics, sampler_config, udd_gap_key=None)
+            score = float(sum(score_components.values()))
+            record = {
+                "score": score,
+                "score_components": score_components,
+                "score_gap_uncertainty_key": None,
+                "score_gap_uncertainty_std": None,
+                "step": int(current_step),
+                "time_ps": float(current_time_ps),
+                "selected_state": int(selected_state),
+                "batch_index": int(graph_index),
+                "batch_size": int(actual_batch_size),
+                "parent_molecule_id": molecule_objects[graph_index].get_moleculeid(),
+                "gap_seeking_switched": bool(gap_seeking_switched),
+                "gap_seeking_pair": gap_seeking_pair,
+                "gap_seeking_gap_key": gap_seeking_gap_key,
+                "gap_seeking_gap_source": gap_seeking_gap_source,
+                "temperature_K": current_temperature,
+                "temperature_target_K": float(target_temperatures[graph_index]),
+                "total_energy_eV": current_total_energy,
+                **metrics,
+            }
+            item = {"record": record, "atoms": atoms_list[graph_index].copy(), "parent_index": graph_index}
+            top_candidates.append(item)
+            per_molecule_records[graph_index].append(dict(record))
+            top_candidates.sort(key=lambda candidate: float(candidate["record"]["score"]), reverse=True)
+            del top_candidates[return_top_n:]
+
+    realtime_simulation = float(time.time() - start_time)
+    timing.set_count("num_md_steps_completed", int(getattr(dyn, "nsteps", 0)))
+    timing_metadata = timing.metadata(total_wall_s=realtime_simulation, num_atoms=len(atoms_list[0]))
+    output_candidates: list[MoleculesObject] = []
+    candidate_ids: list[str] = []
+    for rank, candidate in enumerate(top_candidates):
+        parent_index = int(candidate["parent_index"])
+        parent_id = molecule_objects[parent_index].get_moleculeid()
+        candidate_id = f"{parent_id}-cand-{rank:02d}"
+        candidate_ids.append(candidate_id)
+        candidate_atoms = candidate["atoms"]
+        candidate_atoms.calc = None
+        candidate_metadata = dict(candidate["record"])
+        candidate_metadata.update(
+            {
+                "candidate_rank": int(rank),
+                "candidate_score": float(candidate["record"]["score"]),
+                "candidate_step": int(candidate["record"]["step"]),
+                "candidate_time_ps": float(candidate["record"]["time_ps"]),
+                "dynamics_backend": dynamics_backend,
+                "alchemi_baoab_options": dict(vars(alchemi_options)),
+                "timing": timing_metadata,
+            }
+        )
+        molecule = MoleculesObject(candidate_atoms, candidate_id)
+        molecule.update_metadata(candidate_metadata)
+        output_candidates.append(molecule)
+
+    grouped_candidates: dict[str, tuple[list[dict[str, Any]], list[str]]] = {}
+    for candidate, candidate_id in zip(top_candidates, candidate_ids):
+        parent_id = molecule_objects[int(candidate["parent_index"])].get_moleculeid()
+        grouped_candidates.setdefault(parent_id, ([], []))[0].append(candidate)
+        grouped_candidates[parent_id][1].append(candidate_id)
+    for parent_id, (items, ids) in grouped_candidates.items():
+        _write_qm_candidate_xyz(sampler_config, parent_id, items, ids)
+
+    for graph_index, molecule in enumerate(molecule_objects):
+        molecule_records = sorted(per_molecule_records[graph_index], key=lambda item: float(item["score"]), reverse=True)
+        last_geometry_metrics = (
+            dict(per_molecule_geometry_trace[graph_index][-1]) if per_molecule_geometry_trace[graph_index] else {}
+        )
+        meta_dict = {
+            "realtime_simulation": realtime_simulation,
+            "selected_state": int(selected_state),
+            "best_candidate": molecule_records[0] if molecule_records else None,
+            "top_candidates": molecule_records[:return_top_n],
+            "return_top_n": int(return_top_n),
+            "hard_close_contact": replica_stop_reasons[graph_index] == "min_distance",
+            "geometry_reject_reason": replica_stop_reasons[graph_index],
+            "geometry_metrics_trace": per_molecule_geometry_trace[graph_index],
+            "max_nearest_neighbor_distance": last_geometry_metrics.get("max_nearest_neighbor_distance"),
+            "nearest_neighbor_distances": last_geometry_metrics.get("nearest_neighbor_distances"),
+            "trajectory_temperature_trace_K": [],
+            "trajectory_total_energy_trace_eV": [],
+            "density_trace": [],
+            "temperature_feed_parameters": feeds[graph_index],
+            "energy_drift_eV_per_ps": None,
+            "dynamics_backend": dynamics_backend,
+            "alchemi_baoab_options": dict(vars(alchemi_options)),
+            "batch_size": int(actual_batch_size),
+            "batch_index": int(graph_index),
+            "batch_molecule_ids": [item.get_moleculeid() for item in molecule_objects],
+            "active_replica_count": int(np.sum(active)),
+            "replica_stop_reasons": list(replica_stop_reasons),
+            "timing": timing_metadata,
+            "chemical_symbols": atoms_list[graph_index].get_chemical_symbols(),
+            "positions": atoms_list[graph_index].get_positions(wrap=True),
+            "cell": atoms_list[graph_index].get_cell(),
+            "gap_seeking_enabled": bool(gap_seeking_enabled),
+            "gap_seeking_mode": str(gap_seeking_settings["mode"]),
+            "gap_seeking_candidate_pairs": str(gap_seeking_settings["candidate_pairs"]),
+            "gap_seeking_switch_policy": str(gap_seeking_settings["switch_policy"]),
+            "gap_seeking_trigger_gap_threshold_eV": float(gap_seeking_settings["trigger_gap_threshold_eV"]),
+            "gap_seeking_sigma": float(gap_seeking_settings["sigma"]),
+            "gap_seeking_alpha_eV": float(gap_seeking_settings["alpha_eV"]),
+            "gap_seeking_switch_check_interval": int(gap_seeking_settings["switch_check_interval"]),
+            "gap_seeking_switched": bool(gap_seeking_switched),
+            "gap_seeking_switch_step": gap_seeking_switch_step,
+            "gap_seeking_switch_time_ps": gap_seeking_switch_time_ps,
+            "gap_seeking_pair": gap_seeking_pair,
+            "gap_seeking_gap_key": gap_seeking_gap_key,
+            "gap_seeking_gap_source": gap_seeking_gap_source,
+            "gap_seeking_trigger_gap_eV": gap_seeking_trigger_gap_eV,
+            "gap_seeking_trigger_molecule_id": gap_seeking_trigger_molecule_id,
+            "gap_seeking_trigger_batch_index": gap_seeking_trigger_batch_index,
+            "gap_seeking_min_gap_trace": [],
+            "gap_seeking_active_pair_gap_trace": [],
+            "udd_enabled": False,
+        }
+        meta_dict.update(molecule.get_metadata())
+        _write_metadata(meta_dir, molecule.get_moleculeid(), meta_dict, metadata_format)
+
+    return output_candidates
 
 
 def run_excited_state_sampling(
@@ -680,6 +1146,8 @@ def run_excited_state_sampling(
 
     dynamics_backend = _dynamics_backend(sampler_config)
     use_alchemi = dynamics_backend == "alchemi_baoab"
+    if not use_alchemi and _alchemi_batch_size(sampler_config) > 1:
+        raise ValueError("alchemi_baoab.batch_size > 1 requires dynamics_backend='alchemi_baoab'.")
     if use_alchemi:
         from alframework.samplers.alchemi_baoab_dynamics import (
             ALFExcitedStateAlchemiModel,
@@ -800,6 +1268,7 @@ def run_excited_state_sampling(
             species_key=alchemi_options.species_key,
             coordinates_key=alchemi_options.coordinates_key,
             offset_eV=float(sampler_config.get("energy_offset_eV", 0.0)),
+            device=device,
         )
     gap_seeking_settings = _gap_seeking_settings(_gap_seeking_config(sampler_config), state_ids, int(selected_state))
     gap_seeking_enabled = bool(gap_seeking_settings["enabled"])
@@ -878,6 +1347,7 @@ def run_excited_state_sampling(
                     species_key=alchemi_options.species_key,
                     coordinates_key=alchemi_options.coordinates_key,
                     offset_eV=float(sampler_config.get("energy_offset_eV", 0.0)),
+                    device=device,
                 )
                 alchemi_sigma_force_model = ALFExcitedStateAlchemiModel(
                     ensemble_graph=ensemble_graph,
@@ -886,6 +1356,7 @@ def run_excited_state_sampling(
                     species_key=alchemi_options.species_key,
                     coordinates_key=alchemi_options.coordinates_key,
                     offset_eV=0.0,
+                    device=device,
                 )
             else:
                 model_force_calculator = _make_hippynn_calculator(
@@ -1471,7 +1942,17 @@ def excited_state_sampling_task(
     current_model_id,
     gpus_per_node,
     properties_list,
+    molecule_objects=None,
 ):
+    if molecule_objects is not None:
+        return run_excited_state_sampling_batch(
+            molecule_objects=list(molecule_objects),
+            sampler_config=dict(sampler_config or {}),
+            model_path=str(model_path),
+            current_model_id=int(current_model_id),
+            gpus_per_node=int(gpus_per_node),
+            properties_list=dict(properties_list or {}),
+        )
     return run_excited_state_sampling(
         molecule_object=molecule_object,
         sampler_config=dict(sampler_config or {}),
@@ -1490,7 +1971,17 @@ def excited_state_sampling_gpu_task(
     current_model_id,
     gpus_per_node,
     properties_list,
+    molecule_objects=None,
 ):
+    if molecule_objects is not None:
+        return run_excited_state_sampling_batch(
+            molecule_objects=list(molecule_objects),
+            sampler_config=dict(sampler_config or {}),
+            model_path=str(model_path),
+            current_model_id=int(current_model_id),
+            gpus_per_node=int(gpus_per_node),
+            properties_list=dict(properties_list or {}),
+        )
     return run_excited_state_sampling(
         molecule_object=molecule_object,
         sampler_config=dict(sampler_config or {}),

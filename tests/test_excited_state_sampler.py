@@ -602,3 +602,164 @@ def test_alchemi_backend_uses_fake_runner_not_ase_langevin(monkeypatch, tmp_path
     assert timing["full_sync_count"] == 2
     assert timing["scalar_sync_count"] >= 3
     assert timing["md_run_wall_s"] >= 0.0
+
+
+def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path: Path):
+    class FakeNode:
+        def __init__(self, name):
+            self.mean = f"{name}.mean"
+            self.std = f"{name}.std"
+
+    class FakeGraph:
+        def node_from_name(self, name):
+            return FakeNode(str(name))
+
+    def fake_load_excited_state_ensemble(ensemble_directory, properties_list, device="cpu"):
+        del ensemble_directory, properties_list, device
+        return (
+            FakeGraph(),
+            [
+                {"state": 0, "energy_node_base": "ensemble_sE0", "force_node_base": "ensemble_F0"},
+                {"state": 1, "energy_node_base": "ensemble_sE1", "force_node_base": "ensemble_F1"},
+            ],
+            [],
+        )
+
+    class FakeAlchemiModel:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def set_energy_node(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeBatch:
+        def __init__(self, atoms_list):
+            self.atoms_list = [atoms.copy() for atoms in atoms_list]
+            self.num_graphs = len(atoms_list)
+            self.num_nodes = sum(len(atoms) for atoms in atoms_list)
+
+    class FakeAlchemiRunner:
+        def __init__(self, *, model, batch, dt_fs, temperature_K, friction_per_fs, random_seed, device):
+            del model, dt_fs, temperature_K, friction_per_fs, random_seed, device
+            self.batch = batch
+            self.nsteps = 0
+            self.callbacks = []
+
+        def attach(self, callback, interval=1):
+            self.callbacks.append((callback, int(interval)))
+
+        def set_temperature(self, *, temperature_K):
+            self.temperature_K_target = temperature_K
+
+        def run(self, steps):
+            for _ in range(int(steps)):
+                self.nsteps += 1
+                for atoms in self.batch.atoms_list:
+                    atoms.set_positions(atoms.get_positions() + 0.01)
+                for callback, interval in self.callbacks:
+                    if self.nsteps % interval == 0:
+                        callback()
+
+        def evaluate_results(self):
+            return {"energy": np.zeros((self.batch.num_graphs, 1)), "forces": np.zeros((self.batch.num_nodes, 3))}
+
+        def results_for_graph(self, graph_index):
+            uncertainty = 0.20 + 0.10 * int(graph_index)
+            forces = np.zeros((3, 3), dtype=float)
+            return {
+                "energy": float(graph_index),
+                "forces": forces,
+                "E_mean_S0": 0.0,
+                "E_std_S0": uncertainty,
+                "F_std_S0": np.full((3, 3), uncertainty),
+                "E_mean_S1": 0.03,
+                "E_std_S1": 0.01,
+                "F_std_S1": np.full((3, 3), 0.01),
+            }
+
+        def sync_graph_to_atoms(self, graph_index, atoms):
+            atoms.set_positions(self.batch.atoms_list[int(graph_index)].get_positions())
+
+        def kinetic_energy_eV(self):
+            return np.zeros(self.batch.num_graphs)
+
+        def temperature_K(self):
+            return np.full(self.batch.num_graphs, 100.0)
+
+    fake_backend = types.ModuleType("alframework.samplers.alchemi_baoab_dynamics")
+    fake_backend.ALFExcitedStateAlchemiModel = FakeAlchemiModel
+    fake_backend.AlchemiBaoabRunner = FakeAlchemiRunner
+    fake_backend.ensure_alchemi_available = lambda: None
+    fake_backend.alchemi_config_from_sampler = lambda sampler_config, default_seed: types.SimpleNamespace(
+        random_seed=default_seed,
+        allow_cpu_debug=True,
+        strict_gpu=False,
+        scalar_sync_policy="control_only",
+        species_key="species",
+        coordinates_key="coordinates",
+        batch_size=2,
+        allow_partial_batches=False,
+        require_same_selected_state=True,
+        batched_gap_switch_policy="global_lowest_gap_trigger",
+    )
+    fake_backend.validate_alchemi_sampler_support = lambda atoms, feed, device, config: None
+    fake_backend.build_alchemi_batch_from_atoms_list = lambda atoms_list, device: FakeBatch(atoms_list)
+
+    monkeypatch.setitem(sys.modules, "alframework.samplers.alchemi_baoab_dynamics", fake_backend)
+    monkeypatch.setattr(sampler_mod, "load_excited_state_ensemble", fake_load_excited_state_ensemble)
+    monkeypatch.setattr(sampler_mod, "annealing_schedule", lambda *args: 100.0)
+
+    molecules = []
+    for idx, shift in enumerate([0.0, 0.2]):
+        molecule = MoleculesObject(
+            Atoms(symbols=["O", "H", "H"], positions=[[shift, 0, 0], [0.96 + shift, 0, 0], [-0.24 + shift, 0.93, 0]]),
+            f"batch_{idx}",
+        )
+        molecule.update_metadata({"excited_state": 0})
+        molecules.append(molecule)
+
+    result = sampler_mod.run_excited_state_sampling_batch(
+        molecules,
+        sampler_config={
+            "dynamics_backend": "alchemi_baoab",
+            "dt": 1.0,
+            "maxt": 0.001,
+            "Ncheck": 1,
+            "min_time": 0.0,
+            "friction": 0.02,
+            "srt_temp": [100.0, 100.0],
+            "end_temp": [100.0, 100.0],
+            "amp_temp": [0.0, 0.0],
+            "per_temp": [5.0, 5.0],
+            "amp_dens": None,
+            "per_dens": None,
+            "end_dens": None,
+            "meta_dir": str(tmp_path / "meta"),
+            "metadata_format": "json",
+            "write_traj_binary": False,
+            "write_traj_xyz": False,
+            "trajectory_frequency": 0.0,
+            "trajectory_interval": 1,
+            "timing": {"enabled": True},
+            "return_top_n": 2,
+            "min_distance_cutoff": 0.3,
+            "max_force_cutoff": 10.0,
+            "alchemi_baoab": {"allow_cpu_debug": True, "batch_size": 2},
+            "state_selection": {"mode": "fixed", "fixed_state": 0},
+            "uncertainty": {"enabled": True, "min_uE": 0.05, "min_uF": 0.05, "logic": "either"},
+            "gap_seeking": {"enabled": False},
+            "udd": {"enabled": False},
+            "score": {"w_energy": 1.0, "w_force": 1.0, "w_gap": 0.0, "uncertainty_aggregate": "max"},
+        },
+        model_path=str(tmp_path / "models" / "model-{:04d}"),
+        current_model_id=0,
+        gpus_per_node=0,
+        properties_list=_properties_list(),
+    )
+
+    assert len(result) == 2
+    assert {item.get_metadata()["parent_molecule_id"] for item in result} == {"batch_0", "batch_1"}
+    assert all(item.get_metadata()["batch_size"] == 2 for item in result)
+    payload = json.loads((tmp_path / "meta" / "metadata-batch_0.json").read_text(encoding="utf-8"))
+    assert payload["batch_size"] == 2
+    assert payload["timing"]["batch_size"] == 2

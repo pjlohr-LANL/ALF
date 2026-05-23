@@ -31,6 +31,23 @@ def _batch():
     )
 
 
+def _batched_batch():
+    return types.SimpleNamespace(
+        positions=torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.5, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+        atomic_numbers=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        num_graphs=2,
+        num_nodes=4,
+    )
+
+
 def _predictor_factory(scale_by_node):
     def make_predictor(input_nodes, output_nodes):
         del input_nodes
@@ -40,9 +57,9 @@ def _predictor_factory(scale_by_node):
             def __call__(self, **kwargs):
                 positions = kwargs["coordinates"]
                 scale = float(scale_by_node.get(energy_node, 1.0))
-                energy = scale * torch.sum(positions * positions).reshape(1, 1)
+                energy = scale * torch.sum(positions * positions, dim=(1, 2)).reshape(-1, 1)
                 extras = [
-                    torch.full((1, 1), float(index), dtype=positions.dtype, device=positions.device)
+                    torch.full((positions.shape[0], 1), float(index), dtype=positions.dtype, device=positions.device)
                     for index, _node in enumerate(output_nodes[1:], start=1)
                 ]
                 return dict(zip(output_nodes, [energy, *extras]))
@@ -140,3 +157,94 @@ def test_alchemi_model_uses_force_node_for_detached_ensemble_energy():
     results = model.results_from_batch(_batch())
 
     np.testing.assert_allclose(results["forces"], [[-2.0, -2.0, -2.0], [-2.0, -2.0, -2.0]])
+
+
+def test_alchemi_model_supports_fixed_size_batches():
+    energy_node = "selected_state_energy"
+    model = ALFExcitedStateAlchemiModel(
+        ensemble_graph=FakeGraph(),
+        energy_node=energy_node,
+        extra_properties={"E_mean_S0": energy_node, "E_std_S0": "std0"},
+        predictor_factory=_predictor_factory({energy_node: 1.0}),
+    )
+
+    output = model(_batched_batch())
+    results = model.results_from_batch(_batched_batch())
+
+    assert output["energy"].shape == (2, 1)
+    assert output["forces"].shape == (4, 3)
+    np.testing.assert_allclose(results["energy"], [[0.25], [3.25]])
+    np.testing.assert_allclose(results["forces"][:, 0], [-0.0, -1.0, -2.0, -3.0])
+
+
+def test_alchemi_model_moves_new_predictors_to_configured_device():
+    moved_devices = []
+
+    def make_predictor(input_nodes, output_nodes):
+        del input_nodes
+        energy_node = output_nodes[0]
+
+        class Predictor:
+            def to(self, device):
+                moved_devices.append(str(device))
+                return self
+
+            def __call__(self, **kwargs):
+                positions = kwargs["coordinates"]
+                energy = torch.sum(positions * positions, dim=(1, 2)).reshape(-1, 1)
+                return {energy_node: energy}
+
+        return Predictor()
+
+    model = ALFExcitedStateAlchemiModel(
+        ensemble_graph=FakeGraph(),
+        energy_node="initial_energy",
+        extra_properties=None,
+        device="cpu",
+        predictor_factory=make_predictor,
+    )
+    model.set_energy_node("updated_energy")
+
+    assert moved_devices == ["cpu", "cpu"]
+
+
+def test_alchemi_model_normalizes_prediction_outputs_to_batch_dtype():
+    energy_node = "selected_state_energy"
+    force_node = "selected_state_force"
+    extra_node = "extra_std"
+
+    def make_predictor(input_nodes, output_nodes):
+        del input_nodes, output_nodes
+
+        class Predictor:
+            def __call__(self, **kwargs):
+                positions = kwargs["coordinates"]
+                num_graphs = int(positions.shape[0])
+                num_atoms = int(positions.shape[1])
+                return {
+                    energy_node: torch.ones((num_graphs, 1), dtype=torch.float64),
+                    force_node: torch.ones((num_graphs, num_atoms, 3), dtype=torch.float64),
+                    extra_node: torch.ones((num_graphs, 1), dtype=torch.float64),
+                }
+
+        return Predictor()
+
+    batch = types.SimpleNamespace(
+        positions=torch.zeros((2, 3), dtype=torch.float32),
+        atomic_numbers=torch.tensor([1, 1], dtype=torch.long),
+    )
+    model = ALFExcitedStateAlchemiModel(
+        ensemble_graph=FakeGraph(),
+        energy_node=energy_node,
+        force_node=force_node,
+        extra_properties={"extra": extra_node},
+        offset_eV=2.0,
+        predictor_factory=make_predictor,
+    )
+
+    output = model(batch)
+
+    assert output["energy"].dtype == batch.positions.dtype
+    assert output["forces"].dtype == batch.positions.dtype
+    assert model.last_results["extra"].dtype == batch.positions.dtype
+    np.testing.assert_allclose(model.results_from_batch(batch)["energy"], [[3.0]])

@@ -67,7 +67,7 @@ class SamplerTiming:
             enabled=bool(raw.get("enabled", False)),
             backend=backend,
             device=device,
-            batch_size=int(raw.get("batch_size", batch_size)),
+            batch_size=int(batch_size),
             cuda_events=bool(raw.get("cuda_events", True)),
             sync_cuda_for_wall=bool(raw.get("sync_cuda_for_wall", False)),
             record_chunk_timings=bool(raw.get("record_chunk_timings", False)),

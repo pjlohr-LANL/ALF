@@ -28,6 +28,12 @@ from alframework.tools.tools import find_empty_directory
 from alframework.tools.tools import system_checker
 from alframework.tools.tools import load_module_from_string
 from alframework.tools.tools import build_input_dict
+from alframework.tools.sampler_batching import (
+    add_molecule_to_same_state_buffer,
+    alchemi_allow_partial_batches,
+    alchemi_sampler_batch_size,
+    pop_ready_same_state_batches,
+)
 from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
 #import logging
@@ -66,6 +72,7 @@ QM_task_queue = parsl_task_queue()
 ML_task_queue = parsl_task_queue()
 builder_task_queue = parsl_task_queue()
 sampler_task_queue = parsl_task_queue()
+sampler_same_state_buffers = {}
 
 
 def _flatten_molecule_output(output):
@@ -86,6 +93,28 @@ def _first_valid_molecule(output):
         if molecule.get_atoms() is not None:
             return molecule
     raise RuntimeError("Sampler returned no valid MoleculesObject with atoms.")
+
+
+def _submit_sampler_batch(batch):
+    task_input = build_input_dict(
+        sampler_task.func,
+        [{"molecule_object": None, "molecule_objects": batch, "sampler_config": sampler_config}, *all_configs, status],
+        raise_on_fail=True,
+    )
+    sampler_task_queue.add_task(sampler_task(**task_input))
+
+
+def _flush_sampler_batches(force_partial=False):
+    batch_size = alchemi_sampler_batch_size(sampler_config)
+    if batch_size <= 1:
+        return
+    for batch in pop_ready_same_state_batches(
+        sampler_same_state_buffers,
+        batch_size=batch_size,
+        allow_partial=alchemi_allow_partial_batches(sampler_config),
+        force_partial=bool(force_partial),
+    ):
+        _submit_sampler_batch(batch)
 
 if (args.test_builder or args.test_qm or args.test_sampler or args.test_ml) and 'parsl_debug_configuration' in master_config:
     parsl_configuration = load_module_from_string(master_config['parsl_debug_configuration'])
@@ -422,23 +451,37 @@ while True:
         structure_list, failed = builder_task_queue.get_task_results()
         status['lifetime_failed_builder_tasks'] = status['lifetime_failed_builder_tasks'] + failed
         # Douple loop to facilitate possiblitiy of multiple sctructures returned by builder
+        sampler_batch_size = alchemi_sampler_batch_size(sampler_config)
         for structure in structure_list:
             # If builders return a single structure:
             if isinstance(structure, MoleculesObject):
-                task_input = build_input_dict(sampler_task.func,
-                                              [{"molecule_object": structure, "sampler_config": sampler_config},
-                                               *all_configs, status],
-                                              raise_on_fail=True)
-                sampler_task_queue.add_task(sampler_task(**task_input))
+                if sampler_batch_size > 1:
+                    add_molecule_to_same_state_buffer(sampler_same_state_buffers, structure)
+                else:
+                    task_input = build_input_dict(sampler_task.func,
+                                                  [{"molecule_object": structure, "sampler_config": sampler_config},
+                                                   *all_configs, status],
+                                                  raise_on_fail=True)
+                    sampler_task_queue.add_task(sampler_task(**task_input))
             # If builders return multiple structures
             elif isinstance(structure, list):
                 for substructure in structure:
                     assert isinstance(substructure, MoleculesObject), 'substructure must be a MoleculesObject instance'
-                    task_input = build_input_dict(sampler_task.func,
-                                                  [{"molecule_object": substructure, "sampler_config": sampler_config},
-                                                   *all_configs, status],
-                                                  raise_on_fail=True)
-                    sampler_task_queue.add_task(sampler_task(**task_input))
+                    if sampler_batch_size > 1:
+                        add_molecule_to_same_state_buffer(sampler_same_state_buffers, substructure)
+                    else:
+                        task_input = build_input_dict(sampler_task.func,
+                                                      [{"molecule_object": substructure, "sampler_config": sampler_config},
+                                                       *all_configs, status],
+                                                      raise_on_fail=True)
+                        sampler_task_queue.add_task(sampler_task(**task_input))
+        _flush_sampler_batches(
+            force_partial=(
+                sampler_task_queue.get_number() == 0
+                and builder_task_queue.get_number() == 0
+                and alchemi_allow_partial_batches(sampler_config)
+            )
+        )
 
     # Run more QM
     if sampler_task_queue.get_completed_number() > master_config['minimum_QM']:

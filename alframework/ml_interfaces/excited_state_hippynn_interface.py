@@ -543,13 +543,14 @@ def load_excited_state_ensemble(
     properties_list: dict[str, list[Any]],
     device: str = "cuda:0",
 ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
-    del device
     import hippynn
 
     state_table = derive_state_property_table(properties_list, require_forces=False)
     gap_table = derive_gap_property_table(properties_list)
     ensemble_root = Path(ensemble_directory).expanduser().resolve()
     ensemble_graph, _ = hippynn.graphs.make_ensemble(str(ensemble_root / "model-*"))
+    if hasattr(ensemble_graph, "to"):
+        ensemble_graph.to(device)
     resolved_rows: list[dict[str, Any]] = []
     for row in state_table:
         resolved = dict(row)
