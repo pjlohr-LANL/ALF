@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from ase import Atoms
 from ase import units
 from ase.io import write
 from ase.io.trajectory import Trajectory
@@ -692,6 +693,47 @@ def _json_default(value: Any):
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable.")
 
 
+def _plain_metadata_value(value: Any) -> Any:
+    """Convert sampler metadata to primitives safe for Parsl result serialization."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if hasattr(value, "detach"):
+        tensor = value.detach()
+        if hasattr(tensor, "cpu"):
+            tensor = tensor.cpu()
+        return _plain_metadata_value(np.asarray(tensor))
+    if isinstance(value, dict):
+        return {str(key): _plain_metadata_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_plain_metadata_value(item) for item in value]
+    if hasattr(value, "tolist"):
+        return _plain_metadata_value(value.tolist())
+    return str(value)
+
+
+def _plain_metadata_dict(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {str(key): _plain_metadata_value(value) for key, value in metadata.items()}
+
+
+def _plain_atoms_for_task_result(atoms) -> Atoms:
+    """Return a calculator-free Atoms object with no attached constraints/info objects."""
+    clean = Atoms(
+        numbers=np.asarray(atoms.get_atomic_numbers(), dtype=int),
+        positions=np.asarray(atoms.get_positions(), dtype=float),
+        cell=np.asarray(atoms.get_cell(), dtype=float),
+        pbc=np.asarray(atoms.get_pbc(), dtype=bool),
+    )
+    if atoms.has("momenta"):
+        clean.set_momenta(np.asarray(atoms.get_momenta(), dtype=float))
+    return clean
+
+
 def run_excited_state_sampling_batch(
     molecule_objects: list[MoleculesObject],
     *,
@@ -1048,8 +1090,7 @@ def run_excited_state_sampling_batch(
         parent_id = molecule_objects[parent_index].get_moleculeid()
         candidate_id = f"{parent_id}-cand-{rank:02d}"
         candidate_ids.append(candidate_id)
-        candidate_atoms = candidate["atoms"]
-        candidate_atoms.calc = None
+        candidate_atoms = _plain_atoms_for_task_result(candidate["atoms"])
         candidate_metadata = dict(candidate["record"])
         candidate_metadata.update(
             {
@@ -1063,7 +1104,7 @@ def run_excited_state_sampling_batch(
             }
         )
         molecule = MoleculesObject(candidate_atoms, candidate_id)
-        molecule.update_metadata(candidate_metadata)
+        molecule.update_metadata(_plain_metadata_dict(candidate_metadata))
         output_candidates.append(molecule)
 
     grouped_candidates: dict[str, tuple[list[dict[str, Any]], list[str]]] = {}
@@ -1911,8 +1952,7 @@ def run_excited_state_sampling(
     candidate_ids = [f"{molecule_object.get_moleculeid()}-cand-{rank:02d}" for rank in range(len(top_candidates))]
     _write_qm_candidate_xyz(sampler_config, molecule_object.get_moleculeid(), top_candidates, candidate_ids)
     for rank, candidate in enumerate(top_candidates):
-        selected_atoms = candidate["atoms"]
-        selected_atoms.calc = None
+        selected_atoms = _plain_atoms_for_task_result(candidate["atoms"])
         candidate_record = dict(candidate["record"])
         candidate_metadata = dict(meta_dict)
         candidate_metadata.update(
@@ -1929,7 +1969,7 @@ def run_excited_state_sampling(
             selected_atoms,
             candidate_ids[rank],
         )
-        candidate_molecule.update_metadata(candidate_metadata)
+        candidate_molecule.update_metadata(_plain_metadata_dict(candidate_metadata))
         output_candidates.append(candidate_molecule)
     return output_candidates
 

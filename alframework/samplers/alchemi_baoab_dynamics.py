@@ -72,10 +72,10 @@ def _prediction_value(predictions: Any, node: Any, fallback_key: str):
 def _prediction_tensor(value: Any, reference, *, dtype=None):
     if torch is None:
         raise _missing_alchemi_error(_alchemi_model_import_error)
-    target_dtype = dtype
-    if target_dtype is None and hasattr(value, "dtype") and torch.is_floating_point(value):
-        target_dtype = reference.dtype
     tensor = value if hasattr(value, "detach") else torch.as_tensor(value)
+    target_dtype = dtype
+    if target_dtype is None and torch.is_floating_point(tensor):
+        target_dtype = reference.dtype
     if target_dtype is not None and torch.is_floating_point(tensor):
         return tensor.to(device=reference.device, dtype=target_dtype)
     return tensor.to(device=reference.device)

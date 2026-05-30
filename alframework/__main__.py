@@ -328,16 +328,19 @@ if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
     while QM_task_queue.get_exec_done_number() < master_config['bootstrap_set']:
         if QM_task_queue.get_queued_number() < master_config['target_queued_QM']:
             while builder_task_queue.get_number() * master_config.get('maximum_builder_structures', 1) < master_config['parallel_samplers']:
+                remaining_bootstrap = int(master_config['bootstrap_set']) - int(status['current_molecule_id'])
+                if remaining_bootstrap <= 0:
+                    break
+                builder_count = min(int(master_config.get('maximum_builder_structures', 1)), remaining_bootstrap)
                 moleculeids = ['mol-boot-{:010d}'.format(it_ind) for it_ind in
-                               range(status['current_molecule_id'], status['current_molecule_id'] + master_config.get('maximum_builder_structures', 1))
-                               ]
+                               range(status['current_molecule_id'], status['current_molecule_id'] + builder_count)]
                 task_input = build_input_dict(builder_task.func,
                                               [{"moleculeid": 'mol-boot-{:010d}'.format(status['current_molecule_id']),
                                                 "moleculeids": moleculeids, "builder_config": builder_config},
                                                *all_configs, status],
                                               raise_on_fail=True)
                 builder_task_queue.add_task(builder_task(**task_input))
-                status['current_molecule_id'] = status['current_molecule_id'] + master_config.get('maximum_builder_structures',1)
+                status['current_molecule_id'] = status['current_molecule_id'] + builder_count
         
         if builder_task_queue.get_exec_done_number() > master_config['minimum_QM']:
             builder_results, failed = builder_task_queue.get_task_results()
