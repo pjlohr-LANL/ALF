@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from ase import Atoms
 from ase import units
 from ase.io import write
 from ase.io.trajectory import Trajectory
@@ -18,6 +17,12 @@ from parsl import python_app
 from alframework.ml_interfaces.excited_state_hippynn_interface import load_excited_state_ensemble
 from alframework.samplers.sampling_timing import SamplerTiming
 from alframework.tools.excited_state_tools import gap_key_for_pair, select_excited_state, stable_uint32_seed
+from alframework.tools.molecule_payloads import (
+    clean_atoms,
+    plain_metadata_dict,
+    write_sampler_error_ref,
+    write_sampler_result_ref,
+)
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.tools import annealing_schedule
 
@@ -693,47 +698,6 @@ def _json_default(value: Any):
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable.")
 
 
-def _plain_metadata_value(value: Any) -> Any:
-    """Convert sampler metadata to primitives safe for Parsl result serialization."""
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if hasattr(value, "detach"):
-        tensor = value.detach()
-        if hasattr(tensor, "cpu"):
-            tensor = tensor.cpu()
-        return _plain_metadata_value(np.asarray(tensor))
-    if isinstance(value, dict):
-        return {str(key): _plain_metadata_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_plain_metadata_value(item) for item in value]
-    if hasattr(value, "tolist"):
-        return _plain_metadata_value(value.tolist())
-    return str(value)
-
-
-def _plain_metadata_dict(metadata: dict[str, Any]) -> dict[str, Any]:
-    return {str(key): _plain_metadata_value(value) for key, value in metadata.items()}
-
-
-def _plain_atoms_for_task_result(atoms) -> Atoms:
-    """Return a calculator-free Atoms object with no attached constraints/info objects."""
-    clean = Atoms(
-        numbers=np.asarray(atoms.get_atomic_numbers(), dtype=int),
-        positions=np.asarray(atoms.get_positions(), dtype=float),
-        cell=np.asarray(atoms.get_cell(), dtype=float),
-        pbc=np.asarray(atoms.get_pbc(), dtype=bool),
-    )
-    if atoms.has("momenta"):
-        clean.set_momenta(np.asarray(atoms.get_momenta(), dtype=float))
-    return clean
-
-
 def run_excited_state_sampling_batch(
     molecule_objects: list[MoleculesObject],
     *,
@@ -1090,7 +1054,7 @@ def run_excited_state_sampling_batch(
         parent_id = molecule_objects[parent_index].get_moleculeid()
         candidate_id = f"{parent_id}-cand-{rank:02d}"
         candidate_ids.append(candidate_id)
-        candidate_atoms = _plain_atoms_for_task_result(candidate["atoms"])
+        candidate_atoms = clean_atoms(candidate["atoms"])
         candidate_metadata = dict(candidate["record"])
         candidate_metadata.update(
             {
@@ -1104,7 +1068,7 @@ def run_excited_state_sampling_batch(
             }
         )
         molecule = MoleculesObject(candidate_atoms, candidate_id)
-        molecule.update_metadata(_plain_metadata_dict(candidate_metadata))
+        molecule.update_metadata(plain_metadata_dict(candidate_metadata))
         output_candidates.append(molecule)
 
     grouped_candidates: dict[str, tuple[list[dict[str, Any]], list[str]]] = {}
@@ -1952,7 +1916,7 @@ def run_excited_state_sampling(
     candidate_ids = [f"{molecule_object.get_moleculeid()}-cand-{rank:02d}" for rank in range(len(top_candidates))]
     _write_qm_candidate_xyz(sampler_config, molecule_object.get_moleculeid(), top_candidates, candidate_ids)
     for rank, candidate in enumerate(top_candidates):
-        selected_atoms = _plain_atoms_for_task_result(candidate["atoms"])
+        selected_atoms = clean_atoms(candidate["atoms"])
         candidate_record = dict(candidate["record"])
         candidate_metadata = dict(meta_dict)
         candidate_metadata.update(
@@ -1969,7 +1933,7 @@ def run_excited_state_sampling(
             selected_atoms,
             candidate_ids[rank],
         )
-        candidate_molecule.update_metadata(_plain_metadata_dict(candidate_metadata))
+        candidate_molecule.update_metadata(plain_metadata_dict(candidate_metadata))
         output_candidates.append(candidate_molecule)
     return output_candidates
 
@@ -1984,23 +1948,29 @@ def excited_state_sampling_task(
     properties_list,
     molecule_objects=None,
 ):
-    if molecule_objects is not None:
-        return run_excited_state_sampling_batch(
-            molecule_objects=list(molecule_objects),
-            sampler_config=dict(sampler_config or {}),
+    local_sampler_config = dict(sampler_config or {})
+    try:
+        if molecule_objects is not None:
+            result = run_excited_state_sampling_batch(
+                molecule_objects=list(molecule_objects),
+                sampler_config=local_sampler_config,
+                model_path=str(model_path),
+                current_model_id=int(current_model_id),
+                gpus_per_node=int(gpus_per_node),
+                properties_list=dict(properties_list or {}),
+            )
+            return write_sampler_result_ref(result, local_sampler_config)
+        result = run_excited_state_sampling(
+            molecule_object=molecule_object,
+            sampler_config=local_sampler_config,
             model_path=str(model_path),
             current_model_id=int(current_model_id),
             gpus_per_node=int(gpus_per_node),
             properties_list=dict(properties_list or {}),
         )
-    return run_excited_state_sampling(
-        molecule_object=molecule_object,
-        sampler_config=dict(sampler_config or {}),
-        model_path=str(model_path),
-        current_model_id=int(current_model_id),
-        gpus_per_node=int(gpus_per_node),
-        properties_list=dict(properties_list or {}),
-    )
+        return write_sampler_result_ref(result, local_sampler_config)
+    except BaseException as exc:
+        return write_sampler_error_ref(exc, local_sampler_config)
 
 
 @python_app(executors=["alf_gpu_executor"])
@@ -2013,20 +1983,26 @@ def excited_state_sampling_gpu_task(
     properties_list,
     molecule_objects=None,
 ):
-    if molecule_objects is not None:
-        return run_excited_state_sampling_batch(
-            molecule_objects=list(molecule_objects),
-            sampler_config=dict(sampler_config or {}),
+    local_sampler_config = dict(sampler_config or {})
+    try:
+        if molecule_objects is not None:
+            result = run_excited_state_sampling_batch(
+                molecule_objects=list(molecule_objects),
+                sampler_config=local_sampler_config,
+                model_path=str(model_path),
+                current_model_id=int(current_model_id),
+                gpus_per_node=int(gpus_per_node),
+                properties_list=dict(properties_list or {}),
+            )
+            return write_sampler_result_ref(result, local_sampler_config)
+        result = run_excited_state_sampling(
+            molecule_object=molecule_object,
+            sampler_config=local_sampler_config,
             model_path=str(model_path),
             current_model_id=int(current_model_id),
             gpus_per_node=int(gpus_per_node),
             properties_list=dict(properties_list or {}),
         )
-    return run_excited_state_sampling(
-        molecule_object=molecule_object,
-        sampler_config=dict(sampler_config or {}),
-        model_path=str(model_path),
-        current_model_id=int(current_model_id),
-        gpus_per_node=int(gpus_per_node),
-        properties_list=dict(properties_list or {}),
-    )
+        return write_sampler_result_ref(result, local_sampler_config)
+    except BaseException as exc:
+        return write_sampler_error_ref(exc, local_sampler_config)

@@ -143,7 +143,9 @@ class DataDumper:
         return fig
 
     def __getattr__(self, item):
-        return getattr(self._plotter, item)
+        if item == "_plotter" or "_plotter" not in self.__dict__:
+            raise AttributeError(item)
+        return getattr(self.__dict__["_plotter"], item)
 
 
 def train_single_excited_state_model(

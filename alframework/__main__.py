@@ -34,6 +34,7 @@ from alframework.tools.sampler_batching import (
     alchemi_sampler_batch_size,
     pop_ready_same_state_batches,
 )
+from alframework.tools.molecule_payloads import flatten_molecule_output
 from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
 #import logging
@@ -77,14 +78,7 @@ sampler_same_state_buffers = {}
 
 def _flatten_molecule_output(output):
     """Normalize stage outputs that may be a MoleculesObject or nested lists."""
-    if isinstance(output, MoleculesObject):
-        return [output]
-    if isinstance(output, list):
-        flattened = []
-        for item in output:
-            flattened.extend(_flatten_molecule_output(item))
-        return flattened
-    assert isinstance(output, MoleculesObject), 'output must be a MoleculesObject instance or list of MoleculesObjects'
+    return flatten_molecule_output(output)
 
 
 def _first_valid_molecule(output):
@@ -491,7 +485,13 @@ while True:
         sampler_results, failed = sampler_task_queue.get_task_results()
         status['lifetime_failed_sampler_tasks'] = status['lifetime_failed_sampler_tasks'] + failed
         for sampler_output in sampler_results:
-            for structure in _flatten_molecule_output(sampler_output):
+            try:
+                sampler_structures = _flatten_molecule_output(sampler_output)
+            except Exception as exc:
+                status['lifetime_failed_sampler_tasks'] = status['lifetime_failed_sampler_tasks'] + 1
+                print('Sampler returned failed result: {:s}: {:s}'.format(type(exc).__name__, str(exc)))
+                continue
+            for structure in sampler_structures:
                 if structure.get_atoms() is None:
                     continue
                 task_input = build_input_dict(qm_task.func,
