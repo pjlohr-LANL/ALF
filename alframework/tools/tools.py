@@ -195,6 +195,122 @@ def store_current_data(h5path, system_data, properties):
     dpack.cleanup()
 
 
+def dataset_screening_enabled(sampler_config):
+    screen_config = sampler_config.get("dataset_screening", False)
+    if isinstance(screen_config, dict):
+        return bool(screen_config.get("enabled", False))
+    return bool(screen_config)
+
+
+def _dataset_screening_options(sampler_config):
+    screen_config = sampler_config.get("dataset_screening", {})
+    if not isinstance(screen_config, dict):
+        screen_config = {}
+    return {
+        "force": bool(screen_config.get("force", True)),
+        "min_distance": bool(screen_config.get("min_distance", True)),
+        "max_force_cutoff": float(sampler_config.get("max_force_cutoff", 10.0)),
+        "min_distance_cutoff": float(sampler_config.get("min_distance_cutoff", 0.3)),
+    }
+
+
+def _force_property_keys(properties, results):
+    keys = []
+    for prop_key, prop_spec in properties.items():
+        if len(prop_spec) < 2 or str(prop_spec[1]).lower() != "atomic":
+            continue
+        db_name = str(prop_spec[0])
+        if str(prop_key).startswith("F") or db_name.startswith("F"):
+            if prop_key in results:
+                keys.append(prop_key)
+    return keys
+
+
+def dataset_screening_metrics(system, properties):
+    atoms = system.get_atoms()
+    results = system.get_results()
+    metrics = {"max_force_norm": None, "min_distance": None}
+
+    force_maxima = []
+    for force_key in _force_property_keys(properties, results):
+        force_array = np.asarray(results[force_key], dtype=np.float64)
+        if force_array.ndim != 2 or force_array.shape[-1] != 3:
+            raise ValueError(
+                "Dataset screening expected force property {:s} to have shape (n_atoms, 3), got {:s}".format(
+                    str(force_key), str(force_array.shape)
+                )
+            )
+        force_maxima.append(float(np.linalg.norm(force_array, axis=1).max()))
+    if force_maxima:
+        metrics["max_force_norm"] = max(force_maxima)
+
+    if atoms is not None and len(atoms) > 1:
+        distances = np.asarray(atoms.get_all_distances(mic=True), dtype=np.float64)
+        np.fill_diagonal(distances, np.inf)
+        metrics["min_distance"] = float(np.min(distances))
+    elif atoms is not None:
+        metrics["min_distance"] = np.inf
+
+    return metrics
+
+
+def filter_dataset_screening(system_data, properties, sampler_config):
+    options = _dataset_screening_options(sampler_config)
+    kept = []
+    summary = {
+        "enabled": dataset_screening_enabled(sampler_config),
+        "total": len(system_data),
+        "kept": 0,
+        "rejected_force": 0,
+        "rejected_min_distance": 0,
+        "max_force_cutoff": options["max_force_cutoff"],
+        "min_distance_cutoff": options["min_distance_cutoff"],
+    }
+
+    if not summary["enabled"]:
+        summary["kept"] = len(system_data)
+        return list(system_data), summary
+
+    for system in system_data:
+        if not isinstance(system, MoleculesObject) or not system.check_convergence() or system.get_atoms() is None:
+            kept.append(system)
+            continue
+
+        metrics = dataset_screening_metrics(system, properties)
+        reject_force = (
+            options["force"]
+            and metrics["max_force_norm"] is not None
+            and metrics["max_force_norm"] > options["max_force_cutoff"]
+        )
+        reject_distance = (
+            options["min_distance"]
+            and metrics["min_distance"] is not None
+            and metrics["min_distance"] < options["min_distance_cutoff"]
+        )
+
+        if reject_force:
+            summary["rejected_force"] += 1
+        if reject_distance:
+            summary["rejected_min_distance"] += 1
+        if not reject_force and not reject_distance:
+            kept.append(system)
+
+    summary["kept"] = len(kept)
+    return kept, summary
+
+
+def print_dataset_screening_summary(summary):
+    if not summary.get("enabled", False):
+        return
+    print("Dataset screening summary")
+    print("Total QM results: {:d}".format(int(summary["total"])))
+    print("Kept results: {:d}".format(int(summary["kept"])))
+    print("Rejected by force: {:d}".format(int(summary["rejected_force"])))
+    print("Rejected by min distance: {:d}".format(int(summary["rejected_min_distance"])))
+    print("Max force cutoff: {:.6g}".format(float(summary["max_force_cutoff"])))
+    print("Min distance cutoff: {:.6g}".format(float(summary["min_distance_cutoff"])))
+
+
 # Recommend creation of parsl queue object
 class parsl_task_queue():
     def __init__(self):

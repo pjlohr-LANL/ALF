@@ -61,3 +61,5 @@ es_datasets/
 examples/
 manifest_cache/
 production/
+
+atomistic_environment.yml

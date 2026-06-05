@@ -22,7 +22,7 @@ import parsl
 import alframework
 #from alframework.parsl_resource_configs.darwin import config_atdm_ml
 from alframework.tools.tools import parsl_task_queue
-from alframework.tools.tools import store_current_data
+from alframework.tools.tools import filter_dataset_screening, print_dataset_screening_summary, store_current_data
 from alframework.tools.tools import load_config_file
 from alframework.tools.tools import find_empty_directory
 from alframework.tools.tools import system_checker
@@ -508,6 +508,17 @@ while True:
         status['lifetime_failed_QM_tasks'] = status['lifetime_failed_QM_tasks'] + failed
         #with open('temp-{:04d}.pkl'.format(status['current_h5_id']),'wb') as pickle_file:
         #    pickle.dump(results_list,pickle_file)
+        results_list, screening_summary = filter_dataset_screening(
+            results_list,
+            master_config['properties_list'],
+            sampler_config,
+        )
+        print_dataset_screening_summary(screening_summary)
+        if len(results_list) == 0:
+            print("All completed QM results were rejected by dataset screening; skipping H5 save and ML training.")
+            with open(master_config['status_path'], "w") as outfile:
+                json.dump(status, outfile, indent=2)
+            continue
         store_current_data(master_config['h5_path'].format(status['current_h5_id']), results_list, master_config['properties_list'])
 #        with open('data-bk-{:04d}.pickle'.format(status['current_h5_id']),'wb') as pkbk: 
 #            pickle.dump(results_list,pkbk)
