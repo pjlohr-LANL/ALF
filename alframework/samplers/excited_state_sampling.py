@@ -376,9 +376,22 @@ def _gap_term(min_gap: float, score_config: dict[str, Any]) -> float:
 
 
 def _effective_uncertainties(metrics: dict[str, Any], score_config: dict[str, Any]) -> tuple[float, float]:
+    scope = str(score_config.get("uncertainty_scope", "selected_state")).strip().lower()
+    if scope == "selected_state":
+        return float(metrics["uE_selected"]), float(metrics["uF_selected"])
+    if scope != "all_states":
+        raise ValueError(
+            f"Unsupported excited-state uncertainty_scope: {scope!r}. "
+            "Use 'selected_state' or 'all_states'."
+        )
     aggregate = str(score_config.get("uncertainty_aggregate", "max")).strip().lower()
     if aggregate == "rms":
         return float(metrics["uE_rms"]), float(metrics["uF_rms"])
+    if aggregate != "max":
+        raise ValueError(
+            f"Unsupported excited-state uncertainty_aggregate: {aggregate!r}. "
+            "Use 'max' or 'rms'."
+        )
     return float(metrics["uE_max"]), float(metrics["uF_max"])
 
 
@@ -471,6 +484,11 @@ def _results_to_metrics(
     for row in state_table:
         state = int(row["state"])
         force_stds[state] = _force_rms(np.asarray(results[f"F_std_S{state}"], dtype=np.float64))
+    uncertainty_state = int(selected_state)
+    if uncertainty_state not in energy_stds or uncertainty_state not in force_stds:
+        raise ValueError(
+            f"Selected state {uncertainty_state} is missing from sampler uncertainty metrics."
+        )
 
     if forces_override is None:
         forces = np.asarray(atoms.get_forces(), dtype=np.float64)
@@ -488,6 +506,9 @@ def _results_to_metrics(
         "gap_stds": gap_stds,
         "gap_pairs": gap_pairs,
         "force_stds": force_stds,
+        "uncertainty_state": uncertainty_state,
+        "uE_selected": float(energy_stds[uncertainty_state]),
+        "uF_selected": float(force_stds[uncertainty_state]),
         "uE_max": float(max(energy_stds.values())),
         "uE_rms": float(np.sqrt(np.mean(np.square(list(energy_stds.values()))))),
         "uF_max": float(max(force_stds.values())),

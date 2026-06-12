@@ -168,9 +168,13 @@ def _candidate_record(
     generation: int,
     rank: int,
     candidate: dict[str, Any],
+    uncertainty_scope: str,
     uncertainty_aggregate: str,
 ) -> dict[str, Any]:
-    if uncertainty_aggregate == "rms":
+    if uncertainty_scope == "selected_state":
+        uE_used = candidate.get("uE_selected", candidate.get("uE_rms", candidate.get("uE_max")))
+        uF_used = candidate.get("uF_selected", candidate.get("uF_rms", candidate.get("uF_max")))
+    elif uncertainty_aggregate == "rms":
         uE_used = candidate.get("uE_rms", candidate.get("uE_max"))
         uF_used = candidate.get("uF_rms", candidate.get("uF_max"))
     else:
@@ -186,6 +190,9 @@ def _candidate_record(
         "uE": candidate.get("uE_max", candidate.get("uE_rms")),
         "uE_used": uE_used,
         "uF": uF_used,
+        "uE_selected": candidate.get("uE_selected"),
+        "uF_selected": candidate.get("uF_selected"),
+        "uncertainty_state": candidate.get("uncertainty_state"),
         "uE_max": candidate.get("uE_max"),
         "uE_rms": candidate.get("uE_rms"),
         "uF_max": candidate.get("uF_max"),
@@ -206,6 +213,9 @@ def _candidate_record(
 
 def _collect_sampler_records(run_dir: Path, sampler_config: dict[str, Any]) -> dict[int, list[dict[str, Any]]]:
     metadata_dir = _resolve_path(run_dir, str(sampler_config.get("meta_dir", "sampling/")))
+    uncertainty_scope = str(
+        ((sampler_config.get("score") or {}).get("uncertainty_scope") or "selected_state")
+    ).strip().lower()
     uncertainty_aggregate = str(
         ((sampler_config.get("score") or {}).get("uncertainty_aggregate") or "max")
     ).strip().lower()
@@ -228,6 +238,7 @@ def _collect_sampler_records(run_dir: Path, sampler_config: dict[str, Any]) -> d
                     generation=generation,
                     rank=rank,
                     candidate=dict(candidate),
+                    uncertainty_scope=uncertainty_scope,
                     uncertainty_aggregate=uncertainty_aggregate,
                 )
             )

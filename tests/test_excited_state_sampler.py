@@ -37,6 +37,105 @@ def _snapshot(*, energy, forces, e0, e1, u0, u1, f0, f1):
     }
 
 
+def test_selected_state_uncertainty_is_default_for_gate_and_score():
+    atoms = Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
+    metrics = sampler_mod._results_to_metrics(
+        atoms,
+        _snapshot(
+            energy=0.0,
+            forces=np.zeros((3, 3)),
+            e0=0.00,
+            e1=0.03,
+            u0=0.20,
+            u1=2.00,
+            f0=np.full((3, 3), 0.05),
+            f1=np.full((3, 3), 3.00),
+        ),
+        [
+            {"state": 0},
+            {"state": 1},
+        ],
+        [],
+        selected_state=0,
+        forces_override=np.zeros((3, 3)),
+    )
+    sampler_config = {
+        "uncertainty": {"enabled": True, "min_uE": 0.15, "min_uF": 0.10, "logic": "either"},
+        "score": {"w_energy": 2.0, "w_force": 3.0, "w_gap": 0.0},
+    }
+
+    assert metrics["uncertainty_state"] == 0
+    assert metrics["uE_selected"] == pytest.approx(0.20)
+    assert metrics["uF_selected"] == pytest.approx(0.05)
+    assert metrics["uE_max"] == pytest.approx(2.00)
+    assert metrics["uF_max"] == pytest.approx(3.00)
+    assert sampler_mod._passes_uncertainty_gate(metrics, sampler_config)
+    components = sampler_mod.compute_excited_state_score_components(metrics, sampler_config)
+    assert components["energy_uncertainty"] == pytest.approx(0.40)
+    assert components["force_uncertainty"] == pytest.approx(0.15)
+
+
+def test_nonselected_state_uncertainty_does_not_pass_selected_state_gate():
+    atoms = Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
+    metrics = sampler_mod._results_to_metrics(
+        atoms,
+        _snapshot(
+            energy=0.0,
+            forces=np.zeros((3, 3)),
+            e0=0.00,
+            e1=0.03,
+            u0=0.01,
+            u1=2.00,
+            f0=np.full((3, 3), 0.01),
+            f1=np.full((3, 3), 3.00),
+        ),
+        [
+            {"state": 0},
+            {"state": 1},
+        ],
+        [],
+        selected_state=0,
+        forces_override=np.zeros((3, 3)),
+    )
+    sampler_config = {
+        "uncertainty": {"enabled": True, "min_uE": 0.15, "min_uF": 0.10, "logic": "either"},
+        "score": {"w_energy": 1.0, "w_force": 1.0, "w_gap": 0.0},
+    }
+
+    assert not sampler_mod._passes_uncertainty_gate(metrics, sampler_config)
+    components = sampler_mod.compute_excited_state_score_components(metrics, sampler_config)
+    assert components["energy_uncertainty"] == pytest.approx(0.01)
+    assert components["force_uncertainty"] == pytest.approx(0.01)
+
+
+def test_all_state_uncertainty_scope_preserves_legacy_aggregate_behavior():
+    metrics = {
+        "selected_state": 0,
+        "uncertainty_state": 0,
+        "uE_selected": 0.01,
+        "uF_selected": 0.02,
+        "uE_max": 1.0,
+        "uF_max": 2.0,
+        "uE_rms": 0.5,
+        "uF_rms": 0.75,
+        "min_gap": 0.03,
+        "gap_stds": {},
+    }
+    sampler_config = {
+        "score": {
+            "w_energy": 1.0,
+            "w_force": 1.0,
+            "w_gap": 0.0,
+            "uncertainty_scope": "all_states",
+            "uncertainty_aggregate": "rms",
+        }
+    }
+
+    components = sampler_mod.compute_excited_state_score_components(metrics, sampler_config)
+    assert components["energy_uncertainty"] == pytest.approx(0.5)
+    assert components["force_uncertainty"] == pytest.approx(0.75)
+
+
 def _install_fake_sampling_runtime(monkeypatch, snapshots):
     fake_snapshots = [deepcopy(s) for s in snapshots]
 
@@ -224,6 +323,9 @@ def test_run_excited_state_sampling_selects_highest_scoring_valid_frame(monkeypa
     assert result.get_metadata()["selected_state"] == 0
     assert result.get_metadata()["best_candidate"]["step"] == 1
     assert result.get_metadata()["best_candidate"]["score"] > 0.6
+    best_candidate = result.get_metadata()["best_candidate"]
+    assert best_candidate["score_components"]["energy_uncertainty"] == pytest.approx(best_candidate["uE_selected"])
+    assert best_candidate["score_components"]["force_uncertainty"] == pytest.approx(best_candidate["uF_selected"])
     assert schedule_calls[0] == (0.0, 0.002, 0.0, 5.0, 100.0, 200.0)
     assert fake_langevin.instances[0].run_calls == [1, 1, 1]
     meta_path = tmp_path / "meta" / "metadata-traj_0000.json"
@@ -673,8 +775,8 @@ def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path
                 "E_std_S0": uncertainty,
                 "F_std_S0": np.full((3, 3), uncertainty),
                 "E_mean_S1": 0.03,
-                "E_std_S1": 0.01,
-                "F_std_S1": np.full((3, 3), 0.01),
+                "E_std_S1": 10.0,
+                "F_std_S1": np.full((3, 3), 10.0),
             }
 
         def sync_graph_to_atoms(self, graph_index, atoms):
@@ -760,6 +862,14 @@ def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path
     assert len(result) == 2
     assert {item.get_metadata()["parent_molecule_id"] for item in result} == {"batch_0", "batch_1"}
     assert all(item.get_metadata()["batch_size"] == 2 for item in result)
+    assert all(
+        item.get_metadata()["score_components"]["energy_uncertainty"] == pytest.approx(item.get_metadata()["uE_selected"])
+        for item in result
+    )
+    assert all(
+        item.get_metadata()["score_components"]["force_uncertainty"] == pytest.approx(item.get_metadata()["uF_selected"])
+        for item in result
+    )
     payload = json.loads((tmp_path / "meta" / "metadata-batch_0.json").read_text(encoding="utf-8"))
     assert payload["batch_size"] == 2
     assert payload["timing"]["batch_size"] == 2
