@@ -136,6 +136,75 @@ def test_all_state_uncertainty_scope_preserves_legacy_aggregate_behavior():
     assert components["force_uncertainty"] == pytest.approx(0.75)
 
 
+def test_selected_state_scope_ignores_legacy_rms_aggregate():
+    metrics = {
+        "selected_state": 0,
+        "uncertainty_state": 0,
+        "uE_selected": 0.10,
+        "uF_selected": 0.20,
+        "uE_max": 1.0,
+        "uF_max": 2.0,
+        "uE_rms": 0.5,
+        "uF_rms": 0.75,
+        "min_gap": 0.03,
+        "gap_stds": {},
+    }
+    sampler_config = {
+        "score": {
+            "w_energy": 1.0,
+            "w_force": 1.0,
+            "w_gap": 0.0,
+            "uncertainty_scope": "selected_state",
+            "uncertainty_aggregate": "rms",
+        }
+    }
+
+    components = sampler_mod.compute_excited_state_score_components(metrics, sampler_config)
+    assert components["energy_uncertainty"] == pytest.approx(0.10)
+    assert components["force_uncertainty"] == pytest.approx(0.20)
+
+
+def test_gap_seeking_hysteresis_settings_validation():
+    settings = sampler_mod._gap_seeking_settings(
+        {
+            "enabled": True,
+            "switch_policy": "hysteresis",
+            "trigger_gap_threshold_eV": 0.001,
+            "exit_gap_threshold_eV": 0.02,
+            "min_lcm_steps": 50,
+        },
+        [0, 1],
+        selected_state=0,
+    )
+
+    assert settings["switch_policy"] == "hysteresis"
+    assert settings["exit_gap_threshold_eV"] == pytest.approx(0.02)
+    assert settings["min_lcm_steps"] == 50
+
+
+def test_gap_seeking_hysteresis_requires_exit_above_trigger():
+    with pytest.raises(ValueError, match="exit_gap_threshold_eV must be greater"):
+        sampler_mod._gap_seeking_settings(
+            {
+                "enabled": True,
+                "switch_policy": "hysteresis",
+                "trigger_gap_threshold_eV": 0.001,
+                "exit_gap_threshold_eV": 0.001,
+            },
+            [0, 1],
+            selected_state=0,
+        )
+
+
+def test_gap_seeking_rejects_unsupported_switch_policy():
+    with pytest.raises(ValueError, match="Unsupported gap_seeking.switch_policy"):
+        sampler_mod._gap_seeking_settings(
+            {"enabled": True, "switch_policy": "pulse"},
+            [0, 1],
+            selected_state=0,
+        )
+
+
 def _install_fake_sampling_runtime(monkeypatch, snapshots):
     fake_snapshots = [deepcopy(s) for s in snapshots]
 
@@ -324,6 +393,10 @@ def test_run_excited_state_sampling_selects_highest_scoring_valid_frame(monkeypa
     assert result.get_metadata()["best_candidate"]["step"] == 1
     assert result.get_metadata()["best_candidate"]["score"] > 0.6
     best_candidate = result.get_metadata()["best_candidate"]
+    assert result.get_metadata()["score_uncertainty_scope"] == "selected_state"
+    assert result.get_metadata()["score_uncertainty_source"] == "selected_state"
+    assert best_candidate["score_uncertainty_scope"] == "selected_state"
+    assert best_candidate["score_uncertainty_source"] == "selected_state"
     assert best_candidate["score_components"]["energy_uncertainty"] == pytest.approx(best_candidate["uE_selected"])
     assert best_candidate["score_components"]["force_uncertainty"] == pytest.approx(best_candidate["uF_selected"])
     assert schedule_calls[0] == (0.0, 0.002, 0.0, 5.0, 100.0, 200.0)
@@ -866,10 +939,202 @@ def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path
         item.get_metadata()["score_components"]["energy_uncertainty"] == pytest.approx(item.get_metadata()["uE_selected"])
         for item in result
     )
+    assert all(item.get_metadata()["score_uncertainty_scope"] == "selected_state" for item in result)
+    assert all(item.get_metadata()["score_uncertainty_source"] == "selected_state" for item in result)
     assert all(
         item.get_metadata()["score_components"]["force_uncertainty"] == pytest.approx(item.get_metadata()["uF_selected"])
         for item in result
     )
     payload = json.loads((tmp_path / "meta" / "metadata-batch_0.json").read_text(encoding="utf-8"))
     assert payload["batch_size"] == 2
+    assert payload["score_uncertainty_scope"] == "selected_state"
+    assert payload["score_uncertainty_source"] == "selected_state"
     assert payload["timing"]["batch_size"] == 2
+
+
+def test_batched_gap_seeking_hysteresis_enters_and_exits_lcm(monkeypatch, tmp_path: Path):
+    class FakeNode:
+        def __init__(self, name):
+            self.mean = f"{name}.mean"
+            self.std = f"{name}.std"
+
+    class FakeGraph:
+        def node_from_name(self, name):
+            return FakeNode(str(name))
+
+    def fake_load_excited_state_ensemble(ensemble_directory, properties_list, device="cpu"):
+        del ensemble_directory, properties_list, device
+        return (
+            FakeGraph(),
+            [
+                {"state": 0, "energy_node_base": "ensemble_sE0", "force_node_base": "ensemble_F0"},
+                {"state": 1, "energy_node_base": "ensemble_sE1", "force_node_base": "ensemble_F1"},
+            ],
+            [],
+        )
+
+    class FakeAlchemiModel:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.energy_nodes = [kwargs["energy_node"]]
+            self.lcm_modes = []
+            self.__class__.instances.append(self)
+
+        def set_energy_node(self, energy_node, **kwargs):
+            del kwargs
+            self.energy_nodes.append(energy_node)
+
+        def set_lcm_gap_mode(self, **kwargs):
+            self.lcm_modes.append(dict(kwargs))
+
+    class FakeBatch:
+        def __init__(self, atoms_list):
+            self.atoms_list = [atoms.copy() for atoms in atoms_list]
+            self.num_graphs = len(atoms_list)
+            self.num_nodes = sum(len(atoms) for atoms in atoms_list)
+
+    class FakeAlchemiRunner:
+        def __init__(self, *, model, batch, dt_fs, temperature_K, friction_per_fs, random_seed, device):
+            del model, dt_fs, temperature_K, friction_per_fs, random_seed, device
+            self.batch = batch
+            self.nsteps = 0
+            self.callbacks = []
+
+        def attach(self, callback, interval=1):
+            self.callbacks.append((callback, int(interval)))
+
+        def set_temperature(self, *, temperature_K):
+            self.temperature_K_target = temperature_K
+
+        def run(self, steps):
+            for _ in range(int(steps)):
+                self.nsteps += 1
+                for callback, interval in self.callbacks:
+                    if self.nsteps % interval == 0:
+                        callback()
+
+        def _snapshot(self):
+            if self.nsteps <= 2:
+                gap = 0.0005
+            else:
+                gap = 0.03
+            uncertainty = 0.20
+            forces = np.zeros((3, 3), dtype=float)
+            return {
+                "energy": 0.0,
+                "forces": forces,
+                "E_mean_S0": 0.0,
+                "E_std_S0": uncertainty,
+                "F_std_S0": np.full((3, 3), uncertainty),
+                "E_mean_S1": gap,
+                "E_std_S1": uncertainty,
+                "F_std_S1": np.full((3, 3), uncertainty),
+            }
+
+        def evaluate_results(self):
+            return dict(self._snapshot())
+
+        def results_for_graph(self, graph_index):
+            assert int(graph_index) == 0
+            return dict(self._snapshot())
+
+        def sync_graph_to_atoms(self, graph_index, atoms):
+            assert int(graph_index) == 0
+            atoms.set_positions(self.batch.atoms_list[0].get_positions())
+
+        def kinetic_energy_eV(self):
+            return np.zeros(self.batch.num_graphs)
+
+        def temperature_K(self):
+            return np.full(self.batch.num_graphs, 100.0)
+
+    fake_backend = types.ModuleType("alframework.samplers.alchemi_baoab_dynamics")
+    fake_backend.ALFExcitedStateAlchemiModel = FakeAlchemiModel
+    fake_backend.AlchemiBaoabRunner = FakeAlchemiRunner
+    fake_backend.ensure_alchemi_available = lambda: None
+    fake_backend.alchemi_config_from_sampler = lambda sampler_config, default_seed: types.SimpleNamespace(
+        random_seed=default_seed,
+        allow_cpu_debug=True,
+        strict_gpu=False,
+        scalar_sync_policy="control_only",
+        species_key="species",
+        coordinates_key="coordinates",
+        batch_size=1,
+        allow_partial_batches=True,
+        require_same_selected_state=True,
+        batched_gap_switch_policy="global_lowest_gap_trigger",
+    )
+    fake_backend.validate_alchemi_sampler_support = lambda atoms, feed, device, config: None
+    fake_backend.build_alchemi_batch_from_atoms_list = lambda atoms_list, device: FakeBatch(atoms_list)
+
+    monkeypatch.setitem(sys.modules, "alframework.samplers.alchemi_baoab_dynamics", fake_backend)
+    monkeypatch.setattr(sampler_mod, "load_excited_state_ensemble", fake_load_excited_state_ensemble)
+    monkeypatch.setattr(sampler_mod, "annealing_schedule", lambda *args: 100.0)
+
+    molecule = MoleculesObject(
+        Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]]),
+        "batch_hysteresis",
+    )
+    molecule.update_metadata({"excited_state": 0})
+
+    result = sampler_mod.run_excited_state_sampling_batch(
+        [molecule],
+        sampler_config={
+            "dynamics_backend": "alchemi_baoab",
+            "dt": 1.0,
+            "maxt": 0.004,
+            "Ncheck": 1,
+            "min_time": 0.0,
+            "friction": 0.02,
+            "srt_temp": [100.0, 100.0],
+            "end_temp": [100.0, 100.0],
+            "amp_temp": [0.0, 0.0],
+            "per_temp": [5.0, 5.0],
+            "amp_dens": None,
+            "per_dens": None,
+            "end_dens": None,
+            "meta_dir": str(tmp_path / "meta"),
+            "metadata_format": "json",
+            "write_traj_binary": False,
+            "write_traj_xyz": False,
+            "trajectory_frequency": 0.0,
+            "trajectory_interval": 1,
+            "timing": {"enabled": True},
+            "return_top_n": 2,
+            "min_distance_cutoff": 0.3,
+            "max_force_cutoff": 10.0,
+            "alchemi_baoab": {"allow_cpu_debug": True, "batch_size": 1, "allow_partial_batches": True},
+            "state_selection": {"mode": "fixed", "fixed_state": 0},
+            "uncertainty": {"enabled": True, "min_uE": 0.05, "min_uF": 0.05, "logic": "either"},
+            "gap_seeking": {
+                "enabled": True,
+                "switch_policy": "hysteresis",
+                "trigger_gap_threshold_eV": 0.001,
+                "exit_gap_threshold_eV": 0.02,
+                "min_lcm_steps": 2,
+                "switch_check_interval": 1,
+            },
+            "udd": {"enabled": False},
+            "score": {"w_energy": 1.0, "w_force": 1.0, "w_gap": 0.0},
+        },
+        model_path=str(tmp_path / "models" / "model-{:04d}"),
+        current_model_id=0,
+        gpus_per_node=0,
+        properties_list=_properties_list(),
+    )
+
+    assert len(result) >= 1
+    model = FakeAlchemiModel.instances[0]
+    assert len(model.lcm_modes) == 1
+    assert model.energy_nodes[-1] == "ensemble_sE0.mean"
+    payload = json.loads((tmp_path / "meta" / "metadata-batch_hysteresis.json").read_text(encoding="utf-8"))
+    assert payload["gap_seeking_switched"] is True
+    assert payload["gap_seeking_current_mode"] == "direct"
+    assert payload["gap_seeking_switch_policy"] == "hysteresis"
+    assert payload["gap_seeking_exit_gap_threshold_eV"] == pytest.approx(0.02)
+    assert payload["gap_seeking_min_lcm_steps"] == 2
+    assert [event["event"] for event in payload["gap_seeking_switch_events"]] == ["enter_lcm", "exit_lcm"]
+    assert payload["gap_seeking_switch_events"][0]["step"] == 1
+    assert payload["gap_seeking_switch_events"][1]["step"] == 3
+    assert payload["gap_seeking_switch_events"][1]["reason"] == "exit_gap_threshold"

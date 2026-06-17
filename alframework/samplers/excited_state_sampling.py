@@ -302,17 +302,22 @@ def _gap_seeking_settings(
     sigma = float(gap_seeking.get("sigma", 3.5))
     alpha_eV = float(gap_seeking.get("alpha_eV", 0.05))
     switch_check_interval = int(gap_seeking.get("switch_check_interval", 1))
+    exit_gap_threshold = gap_seeking.get("exit_gap_threshold_eV", None)
+    exit_gap_threshold = None if exit_gap_threshold is None else float(exit_gap_threshold)
+    min_lcm_steps = int(gap_seeking.get("min_lcm_steps", 0))
 
     if not enabled:
         return {
             "enabled": False,
             "mode": mode,
             "trigger_gap_threshold_eV": trigger_gap_threshold,
+            "exit_gap_threshold_eV": exit_gap_threshold,
             "candidate_pairs": candidate_pairs,
             "switch_policy": switch_policy,
             "sigma": sigma,
             "alpha_eV": alpha_eV,
             "switch_check_interval": switch_check_interval,
+            "min_lcm_steps": min_lcm_steps,
             "pairs": [],
         }
     pairs = _allowed_gap_pairs(state_ids, int(selected_state), candidate_pairs)
@@ -320,10 +325,25 @@ def _gap_seeking_settings(
         raise ValueError(
             f"Unsupported gap_seeking.mode: {mode!r}. Use 'levine_coe_martinez_switch'."
         )
-    if switch_policy != "stay_fixed":
-        raise ValueError(f"Unsupported gap_seeking.switch_policy: {switch_policy!r}. Use 'stay_fixed'.")
+    if switch_policy not in {"stay_fixed", "hysteresis"}:
+        raise ValueError(
+            f"Unsupported gap_seeking.switch_policy: {switch_policy!r}. "
+            "Use 'stay_fixed' or 'hysteresis'."
+        )
     if trigger_gap_threshold <= 0.0:
         raise ValueError("gap_seeking.trigger_gap_threshold_eV must be > 0.")
+    if switch_policy == "hysteresis":
+        if exit_gap_threshold is None:
+            raise ValueError("gap_seeking.exit_gap_threshold_eV is required for switch_policy='hysteresis'.")
+        if exit_gap_threshold <= trigger_gap_threshold:
+            raise ValueError(
+                "gap_seeking.exit_gap_threshold_eV must be greater than "
+                "gap_seeking.trigger_gap_threshold_eV for switch_policy='hysteresis'."
+            )
+    if exit_gap_threshold is not None and exit_gap_threshold <= 0.0:
+        raise ValueError("gap_seeking.exit_gap_threshold_eV must be > 0.")
+    if min_lcm_steps < 0:
+        raise ValueError("gap_seeking.min_lcm_steps must be >= 0.")
     if sigma <= 0.0:
         raise ValueError("gap_seeking.sigma must be > 0.")
     if alpha_eV <= 0.0:
@@ -336,11 +356,13 @@ def _gap_seeking_settings(
         "enabled": True,
         "mode": mode,
         "trigger_gap_threshold_eV": trigger_gap_threshold,
+        "exit_gap_threshold_eV": exit_gap_threshold,
         "candidate_pairs": candidate_pairs,
         "switch_policy": switch_policy,
         "sigma": sigma,
         "alpha_eV": alpha_eV,
         "switch_check_interval": switch_check_interval,
+        "min_lcm_steps": min_lcm_steps,
         "pairs": pairs,
     }
 
@@ -393,6 +415,23 @@ def _effective_uncertainties(metrics: dict[str, Any], score_config: dict[str, An
             "Use 'max' or 'rms'."
         )
     return float(metrics["uE_max"]), float(metrics["uF_max"])
+
+
+def _score_uncertainty_metadata(sampler_config: dict[str, Any]) -> dict[str, Any]:
+    score_config = _score_config(sampler_config)
+    scope = str(score_config.get("uncertainty_scope", "selected_state")).strip().lower()
+    aggregate = str(score_config.get("uncertainty_aggregate", "max")).strip().lower()
+    if scope == "selected_state":
+        source = "selected_state"
+    elif scope == "all_states":
+        source = f"all_states_{aggregate}"
+    else:
+        source = scope
+    return {
+        "score_uncertainty_scope": scope,
+        "score_uncertainty_aggregate": aggregate,
+        "score_uncertainty_source": source,
+    }
 
 
 def _passes_uncertainty_gate(metrics: dict[str, Any], sampler_config: dict[str, Any]) -> bool:
@@ -878,6 +917,7 @@ def run_excited_state_sampling_batch(
     gap_seeking_settings = _gap_seeking_settings(_gap_seeking_config(sampler_config), state_ids, selected_state)
     gap_seeking_enabled = bool(gap_seeking_settings["enabled"])
     gap_seeking_switched = False
+    gap_seeking_lcm_active = False
     gap_seeking_switch_step = None
     gap_seeking_switch_time_ps = None
     gap_seeking_pair = None
@@ -886,6 +926,7 @@ def run_excited_state_sampling_batch(
     gap_seeking_trigger_gap_eV = None
     gap_seeking_trigger_molecule_id = None
     gap_seeking_trigger_batch_index = None
+    gap_seeking_switch_events: list[dict[str, Any]] = []
 
     active = np.ones(actual_batch_size, dtype=bool)
     replica_stop_reasons: list[str | None] = [None for _ in molecule_objects]
@@ -911,14 +952,105 @@ def run_excited_state_sampling_batch(
             dyn.sync_graph_to_atoms(int(graph_index), atoms_list[int(graph_index)])
         timing.increment("full_sync_count", 1)
 
-    def _update_gap_seeking_switch() -> None:
-        nonlocal gap_seeking_switched, gap_seeking_switch_step, gap_seeking_switch_time_ps
+    def _set_batched_lcm_mode(trigger: dict[str, Any], current_step: int) -> None:
+        nonlocal gap_seeking_switched, gap_seeking_lcm_active, gap_seeking_switch_step, gap_seeking_switch_time_ps
         nonlocal gap_seeking_pair, gap_seeking_gap_key, gap_seeking_gap_source, gap_seeking_trigger_gap_eV
         nonlocal gap_seeking_trigger_molecule_id, gap_seeking_trigger_batch_index
-        if not gap_seeking_enabled or gap_seeking_switched or not np.any(active):
+        gap_seeking_switched = True
+        gap_seeking_lcm_active = True
+        gap_seeking_switch_step = int(current_step)
+        gap_seeking_switch_time_ps = float(current_step * dt) / 1000.0
+        gap_seeking_pair = [int(value) for value in trigger["pair"]]
+        gap_seeking_gap_key = str(trigger["gap_key"])
+        gap_seeking_gap_source = str(trigger["gap_source"])
+        gap_seeking_trigger_gap_eV = float(trigger["gap_eV"])
+        gap_seeking_trigger_batch_index = int(trigger["batch_index"])
+        gap_seeking_trigger_molecule_id = molecule_objects[gap_seeking_trigger_batch_index].get_moleculeid()
+        gap_seeking_switch_events.append(
+            {
+                "event": "enter_lcm",
+                "step": int(current_step),
+                "time_ps": float(current_step * dt) / 1000.0,
+                "batch_index": int(gap_seeking_trigger_batch_index),
+                "molecule_id": gap_seeking_trigger_molecule_id,
+                **{key: trigger[key] for key in ["pair", "gap_key", "gap_source", "gap_eV", "abs_gap_eV"]},
+            }
+        )
+        lower_state, upper_state = int(gap_seeking_pair[0]), int(gap_seeking_pair[1])
+        gap_base = gap_node_by_pair.get((lower_state, upper_state))
+        alchemi_model.set_lcm_gap_mode(
+            lower_energy_node=energy_node_by_state[lower_state].mean,
+            upper_energy_node=energy_node_by_state[upper_state].mean,
+            lower_force_node=force_node_by_state[lower_state].mean,
+            upper_force_node=force_node_by_state[upper_state].mean,
+            gap_node=gap_base.mean if gap_base is not None else None,
+            sigma=float(gap_seeking_settings["sigma"]),
+            alpha_eV=float(gap_seeking_settings["alpha_eV"]),
+        )
+
+    def _set_batched_direct_mode(current_step: int, *, reason: str, gap_info: dict[str, Any] | None = None) -> None:
+        nonlocal gap_seeking_lcm_active
+        gap_seeking_lcm_active = False
+        alchemi_model.set_energy_node(
+            energy_node_by_state[int(selected_state)].mean,
+            force_node=force_node_by_state[int(selected_state)].mean,
+        )
+        event = {
+            "event": "exit_lcm",
+            "step": int(current_step),
+            "time_ps": float(current_step * dt) / 1000.0,
+            "reason": str(reason),
+            "batch_index": gap_seeking_trigger_batch_index,
+            "molecule_id": gap_seeking_trigger_molecule_id,
+        }
+        if gap_info is not None:
+            event.update({key: gap_info[key] for key in ["pair", "gap_key", "gap_source", "gap_eV", "abs_gap_eV"]})
+        gap_seeking_switch_events.append(event)
+
+    def _active_batched_gap_info() -> dict[str, Any] | None:
+        if gap_seeking_trigger_batch_index is None or gap_seeking_pair is None:
+            return None
+        graph_results = dyn.results_for_graph(int(gap_seeking_trigger_batch_index))
+        gap_infos = _gap_infos_from_results(graph_results, list(gap_seeking_settings["pairs"]))
+        active_pair = [int(gap_seeking_pair[0]), int(gap_seeking_pair[1])]
+        for gap_info in gap_infos:
+            if [int(value) for value in gap_info["pair"]] == active_pair:
+                return gap_info
+        return None
+
+    def _update_gap_seeking_switch() -> None:
+        if not gap_seeking_enabled or not np.any(active):
             return
         current_step = int(dyn.nsteps)
         if current_step <= 0:
+            return
+        if gap_seeking_lcm_active:
+            if str(gap_seeking_settings["switch_policy"]) != "hysteresis":
+                return
+            if gap_seeking_switch_step is not None and (
+                current_step - int(gap_seeking_switch_step)
+            ) < int(gap_seeking_settings["min_lcm_steps"]):
+                return
+            if gap_seeking_trigger_batch_index is None or not bool(active[int(gap_seeking_trigger_batch_index)]):
+                _set_batched_direct_mode(current_step, reason="trigger_replica_inactive")
+            else:
+                _evaluate_results()
+                active_gap = _active_batched_gap_info()
+                if active_gap is not None and float(active_gap["abs_gap_eV"]) >= float(
+                    gap_seeking_settings["exit_gap_threshold_eV"]
+                ):
+                    _set_batched_direct_mode(current_step, reason="exit_gap_threshold", gap_info=active_gap)
+            if not gap_seeking_lcm_active:
+                results = _evaluate_results()
+                _validate_sampler_results(
+                    results,
+                    state_table,
+                    selected_state=selected_state,
+                    step=current_step,
+                    context="batched_gap_seeking_exit",
+                    gap_seeking_switched=gap_seeking_switched,
+                    gap_seeking_pair=gap_seeking_pair,
+                )
             return
         triggers: list[dict[str, Any]] = []
         _evaluate_results()
@@ -933,26 +1065,7 @@ def run_excited_state_sampling_batch(
         if not triggers:
             return
         trigger = min(triggers, key=lambda item: float(item["abs_gap_eV"]))
-        gap_seeking_switched = True
-        gap_seeking_switch_step = int(current_step)
-        gap_seeking_switch_time_ps = float(current_step * dt) / 1000.0
-        gap_seeking_pair = [int(value) for value in trigger["pair"]]
-        gap_seeking_gap_key = str(trigger["gap_key"])
-        gap_seeking_gap_source = str(trigger["gap_source"])
-        gap_seeking_trigger_gap_eV = float(trigger["gap_eV"])
-        gap_seeking_trigger_batch_index = int(trigger["batch_index"])
-        gap_seeking_trigger_molecule_id = molecule_objects[gap_seeking_trigger_batch_index].get_moleculeid()
-        lower_state, upper_state = int(gap_seeking_pair[0]), int(gap_seeking_pair[1])
-        gap_base = gap_node_by_pair.get((lower_state, upper_state))
-        alchemi_model.set_lcm_gap_mode(
-            lower_energy_node=energy_node_by_state[lower_state].mean,
-            upper_energy_node=energy_node_by_state[upper_state].mean,
-            lower_force_node=force_node_by_state[lower_state].mean,
-            upper_force_node=force_node_by_state[upper_state].mean,
-            gap_node=gap_base.mean if gap_base is not None else None,
-            sigma=float(gap_seeking_settings["sigma"]),
-            alpha_eV=float(gap_seeking_settings["alpha_eV"]),
-        )
+        _set_batched_lcm_mode(trigger, current_step)
         results = _evaluate_results()
         _validate_sampler_results(
             results,
@@ -1042,6 +1155,7 @@ def run_excited_state_sampling_batch(
             record = {
                 "score": score,
                 "score_components": score_components,
+                **_score_uncertainty_metadata(sampler_config),
                 "score_gap_uncertainty_key": None,
                 "score_gap_uncertainty_std": None,
                 "step": int(current_step),
@@ -1051,6 +1165,7 @@ def run_excited_state_sampling_batch(
                 "batch_size": int(actual_batch_size),
                 "parent_molecule_id": molecule_objects[graph_index].get_moleculeid(),
                 "gap_seeking_switched": bool(gap_seeking_switched),
+                "gap_seeking_current_mode": "lcm_gap" if gap_seeking_lcm_active else "direct",
                 "gap_seeking_pair": gap_seeking_pair,
                 "gap_seeking_gap_key": gap_seeking_gap_key,
                 "gap_seeking_gap_source": gap_seeking_gap_source,
@@ -1123,6 +1238,7 @@ def run_excited_state_sampling_batch(
             "energy_drift_eV_per_ps": None,
             "dynamics_backend": dynamics_backend,
             "alchemi_baoab_options": dict(vars(alchemi_options)),
+            **_score_uncertainty_metadata(sampler_config),
             "batch_size": int(actual_batch_size),
             "batch_index": int(graph_index),
             "batch_molecule_ids": [item.get_moleculeid() for item in molecule_objects],
@@ -1137,10 +1253,13 @@ def run_excited_state_sampling_batch(
             "gap_seeking_candidate_pairs": str(gap_seeking_settings["candidate_pairs"]),
             "gap_seeking_switch_policy": str(gap_seeking_settings["switch_policy"]),
             "gap_seeking_trigger_gap_threshold_eV": float(gap_seeking_settings["trigger_gap_threshold_eV"]),
+            "gap_seeking_exit_gap_threshold_eV": gap_seeking_settings["exit_gap_threshold_eV"],
+            "gap_seeking_min_lcm_steps": int(gap_seeking_settings["min_lcm_steps"]),
             "gap_seeking_sigma": float(gap_seeking_settings["sigma"]),
             "gap_seeking_alpha_eV": float(gap_seeking_settings["alpha_eV"]),
             "gap_seeking_switch_check_interval": int(gap_seeking_settings["switch_check_interval"]),
             "gap_seeking_switched": bool(gap_seeking_switched),
+            "gap_seeking_current_mode": "lcm_gap" if gap_seeking_lcm_active else "direct",
             "gap_seeking_switch_step": gap_seeking_switch_step,
             "gap_seeking_switch_time_ps": gap_seeking_switch_time_ps,
             "gap_seeking_pair": gap_seeking_pair,
@@ -1149,6 +1268,7 @@ def run_excited_state_sampling_batch(
             "gap_seeking_trigger_gap_eV": gap_seeking_trigger_gap_eV,
             "gap_seeking_trigger_molecule_id": gap_seeking_trigger_molecule_id,
             "gap_seeking_trigger_batch_index": gap_seeking_trigger_batch_index,
+            "gap_seeking_switch_events": gap_seeking_switch_events,
             "gap_seeking_min_gap_trace": [],
             "gap_seeking_active_pair_gap_trace": [],
             "udd_enabled": False,
@@ -1299,6 +1419,7 @@ def run_excited_state_sampling(
     gap_seeking_settings = _gap_seeking_settings(_gap_seeking_config(sampler_config), state_ids, int(selected_state))
     gap_seeking_enabled = bool(gap_seeking_settings["enabled"])
     gap_seeking_switched = False
+    gap_seeking_lcm_active = False
     gap_seeking_switch_step = None
     gap_seeking_switch_time_ps = None
     gap_seeking_pair = None
@@ -1477,6 +1598,7 @@ def run_excited_state_sampling(
     geometry_metrics_trace: list[dict[str, Any]] = []
     gap_seeking_min_gap_trace: list[dict[str, Any]] = []
     gap_seeking_active_pair_gap_trace: list[dict[str, Any]] = []
+    gap_seeking_switch_events: list[dict[str, Any]] = []
 
     def _run_md_steps(steps: int) -> None:
         with timing.scope("md_run", cuda=use_alchemi):
@@ -1513,7 +1635,7 @@ def run_excited_state_sampling(
         nonlocal calculator, energy_for_md, last_tau_update_step, udd_tau
         if not (udd_enabled and udd_tau_mode == "force_relative"):
             return
-        if gap_seeking_switched:
+        if gap_seeking_lcm_active:
             return
         if use_alchemi:
             if alchemi_model_force_model is None or alchemi_sigma_force_model is None:
@@ -1596,9 +1718,9 @@ def run_excited_state_sampling(
 
     def _update_gap_seeking_switch() -> None:
         nonlocal calculator, energy_for_md
-        nonlocal gap_seeking_switched, gap_seeking_switch_step, gap_seeking_switch_time_ps
+        nonlocal gap_seeking_switched, gap_seeking_lcm_active, gap_seeking_switch_step, gap_seeking_switch_time_ps
         nonlocal gap_seeking_pair, gap_seeking_gap_key, gap_seeking_gap_source, gap_seeking_trigger_gap_eV
-        if not gap_seeking_enabled or gap_seeking_switched:
+        if not gap_seeking_enabled:
             return
 
         current_step = int(dyn.nsteps)
@@ -1612,17 +1734,82 @@ def run_excited_state_sampling(
         gap_infos = _gap_infos_from_results(current_results, list(gap_seeking_settings["pairs"]))
         if not gap_infos:
             raise RuntimeError("Gap-seeking switch found no valid state-energy gaps to monitor.")
+        if gap_seeking_lcm_active:
+            if str(gap_seeking_settings["switch_policy"]) != "hysteresis":
+                return
+            if gap_seeking_switch_step is not None and (
+                current_step - int(gap_seeking_switch_step)
+            ) < int(gap_seeking_settings["min_lcm_steps"]):
+                return
+            active_gap = None
+            if gap_seeking_pair is not None:
+                active_pair = [int(gap_seeking_pair[0]), int(gap_seeking_pair[1])]
+                for gap_info in gap_infos:
+                    if [int(value) for value in gap_info["pair"]] == active_pair:
+                        active_gap = gap_info
+                        break
+            if active_gap is None or float(active_gap["abs_gap_eV"]) < float(gap_seeking_settings["exit_gap_threshold_eV"]):
+                return
+
+            gap_seeking_lcm_active = False
+            energy_for_md = energy_node.mean
+            gap_seeking_switch_events.append(
+                {
+                    "event": "exit_lcm",
+                    "step": int(current_step),
+                    "time_ps": float(current_step * dt) / 1000.0,
+                    "reason": "exit_gap_threshold",
+                    **{key: active_gap[key] for key in ["pair", "gap_key", "gap_source", "gap_eV", "abs_gap_eV"]},
+                }
+            )
+            if use_alchemi:
+                alchemi_model.set_energy_node(
+                    energy_for_md,
+                    force_node=force_node_by_state[int(selected_state)].mean,
+                )
+                results = _evaluate_alchemi_results()
+                _validate_sampler_results(
+                    results,
+                    state_table,
+                    selected_state=selected_state,
+                    step=current_step,
+                    context="gap_seeking_exit",
+                    gap_seeking_switched=gap_seeking_switched,
+                    gap_seeking_pair=gap_seeking_pair,
+                )
+            else:
+                calculator = _make_hippynn_calculator(
+                    HippynnCalculator,
+                    torch,
+                    energy=energy_for_md,
+                    extra_properties=extra_properties,
+                    sampler_config=sampler_config,
+                    device=device,
+                )
+                ase_atoms.calc = calculator
+                _fresh_ase_results(step=current_step, context="gap_seeking_exit")
+            return
+
         trigger = min(gap_infos, key=lambda item: float(item["abs_gap_eV"]))
         if float(trigger["abs_gap_eV"]) > float(gap_seeking_settings["trigger_gap_threshold_eV"]):
             return
 
         gap_seeking_switched = True
+        gap_seeking_lcm_active = True
         gap_seeking_switch_step = int(current_step)
         gap_seeking_switch_time_ps = float(current_step * dt) / 1000.0
         gap_seeking_pair = [int(value) for value in trigger["pair"]]
         gap_seeking_gap_key = str(trigger["gap_key"])
         gap_seeking_gap_source = str(trigger["gap_source"])
         gap_seeking_trigger_gap_eV = float(trigger["gap_eV"])
+        gap_seeking_switch_events.append(
+            {
+                "event": "enter_lcm",
+                "step": int(current_step),
+                "time_ps": float(current_step * dt) / 1000.0,
+                **{key: trigger[key] for key in ["pair", "gap_key", "gap_source", "gap_eV", "abs_gap_eV"]},
+            }
+        )
         energy_for_md = _make_lcm_energy_node(
             energy_node_by_state,
             gap_node_by_pair,
@@ -1822,12 +2009,14 @@ def run_excited_state_sampling(
             candidate_record = {
                     "score": float(score),
                     "score_components": score_components,
+                    **_score_uncertainty_metadata(sampler_config),
                     "score_gap_uncertainty_key": score_gap_uncertainty_key,
                     "score_gap_uncertainty_std": score_gap_uncertainty_std,
                     "step": int((step_index + 1) * ncheck),
                     "time_ps": float(current_time_ps),
                     "selected_state": int(selected_state),
                     "gap_seeking_switched": bool(gap_seeking_switched),
+                    "gap_seeking_current_mode": "lcm_gap" if gap_seeking_lcm_active else "direct",
                     "gap_seeking_pair": gap_seeking_pair,
                     "gap_seeking_gap_key": gap_seeking_gap_key,
                     "gap_seeking_gap_source": gap_seeking_gap_source,
@@ -1876,6 +2065,7 @@ def run_excited_state_sampling(
         "energy_drift_eV_per_ps": drift_eV_per_ps,
         "dynamics_backend": dynamics_backend,
         "alchemi_baoab_options": dict(vars(alchemi_options)) if use_alchemi and alchemi_options is not None else None,
+        **_score_uncertainty_metadata(sampler_config),
         "chemical_symbols": ase_atoms.get_chemical_symbols(),
         "positions": ase_atoms.get_positions(wrap=True),
         "cell": ase_atoms.get_cell(),
@@ -1884,16 +2074,20 @@ def run_excited_state_sampling(
         "gap_seeking_candidate_pairs": str(gap_seeking_settings["candidate_pairs"]),
         "gap_seeking_switch_policy": str(gap_seeking_settings["switch_policy"]),
         "gap_seeking_trigger_gap_threshold_eV": float(gap_seeking_settings["trigger_gap_threshold_eV"]),
+        "gap_seeking_exit_gap_threshold_eV": gap_seeking_settings["exit_gap_threshold_eV"],
+        "gap_seeking_min_lcm_steps": int(gap_seeking_settings["min_lcm_steps"]),
         "gap_seeking_sigma": float(gap_seeking_settings["sigma"]),
         "gap_seeking_alpha_eV": float(gap_seeking_settings["alpha_eV"]),
         "gap_seeking_switch_check_interval": int(gap_seeking_settings["switch_check_interval"]),
         "gap_seeking_switched": bool(gap_seeking_switched),
+        "gap_seeking_current_mode": "lcm_gap" if gap_seeking_lcm_active else "direct",
         "gap_seeking_switch_step": gap_seeking_switch_step,
         "gap_seeking_switch_time_ps": gap_seeking_switch_time_ps,
         "gap_seeking_pair": gap_seeking_pair,
         "gap_seeking_gap_key": gap_seeking_gap_key,
         "gap_seeking_gap_source": gap_seeking_gap_source,
         "gap_seeking_trigger_gap_eV": gap_seeking_trigger_gap_eV,
+        "gap_seeking_switch_events": gap_seeking_switch_events,
         "gap_seeking_min_gap_trace": gap_seeking_min_gap_trace,
         "gap_seeking_active_pair_gap_trace": gap_seeking_active_pair_gap_trace,
         "udd_gap_mean_trace": udd_gap_mean_trace,
