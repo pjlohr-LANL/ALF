@@ -32,10 +32,15 @@ def test_label_excited_state_molecule_flattens_outputs_and_applies_offset(monkey
         return energies.copy(), forces.copy()
 
     monkeypatch.setattr(pyseqm_interface, "run_pyseqm_batch", fake_run_pyseqm_batch)
+    monkeypatch.setattr(
+        pyseqm_interface.multiprocessing,
+        "get_context",
+        lambda method: (_ for _ in ()).throw(AssertionError(f"timeout context should not be used: {method}")),
+    )
 
     labeled = pyseqm_interface.label_excited_state_molecule(
         molecule,
-        QM_config={"method": "AM1"},
+        QM_config={"method": "AM1", "max_solve_time_seconds": 0},
         properties_list=_properties_list(),
         sampler_config={"energy_offset_eV": -100.0},
         gpus_per_node=0,
@@ -222,6 +227,146 @@ def test_label_excited_state_molecule_handles_backend_failure(monkeypatch):
     assert labeled.check_convergence() is False
     assert "qm_error" in labeled.get_metadata()
     assert labeled.get_results() == {}
+
+
+def test_label_excited_state_molecule_uses_timeout_child_and_succeeds(monkeypatch, tmp_path: Path):
+    atoms = Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+    molecule = MoleculesObject(atoms, "traj_timeout_success")
+    energies = np.array([[-90.0, -89.5]], dtype=np.float64)
+    forces = np.zeros((1, 2, 3, 3), dtype=np.float64)
+
+    class FakeQueue:
+        def __init__(self, maxsize=0):
+            del maxsize
+            self.payload = None
+
+        def put(self, payload):
+            self.payload = payload
+
+        def get_nowait(self):
+            if self.payload is None:
+                raise pyseqm_interface.queue.Empty
+            return self.payload
+
+    class InlineProcess:
+        def __init__(self, *, target, args):
+            self.target = target
+            self.args = args
+            self.exitcode = None
+
+        def start(self):
+            self.target(*self.args)
+            self.exitcode = 0
+
+        def join(self, timeout=None):
+            self.join_timeout = timeout
+
+        def is_alive(self):
+            return False
+
+        def terminate(self):
+            raise AssertionError("successful child should not be terminated")
+
+        def kill(self):
+            raise AssertionError("successful child should not be killed")
+
+    class InlineContext:
+        Queue = FakeQueue
+        Process = InlineProcess
+
+    def fake_run_pyseqm_batch(**kwargs):
+        assert kwargs["log_handle"] is not None
+        assert kwargs["n_states"] == 2
+        return energies.copy(), forces.copy()
+
+    monkeypatch.setattr(pyseqm_interface, "run_pyseqm_batch", fake_run_pyseqm_batch)
+    monkeypatch.setattr(pyseqm_interface, "_pyseqm_device", lambda gpus_per_node: None)
+    monkeypatch.setattr(pyseqm_interface.multiprocessing, "get_context", lambda method: InlineContext())
+
+    labeled = pyseqm_interface.label_excited_state_molecule(
+        molecule,
+        QM_config={
+            "method": "AM1",
+            "max_solve_time_seconds": 60,
+            "capture_pyseqm_logs": True,
+            "pyseqm_log_dir": str(tmp_path),
+        },
+        properties_list=_properties_list(),
+        sampler_config={"energy_offset_eV": -100.0},
+        gpus_per_node=0,
+    )
+
+    assert labeled.check_convergence() is True
+    assert labeled.get_metadata()["qm_backend"] == "pyseqm"
+    assert "qm_timeout" not in labeled.get_metadata()
+    log_text = next(tmp_path.glob("traj_timeout_success*.log")).read_text(encoding="utf-8")
+    assert "status: success" in log_text
+
+
+def test_label_excited_state_molecule_times_out_child(monkeypatch, tmp_path: Path):
+    atoms = Atoms(symbols=["H", "H"], positions=[[0, 0, 0], [0, 0, 0.75]])
+    molecule = MoleculesObject(atoms, "traj_timeout_failure")
+
+    class EmptyQueue:
+        def __init__(self, maxsize=0):
+            del maxsize
+
+        def get_nowait(self):
+            raise pyseqm_interface.queue.Empty
+
+    class HangingProcess:
+        terminated = False
+
+        def __init__(self, *, target, args):
+            del target, args
+            self.exitcode = None
+            self._alive = True
+
+        def start(self):
+            self._alive = True
+
+        def join(self, timeout=None):
+            self.join_timeout = timeout
+
+        def is_alive(self):
+            return self._alive
+
+        def terminate(self):
+            self.__class__.terminated = True
+            self._alive = False
+            self.exitcode = -15
+
+        def kill(self):
+            self._alive = False
+            self.exitcode = -9
+
+    class HangingContext:
+        Queue = EmptyQueue
+        Process = HangingProcess
+
+    monkeypatch.setattr(pyseqm_interface, "_pyseqm_device", lambda gpus_per_node: None)
+    monkeypatch.setattr(pyseqm_interface.multiprocessing, "get_context", lambda method: HangingContext())
+
+    labeled = pyseqm_interface.label_excited_state_molecule(
+        molecule,
+        QM_config={
+            "method": "AM1",
+            "max_solve_time_seconds": 0.01,
+            "capture_pyseqm_logs": True,
+            "pyseqm_log_dir": str(tmp_path),
+        },
+        properties_list=_properties_list(),
+        sampler_config={"energy_offset_eV": 0.0},
+        gpus_per_node=0,
+    )
+
+    assert HangingProcess.terminated is True
+    assert labeled.check_convergence() is False
+    assert labeled.get_metadata()["qm_timeout"] is True
+    assert "exceeded" in labeled.get_metadata()["qm_error"]
+    assert labeled.get_metadata()["max_solve_time_seconds"] == pytest.approx(0.01)
+    log_text = next(tmp_path.glob("traj_timeout_failure*.log")).read_text(encoding="utf-8")
+    assert "status: timeout" in log_text
 
 
 def test_train_excited_state_ensemble_returns_contract_and_writes_errors(monkeypatch, tmp_path: Path):

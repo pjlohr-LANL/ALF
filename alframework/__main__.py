@@ -74,6 +74,7 @@ ML_task_queue = parsl_task_queue()
 builder_task_queue = parsl_task_queue()
 sampler_task_queue = parsl_task_queue()
 sampler_same_state_buffers = {}
+pending_QM_structures = []
 
 
 def _flatten_molecule_output(output):
@@ -427,9 +428,23 @@ while True:
         QM_config = QM_config_new
         ML_config = ML_config_new
         all_configs = [master_config, builder_config, sampler_config, QM_config, ML_config]
+
+    drain_gpu_tasks_before_ml = bool(master_config.get('drain_gpu_tasks_before_ml', False))
+    qm_submit_batch_size = int(master_config.get('qm_submit_batch_size', master_config['target_queued_QM']))
+    qm_submit_batch_size = max(qm_submit_batch_size, 1)
+    successful_qm_tasks = QM_task_queue.get_exec_done_number()
+    ml_task_ready = (
+        successful_qm_tasks >= master_config['save_h5_threshold']
+        and ML_task_queue.get_number() < 1
+    )
+    gpu_work_blocked_for_ml = drain_gpu_tasks_before_ml and (
+        ml_task_ready or ML_task_queue.get_number() > 0
+    )
 	
     # Run more builders
-    if (QM_task_queue.get_queued_number() < master_config['target_queued_QM']) and \
+    if (not gpu_work_blocked_for_ml) and \
+            ((not drain_gpu_tasks_before_ml) or len(pending_QM_structures) == 0) and \
+            (QM_task_queue.get_queued_number() < master_config['target_queued_QM']) and \
             (QM_task_queue.get_number() < master_config.get('maximum_completed_QM', 1e12)):
         while sampler_task_queue.get_number() + builder_task_queue.get_number() * master_config.get('maximum_builder_structures', 1) \
                 < master_config['parallel_samplers']:
@@ -454,7 +469,7 @@ while True:
             if isinstance(structure, MoleculesObject):
                 if sampler_batch_size > 1:
                     add_molecule_to_same_state_buffer(sampler_same_state_buffers, structure)
-                else:
+                elif not gpu_work_blocked_for_ml:
                     task_input = build_input_dict(sampler_task.func,
                                                   [{"molecule_object": structure, "sampler_config": sampler_config},
                                                    *all_configs, status],
@@ -466,19 +481,20 @@ while True:
                     assert isinstance(substructure, MoleculesObject), 'substructure must be a MoleculesObject instance'
                     if sampler_batch_size > 1:
                         add_molecule_to_same_state_buffer(sampler_same_state_buffers, substructure)
-                    else:
+                    elif not gpu_work_blocked_for_ml:
                         task_input = build_input_dict(sampler_task.func,
                                                       [{"molecule_object": substructure, "sampler_config": sampler_config},
                                                        *all_configs, status],
                                                       raise_on_fail=True)
                         sampler_task_queue.add_task(sampler_task(**task_input))
-        _flush_sampler_batches(
-            force_partial=(
-                sampler_task_queue.get_number() == 0
-                and builder_task_queue.get_number() == 0
-                and alchemi_allow_partial_batches(sampler_config)
+        if not gpu_work_blocked_for_ml:
+            _flush_sampler_batches(
+                force_partial=(
+                    sampler_task_queue.get_number() == 0
+                    and builder_task_queue.get_number() == 0
+                    and alchemi_allow_partial_batches(sampler_config)
+                )
             )
-        )
 
     # Run more QM
     if sampler_task_queue.get_completed_number() > master_config['minimum_QM']:
@@ -494,14 +510,43 @@ while True:
             for structure in sampler_structures:
                 if structure.get_atoms() is None:
                     continue
-                task_input = build_input_dict(qm_task.func,
-                                              [{"molecule_object": structure, "QM_config": QM_config}, master_config,
-                                               *all_configs, status],
-                                              raise_on_fail=True)
-                QM_task_queue.add_task(qm_task(**task_input))
+                if drain_gpu_tasks_before_ml:
+                    pending_QM_structures.append(structure)
+                else:
+                    task_input = build_input_dict(qm_task.func,
+                                                  [{"molecule_object": structure, "QM_config": QM_config}, master_config,
+                                                   *all_configs, status],
+                                                  raise_on_fail=True)
+                    QM_task_queue.add_task(qm_task(**task_input))
+
+    if drain_gpu_tasks_before_ml and not gpu_work_blocked_for_ml:
+        qm_outstanding_tasks = QM_task_queue.get_running_number() + QM_task_queue.get_queued_number()
+        while (
+            pending_QM_structures
+            and qm_outstanding_tasks < qm_submit_batch_size
+            and QM_task_queue.get_number() < master_config.get('maximum_completed_QM', 1e12)
+        ):
+            structure = pending_QM_structures.pop(0)
+            task_input = build_input_dict(qm_task.func,
+                                          [{"molecule_object": structure, "QM_config": QM_config}, master_config,
+                                           *all_configs, status],
+                                          raise_on_fail=True)
+            QM_task_queue.add_task(qm_task(**task_input))
+            qm_outstanding_tasks += 1
 
     # Train more models
-    if (QM_task_queue.get_completed_number() > master_config['save_h5_threshold']) and (ML_task_queue.get_number() < 1):
+    gpu_queues_drained_for_ml = (
+        builder_task_queue.get_number() == 0
+        and sampler_task_queue.get_number() == 0
+        and QM_task_queue.get_running_number() == 0
+        and QM_task_queue.get_queued_number() == 0
+    )
+    can_submit_ml = (
+        QM_task_queue.get_exec_done_number() >= master_config['save_h5_threshold']
+        and ML_task_queue.get_number() < 1
+        and ((not drain_gpu_tasks_before_ml) or gpu_queues_drained_for_ml)
+    )
+    if can_submit_ml:
         #print(QM_task_queue.task_list[0].result())
     	  #store_current_data(h5path, system_data, properties):
         results_list, failed = QM_task_queue.get_task_results()
@@ -528,6 +573,8 @@ while True:
                                       raise_on_fail=True)
         ML_task_queue.add_task(ml_task(**task_input))
         status['current_training_id'] = status['current_training_id'] + 1
+        pending_QM_structures.clear()
+        sampler_same_state_buffers.clear()
         
     # Update Model
     if ML_task_queue.get_completed_number() > 0:

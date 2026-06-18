@@ -21,6 +21,7 @@ from alframework.qm_interfaces import pyseqm_interface
 from alframework.qm_interfaces.pyseqm_interface import pyseqm_excited_state_task
 from alframework.samplers import excited_state_sampling as sampler_mod
 from alframework.samplers.excited_state_sampling import excited_state_sampling_task
+from alframework.tools.molecule_payloads import flatten_molecule_output
 from alframework.tools.tools import parsl_task_queue, store_current_data
 from tests.test_excited_state_builder import _write_seed_dataset
 
@@ -240,7 +241,7 @@ def test_async_queue_handoff_builder_sampler_qm_h5_ml(monkeypatch, tmp_path: Pat
     )
     sampler_queue.task_list[0].result()
     sampler_results, _ = sampler_queue.get_task_results()
-    sampled = sampler_results[0]
+    sampled = flatten_molecule_output(sampler_results[0])[0]
     assert sampled.get_atoms() is not None
 
     qm_queue.add_task(

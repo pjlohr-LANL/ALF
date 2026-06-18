@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import multiprocessing
 import os
+import queue
 import socket
 import time
+import traceback
 from typing import Any
 import warnings
 from pathlib import Path
@@ -13,6 +16,10 @@ from parsl import python_app
 
 from alframework.tools.excited_state_tools import derive_gap_property_table, derive_state_property_table
 from alframework.tools.molecules_class import MoleculesObject
+
+
+class PySEQMTimeoutError(TimeoutError):
+    """Raised when a PySEQM solve exceeds the configured wall-time limit."""
 
 
 def _prepare_pyseqm_inputs(
@@ -210,6 +217,131 @@ def run_pyseqm_batch(
     return energies, forces
 
 
+def _pyseqm_timeout_seconds(QM_config: dict[str, Any]) -> float | None:
+    raw_timeout = QM_config.get("max_solve_time_seconds", None)
+    if raw_timeout is None:
+        return None
+    timeout = float(raw_timeout)
+    if timeout <= 0.0:
+        return None
+    return timeout
+
+
+def _append_pyseqm_log_footer(
+    log_path: Path | None,
+    status: str,
+    elapsed_seconds: float,
+    error: Exception | None = None,
+) -> None:
+    if log_path is None:
+        return
+    with open(log_path, "a", encoding="utf-8", buffering=1) as handle:
+        _write_pyseqm_log_footer(handle, status, elapsed_seconds, error=error)
+
+
+def _pyseqm_batch_child(
+    result_queue,
+    coords_np: np.ndarray,
+    species_np: np.ndarray,
+    n_states: int,
+    method: str,
+    scf_eps: float,
+    cis_tol: float,
+    device_name: str | None,
+    log_path: str | None,
+) -> None:
+    log_handle = None
+    try:
+        device = None
+        if device_name is not None:
+            import torch
+
+            device = torch.device(device_name)
+        with contextlib.ExitStack() as stack:
+            if log_path is not None:
+                log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
+                stack.callback(log_handle.close)
+                stack.enter_context(contextlib.redirect_stdout(log_handle))
+                stack.enter_context(contextlib.redirect_stderr(log_handle))
+                stack.enter_context(warnings.catch_warnings())
+                warnings.simplefilter("always")
+            energies, forces = run_pyseqm_batch(
+                coords_np=coords_np,
+                species_np=species_np,
+                n_states=int(n_states),
+                method=str(method),
+                scf_eps=float(scf_eps),
+                cis_tol=float(cis_tol),
+                device=device,
+                log_handle=log_handle,
+            )
+        result_queue.put({"ok": True, "energies": energies, "forces": forces})
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+
+
+def _run_pyseqm_batch_with_timeout(
+    *,
+    coords_np: np.ndarray,
+    species_np: np.ndarray,
+    n_states: int,
+    method: str,
+    scf_eps: float,
+    cis_tol: float,
+    device,
+    log_path: Path | None,
+    max_solve_time_seconds: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=_pyseqm_batch_child,
+        args=(
+            result_queue,
+            np.ascontiguousarray(coords_np).copy(),
+            np.ascontiguousarray(species_np).copy(),
+            int(n_states),
+            str(method),
+            float(scf_eps),
+            float(cis_tol),
+            None if device is None else str(device),
+            None if log_path is None else str(log_path),
+        ),
+    )
+    process.start()
+    process.join(float(max_solve_time_seconds))
+    if process.is_alive():
+        process.terminate()
+        process.join(5.0)
+        if process.is_alive():
+            process.kill()
+            process.join(5.0)
+        raise PySEQMTimeoutError(f"PySEQM solve exceeded {float(max_solve_time_seconds):.6g} seconds")
+
+    try:
+        if hasattr(result_queue, "get"):
+            payload = result_queue.get(timeout=1.0)
+        else:
+            payload = result_queue.get_nowait()
+    except queue.Empty as exc:
+        raise RuntimeError(f"PySEQM child process exited without returning a result; exitcode={process.exitcode}") from exc
+
+    if not bool(payload.get("ok", False)):
+        error_text = str(payload.get("error", "unknown PySEQM child error"))
+        traceback_text = str(payload.get("traceback", "")).strip()
+        if traceback_text:
+            error_text = f"{error_text}\n{traceback_text}"
+        raise RuntimeError(error_text)
+
+    return np.asarray(payload["energies"], dtype=np.float64), np.asarray(payload["forces"], dtype=np.float64)
+
+
 def _pyseqm_device(gpus_per_node: int | None = None):
     import torch
 
@@ -353,19 +485,18 @@ def label_excited_state_molecule(
     cis_tol = float(QM_config.get("cis_tol", 1e-8))
     device = _pyseqm_device(gpus_per_node)
     log_path = _pyseqm_log_path(QM_config, molecule_object)
+    max_solve_time_seconds = _pyseqm_timeout_seconds(QM_config)
     log_handle = None
     start_time = time.time()
     try:
         if log_path is not None:
             log_handle = open(log_path, "w", encoding="utf-8", buffering=1)
             _write_pyseqm_log_header(log_handle, molecule_object, atoms, device, method, scf_eps, cis_tol, len(state_table))
-        with contextlib.ExitStack() as stack:
+        if max_solve_time_seconds is not None:
             if log_handle is not None:
-                stack.enter_context(contextlib.redirect_stdout(log_handle))
-                stack.enter_context(contextlib.redirect_stderr(log_handle))
-                stack.enter_context(warnings.catch_warnings())
-                warnings.simplefilter("always")
-            energies, forces = run_pyseqm_batch(
+                log_handle.close()
+                log_handle = None
+            energies, forces = _run_pyseqm_batch_with_timeout(
                 coords_np=coords,
                 species_np=species,
                 n_states=len(state_table),
@@ -373,22 +504,61 @@ def label_excited_state_molecule(
                 scf_eps=scf_eps,
                 cis_tol=cis_tol,
                 device=device,
-                log_handle=log_handle,
+                log_path=log_path,
+                max_solve_time_seconds=max_solve_time_seconds,
             )
+        else:
+            with contextlib.ExitStack() as stack:
+                if log_handle is not None:
+                    stack.enter_context(contextlib.redirect_stdout(log_handle))
+                    stack.enter_context(contextlib.redirect_stderr(log_handle))
+                    stack.enter_context(warnings.catch_warnings())
+                    warnings.simplefilter("always")
+                energies, forces = run_pyseqm_batch(
+                    coords_np=coords,
+                    species_np=species,
+                    n_states=len(state_table),
+                    method=method,
+                    scf_eps=scf_eps,
+                    cis_tol=cis_tol,
+                    device=device,
+                    log_handle=log_handle,
+                )
+    except PySEQMTimeoutError as exc:
+        if log_handle is not None:
+            _write_pyseqm_log_footer(log_handle, "timeout", time.time() - start_time, error=exc)
+            log_handle.close()
+        else:
+            _append_pyseqm_log_footer(log_path, "timeout", time.time() - start_time, error=exc)
+        error_metadata = {
+            "qm_backend": "pyseqm",
+            "qm_timeout": True,
+            "qm_error": str(exc),
+            "max_solve_time_seconds": float(max_solve_time_seconds),
+        }
+        if log_path is not None:
+            error_metadata["pyseqm_log_path"] = str(log_path)
+        molecule_object.update_metadata(error_metadata)
+        molecule_object.set_converged_flag(False)
+        return molecule_object
     except Exception as exc:
         if log_handle is not None:
             _write_pyseqm_log_footer(log_handle, "error", time.time() - start_time, error=exc)
             log_handle.close()
+        else:
+            _append_pyseqm_log_footer(log_path, "error", time.time() - start_time, error=exc)
         error_metadata = {"qm_backend": "pyseqm", "qm_error": repr(exc)}
         if log_path is not None:
             error_metadata["pyseqm_log_path"] = str(log_path)
         molecule_object.update_metadata(error_metadata)
         molecule_object.set_converged_flag(False)
         return molecule_object
-    finally:
-        if log_handle is not None and not log_handle.closed:
-            _write_pyseqm_log_footer(log_handle, "success", time.time() - start_time)
-            log_handle.close()
+
+    if log_handle is not None and not log_handle.closed:
+        _write_pyseqm_log_footer(log_handle, "success", time.time() - start_time)
+        log_handle.close()
+    elif max_solve_time_seconds is not None:
+        _append_pyseqm_log_footer(log_path, "success", time.time() - start_time)
 
     results: dict[str, Any] = {}
     for row in state_table:

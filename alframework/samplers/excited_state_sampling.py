@@ -562,6 +562,24 @@ def _results_to_metrics(
     }
 
 
+def _candidate_min_distance(atoms) -> float | None:
+    if atoms is None or len(atoms) < 2:
+        return None
+    distances = np.asarray(atoms.get_all_distances(mic=True), dtype=np.float64)
+    np.fill_diagonal(distances, np.inf)
+    min_distance = float(np.min(distances))
+    if not np.isfinite(min_distance):
+        return None
+    return min_distance
+
+
+def _qm_candidate_reject_reason(atoms, sampler_config: dict[str, Any]) -> str | None:
+    min_distance = _candidate_min_distance(atoms)
+    if min_distance is not None and min_distance < float(sampler_config.get("min_distance_cutoff", 0.3)):
+        return "min_distance"
+    return None
+
+
 def _temperature_feed_parameters(sampler_config: dict[str, Any], rng: np.random.Generator) -> dict[str, float | None]:
     feed = {
         "Tamp": float(rng.uniform(*sampler_config["amp_temp"])),
@@ -932,6 +950,7 @@ def run_excited_state_sampling_batch(
     replica_stop_reasons: list[str | None] = [None for _ in molecule_objects]
     top_candidates: list[dict[str, Any]] = []
     per_molecule_records: list[list[dict[str, Any]]] = [[] for _ in molecule_objects]
+    rejected_qm_candidates_min_distance: list[int] = [0 for _ in molecule_objects]
     per_molecule_geometry_trace: list[list[dict[str, Any]]] = [[] for _ in molecule_objects]
     start_time = time.time()
 
@@ -1174,7 +1193,11 @@ def run_excited_state_sampling_batch(
                 "total_energy_eV": current_total_energy,
                 **metrics,
             }
-            item = {"record": record, "atoms": atoms_list[graph_index].copy(), "parent_index": graph_index}
+            candidate_atoms = atoms_list[graph_index].copy()
+            if _qm_candidate_reject_reason(candidate_atoms, sampler_config) == "min_distance":
+                rejected_qm_candidates_min_distance[graph_index] += 1
+                continue
+            item = {"record": record, "atoms": candidate_atoms, "parent_index": graph_index}
             top_candidates.append(item)
             per_molecule_records[graph_index].append(dict(record))
             top_candidates.sort(key=lambda candidate: float(candidate["record"]["score"]), reverse=True)
@@ -1228,6 +1251,7 @@ def run_excited_state_sampling_batch(
             "return_top_n": int(return_top_n),
             "hard_close_contact": replica_stop_reasons[graph_index] == "min_distance",
             "geometry_reject_reason": replica_stop_reasons[graph_index],
+            "rejected_qm_candidates_min_distance": int(rejected_qm_candidates_min_distance[graph_index]),
             "geometry_metrics_trace": per_molecule_geometry_trace[graph_index],
             "max_nearest_neighbor_distance": last_geometry_metrics.get("max_nearest_neighbor_distance"),
             "nearest_neighbor_distances": last_geometry_metrics.get("nearest_neighbor_distances"),
@@ -1581,6 +1605,7 @@ def run_excited_state_sampling(
     top_candidates: list[dict[str, Any]] = []
     hard_close_contact = False
     geometry_reject_reason = None
+    rejected_qm_candidates_min_distance = 0
     start_time = time.time()
     temperatures: list[float] = []
     total_energies: list[float] = []
@@ -2024,7 +2049,11 @@ def run_excited_state_sampling(
                     "temperature_target_K": float(target_temperature),
                     **metrics,
                 }
-            top_candidates.append({"record": candidate_record, "atoms": ase_atoms.copy()})
+            candidate_atoms = ase_atoms.copy()
+            if _qm_candidate_reject_reason(candidate_atoms, sampler_config) == "min_distance":
+                rejected_qm_candidates_min_distance += 1
+                continue
+            top_candidates.append({"record": candidate_record, "atoms": candidate_atoms})
             top_candidates.sort(key=lambda item: float(item["record"]["score"]), reverse=True)
             del top_candidates[return_top_n:]
     finally:
@@ -2055,6 +2084,7 @@ def run_excited_state_sampling(
         "return_top_n": int(return_top_n),
         "hard_close_contact": bool(hard_close_contact),
         "geometry_reject_reason": geometry_reject_reason,
+        "rejected_qm_candidates_min_distance": int(rejected_qm_candidates_min_distance),
         "geometry_metrics_trace": geometry_metrics_trace,
         "max_nearest_neighbor_distance": last_geometry_metrics.get("max_nearest_neighbor_distance"),
         "nearest_neighbor_distances": last_geometry_metrics.get("nearest_neighbor_distances"),

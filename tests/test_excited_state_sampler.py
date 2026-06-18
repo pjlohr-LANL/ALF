@@ -37,6 +37,33 @@ def _snapshot(*, energy, forces, e0, e1, u0, u1, f0, f1):
     }
 
 
+def _safe_candidate_metrics(atoms, selected_state=0):
+    del atoms
+    return {
+        "selected_state": int(selected_state),
+        "energies": {0: 0.0, 1: 0.03},
+        "energy_stds": {0: 0.2, 1: 0.1},
+        "gap_means": {},
+        "gap_stds": {},
+        "gap_pairs": {},
+        "force_stds": {0: 0.2, 1: 0.1},
+        "uncertainty_state": int(selected_state),
+        "uE_selected": 0.2,
+        "uF_selected": 0.2,
+        "uE_max": 0.2,
+        "uE_rms": 0.158113883008419,
+        "uF_max": 0.2,
+        "uF_rms": 0.158113883008419,
+        "min_gap": 0.03,
+        "min_gap_pair": [0, 1],
+        "selected_energy_eV": 0.0,
+        "fmax": 0.0,
+        "min_dist": 0.96,
+        "nearest_neighbor_distances": np.asarray([0.96, 0.96, 0.96], dtype=float),
+        "max_nearest_neighbor_distance": 0.96,
+    }
+
+
 def test_selected_state_uncertainty_is_default_for_gate_and_score():
     atoms = Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
     metrics = sampler_mod._results_to_metrics(
@@ -406,6 +433,75 @@ def test_run_excited_state_sampling_selects_highest_scoring_valid_frame(monkeypa
     payload = json.loads(meta_path.read_text(encoding="utf-8"))
     assert payload["best_candidate"]["score"] > 0.0
     assert "timing" not in payload
+
+
+def test_run_excited_state_sampling_rejects_close_contact_qm_candidate(monkeypatch, tmp_path: Path):
+    snapshots = [
+        _snapshot(
+            energy=0.0,
+            forces=np.zeros((3, 3)),
+            e0=0.00,
+            e1=0.03,
+            u0=0.20,
+            u1=0.10,
+            f0=np.full((3, 3), 0.20),
+            f1=np.full((3, 3), 0.10),
+        )
+    ]
+    _install_fake_sampling_runtime(monkeypatch, snapshots)
+    monkeypatch.setattr(sampler_mod, "annealing_schedule", lambda *args: 100.0)
+    monkeypatch.setattr(
+        sampler_mod,
+        "_results_to_metrics",
+        lambda atoms, results, state_table, gap_table, selected_state, **kwargs: _safe_candidate_metrics(
+            atoms,
+            selected_state=selected_state,
+        ),
+    )
+
+    molecule = MoleculesObject(
+        Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [0.2, 0, 0], [-0.24, 0.93, 0]]),
+        "traj_close_contact",
+    )
+    result = sampler_mod.run_excited_state_sampling(
+        molecule,
+        sampler_config={
+            "dt": 1.0,
+            "maxt": 0.001,
+            "Ncheck": 1,
+            "min_time": 0.0,
+            "friction": 0.02,
+            "srt_temp": [100.0, 100.0],
+            "end_temp": [100.0, 100.0],
+            "amp_temp": [0.0, 0.0],
+            "per_temp": [5.0, 5.0],
+            "amp_dens": None,
+            "per_dens": None,
+            "end_dens": None,
+            "meta_dir": str(tmp_path / "meta"),
+            "metadata_format": "json",
+            "write_traj_binary": False,
+            "write_traj_xyz": False,
+            "trajectory_frequency": 0.0,
+            "trajectory_interval": 1,
+            "min_distance_cutoff": 0.7,
+            "max_force_cutoff": 10.0,
+            "state_selection": {"mode": "fixed", "fixed_state": 0},
+            "uncertainty": {"enabled": True, "min_uE": 0.05, "min_uF": 0.05, "logic": "either"},
+            "score": {"w_energy": 1.0, "w_force": 1.0, "w_gap": 0.0},
+        },
+        model_path=str(tmp_path / "models" / "model-{:04d}"),
+        current_model_id=0,
+        gpus_per_node=0,
+        properties_list=_properties_list(),
+    )
+
+    assert result.get_atoms() is None
+    assert result.get_metadata()["best_candidate"] is None
+    assert result.get_metadata()["rejected_qm_candidates_min_distance"] == 1
+    payload = json.loads((tmp_path / "meta" / "metadata-traj_close_contact.json").read_text(encoding="utf-8"))
+    assert payload["top_candidates"] == []
+    assert payload["rejected_qm_candidates_min_distance"] == 1
 
 
 def test_run_excited_state_sampling_records_opt_in_ase_timing(monkeypatch, tmp_path: Path):
@@ -950,6 +1046,72 @@ def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path
     assert payload["score_uncertainty_scope"] == "selected_state"
     assert payload["score_uncertainty_source"] == "selected_state"
     assert payload["timing"]["batch_size"] == 2
+
+    monkeypatch.setattr(
+        sampler_mod,
+        "_results_to_metrics",
+        lambda atoms, results, state_table, gap_table, selected_state, **kwargs: _safe_candidate_metrics(
+            atoms,
+            selected_state=selected_state,
+        ),
+    )
+    close_contact_molecules = []
+    for idx, positions in enumerate(
+        [
+            [[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]],
+            [[0, 0, 0], [0.2, 0, 0], [-0.24, 0.93, 0]],
+        ]
+    ):
+        molecule = MoleculesObject(Atoms(symbols=["O", "H", "H"], positions=positions), f"batch_guard_{idx}")
+        molecule.update_metadata({"excited_state": 0})
+        close_contact_molecules.append(molecule)
+
+    guarded_result = sampler_mod.run_excited_state_sampling_batch(
+        close_contact_molecules,
+        sampler_config={
+            "dynamics_backend": "alchemi_baoab",
+            "dt": 1.0,
+            "maxt": 0.001,
+            "Ncheck": 1,
+            "min_time": 0.0,
+            "friction": 0.02,
+            "srt_temp": [100.0, 100.0],
+            "end_temp": [100.0, 100.0],
+            "amp_temp": [0.0, 0.0],
+            "per_temp": [5.0, 5.0],
+            "amp_dens": None,
+            "per_dens": None,
+            "end_dens": None,
+            "meta_dir": str(tmp_path / "meta_guard"),
+            "metadata_format": "json",
+            "write_traj_binary": False,
+            "write_traj_xyz": False,
+            "trajectory_frequency": 0.0,
+            "trajectory_interval": 1,
+            "timing": {"enabled": True},
+            "return_top_n": 2,
+            "min_distance_cutoff": 0.7,
+            "max_force_cutoff": 10.0,
+            "alchemi_baoab": {"allow_cpu_debug": True, "batch_size": 2},
+            "state_selection": {"mode": "fixed", "fixed_state": 0},
+            "uncertainty": {"enabled": True, "min_uE": 0.05, "min_uF": 0.05, "logic": "either"},
+            "gap_seeking": {"enabled": False},
+            "udd": {"enabled": False},
+            "score": {"w_energy": 1.0, "w_force": 1.0, "w_gap": 0.0},
+        },
+        model_path=str(tmp_path / "models" / "model-{:04d}"),
+        current_model_id=0,
+        gpus_per_node=0,
+        properties_list=_properties_list(),
+    )
+
+    assert len(guarded_result) == 1
+    assert guarded_result[0].get_metadata()["parent_molecule_id"] == "batch_guard_0"
+    valid_payload = json.loads((tmp_path / "meta_guard" / "metadata-batch_guard_0.json").read_text(encoding="utf-8"))
+    rejected_payload = json.loads((tmp_path / "meta_guard" / "metadata-batch_guard_1.json").read_text(encoding="utf-8"))
+    assert valid_payload["rejected_qm_candidates_min_distance"] == 0
+    assert rejected_payload["top_candidates"] == []
+    assert rejected_payload["rejected_qm_candidates_min_distance"] == 1
 
 
 def test_batched_gap_seeking_hysteresis_enters_and_exits_lcm(monkeypatch, tmp_path: Path):
