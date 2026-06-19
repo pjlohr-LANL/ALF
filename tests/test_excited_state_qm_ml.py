@@ -10,6 +10,7 @@ from ase import Atoms
 from alframework.ml_interfaces import excited_state_hippynn_interface as ml_mod
 from alframework.qm_interfaces import pyseqm_interface
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.qm_batching import pyseqm_batch_size_from_qm_config
 
 
 def _properties_list() -> dict[str, list[object]]:
@@ -19,6 +20,19 @@ def _properties_list() -> dict[str, list[object]]:
         "sE1": ["sE1", "system", 1.0],
         "F1": ["F1", "atomic", 1.0],
     }
+
+
+def test_pyseqm_batch_size_comes_from_qm_config_only():
+    def batch_capable_task(molecule_objects=None):
+        return molecule_objects
+
+    def single_molecule_task(molecule_object=None):
+        return molecule_object
+
+    assert pyseqm_batch_size_from_qm_config({"pyseqm_batch_size": 16}, batch_capable_task) == 16
+    assert pyseqm_batch_size_from_qm_config({}, batch_capable_task) == 1
+    assert pyseqm_batch_size_from_qm_config({"batch_size": 16}, batch_capable_task) == 1
+    assert pyseqm_batch_size_from_qm_config({"pyseqm_batch_size": 16}, single_molecule_task) == 1
 
 
 def test_label_excited_state_molecule_flattens_outputs_and_applies_offset(monkeypatch):
@@ -227,6 +241,70 @@ def test_label_excited_state_molecule_handles_backend_failure(monkeypatch):
     assert labeled.check_convergence() is False
     assert "qm_error" in labeled.get_metadata()
     assert labeled.get_results() == {}
+
+
+def test_label_excited_state_molecules_batches_and_splits_outputs(monkeypatch):
+    molecules = [
+        MoleculesObject(Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [1, 0, 0], [0, 1, 0]]), "traj_0000"),
+        MoleculesObject(Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [1.1, 0, 0], [0, 1.1, 0]]), "traj_0001"),
+    ]
+    energies = np.array([[-90.0, -89.5], [-91.0, -90.25]], dtype=np.float64)
+    forces = np.arange(36, dtype=np.float64).reshape(2, 2, 3, 3)
+    calls = []
+
+    def fake_run_pyseqm_batch(**kwargs):
+        calls.append((kwargs["coords_np"].shape, kwargs["species_np"].shape))
+        assert kwargs["n_states"] == 2
+        return energies.copy(), forces.copy()
+
+    monkeypatch.setattr(pyseqm_interface, "run_pyseqm_batch", fake_run_pyseqm_batch)
+    monkeypatch.setattr(pyseqm_interface, "_pyseqm_device", lambda gpus_per_node: None)
+
+    labeled = pyseqm_interface.label_excited_state_molecules(
+        molecules,
+        QM_config={"method": "AM1"},
+        properties_list=_properties_list(),
+        sampler_config={"energy_offset_eV": -100.0},
+        gpus_per_node=0,
+    )
+
+    assert calls == [((2, 3, 3), (2, 3))]
+    assert [item.check_convergence() for item in labeled] == [True, True]
+    assert [item.get_metadata()["pyseqm_batch_size"] for item in labeled] == [2, 2]
+    np.testing.assert_allclose(labeled[0].get_results()["sE0"], 10.0)
+    np.testing.assert_allclose(labeled[1].get_results()["sE1"], 9.75)
+    np.testing.assert_allclose(labeled[0].get_results()["F0"], forces[0, 0])
+    np.testing.assert_allclose(labeled[1].get_results()["F1"], forces[1, 1])
+
+
+def test_label_excited_state_molecules_retries_individually_after_batch_failure(monkeypatch):
+    molecules = [
+        MoleculesObject(Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [1, 0, 0], [0, 1, 0]]), "traj_0000"),
+        MoleculesObject(Atoms(symbols=["O", "H", "H"], positions=[[0, 0, 0], [1.1, 0, 0], [0, 1.1, 0]]), "traj_0001"),
+    ]
+    calls = []
+
+    def fake_run_pyseqm_batch(**kwargs):
+        batch_size = int(kwargs["coords_np"].shape[0])
+        calls.append(batch_size)
+        if batch_size > 1:
+            raise RuntimeError("synthetic batch failure")
+        return np.array([[-90.0, -89.5]], dtype=np.float64), np.zeros((1, 2, 3, 3), dtype=np.float64)
+
+    monkeypatch.setattr(pyseqm_interface, "run_pyseqm_batch", fake_run_pyseqm_batch)
+    monkeypatch.setattr(pyseqm_interface, "_pyseqm_device", lambda gpus_per_node: None)
+
+    labeled = pyseqm_interface.label_excited_state_molecules(
+        molecules,
+        QM_config={"method": "AM1"},
+        properties_list=_properties_list(),
+        sampler_config={"energy_offset_eV": -100.0},
+        gpus_per_node=0,
+    )
+
+    assert calls == [2, 1, 1]
+    assert [item.check_convergence() for item in labeled] == [True, True]
+    assert all("pyseqm_batch_size" not in item.get_metadata() for item in labeled)
 
 
 def test_label_excited_state_molecule_uses_timeout_child_and_succeeds(monkeypatch, tmp_path: Path):

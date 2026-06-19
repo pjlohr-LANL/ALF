@@ -34,6 +34,7 @@ from alframework.tools.sampler_batching import (
     alchemi_sampler_batch_size,
     pop_ready_same_state_batches,
 )
+from alframework.tools.qm_batching import pyseqm_batch_size_from_qm_config
 from alframework.tools.molecule_payloads import flatten_molecule_output
 from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
@@ -80,6 +81,49 @@ pending_QM_structures = []
 def _flatten_molecule_output(output):
     """Normalize stage outputs that may be a MoleculesObject or nested lists."""
     return flatten_molecule_output(output)
+
+
+def _qm_batch_key(molecule):
+    atoms = molecule.get_atoms()
+    if atoms is None:
+        return tuple()
+    return tuple(sorted(int(value) for value in atoms.get_atomic_numbers()))
+
+
+def _pop_compatible_qm_batch(pending_structures, batch_size):
+    size = max(1, int(batch_size))
+    if size <= 1 or len(pending_structures) <= 1:
+        return [pending_structures.pop(0)]
+
+    seed_key = _qm_batch_key(pending_structures[0])
+    if not seed_key:
+        return [pending_structures.pop(0)]
+
+    selected_indices = []
+    for index, molecule in enumerate(pending_structures):
+        if _qm_batch_key(molecule) == seed_key:
+            selected_indices.append(index)
+            if len(selected_indices) >= size:
+                break
+
+    batch = [pending_structures[index] for index in selected_indices]
+    for index in reversed(selected_indices):
+        del pending_structures[index]
+    return batch
+
+
+def _completed_qm_molecule_number(qm_task_queue):
+    completed = 0
+    for task in qm_task_queue.task_list:
+        try:
+            if task.task_status() != 'exec_done' or not task.done():
+                continue
+            for molecule in _flatten_molecule_output(task.result()):
+                if isinstance(molecule, MoleculesObject) and molecule.check_convergence() is True:
+                    completed += 1
+        except Exception:
+            continue
+    return completed
 
 
 def _first_valid_molecule(output):
@@ -432,9 +476,10 @@ while True:
     drain_gpu_tasks_before_ml = bool(master_config.get('drain_gpu_tasks_before_ml', False))
     qm_submit_batch_size = int(master_config.get('qm_submit_batch_size', master_config['target_queued_QM']))
     qm_submit_batch_size = max(qm_submit_batch_size, 1)
-    successful_qm_tasks = QM_task_queue.get_exec_done_number()
+    pyseqm_batch_size = pyseqm_batch_size_from_qm_config(QM_config, qm_task.func)
+    successful_qm_molecules = _completed_qm_molecule_number(QM_task_queue)
     ml_task_ready = (
-        successful_qm_tasks >= master_config['save_h5_threshold']
+        successful_qm_molecules >= master_config['save_h5_threshold']
         and ML_task_queue.get_number() < 1
     )
     gpu_work_blocked_for_ml = drain_gpu_tasks_before_ml and (
@@ -526,9 +571,11 @@ while True:
             and qm_outstanding_tasks < qm_submit_batch_size
             and QM_task_queue.get_number() < master_config.get('maximum_completed_QM', 1e12)
         ):
-            structure = pending_QM_structures.pop(0)
+            qm_batch = _pop_compatible_qm_batch(pending_QM_structures, pyseqm_batch_size)
             task_input = build_input_dict(qm_task.func,
-                                          [{"molecule_object": structure, "QM_config": QM_config}, master_config,
+                                          [{"molecule_object": qm_batch[0],
+                                            "molecule_objects": qm_batch,
+                                            "QM_config": QM_config}, master_config,
                                            *all_configs, status],
                                           raise_on_fail=True)
             QM_task_queue.add_task(qm_task(**task_input))
@@ -542,7 +589,7 @@ while True:
         and QM_task_queue.get_queued_number() == 0
     )
     can_submit_ml = (
-        QM_task_queue.get_exec_done_number() >= master_config['save_h5_threshold']
+        _completed_qm_molecule_number(QM_task_queue) >= master_config['save_h5_threshold']
         and ML_task_queue.get_number() < 1
         and ((not drain_gpu_tasks_before_ml) or gpu_queues_drained_for_ml)
     )
@@ -551,6 +598,11 @@ while True:
     	  #store_current_data(h5path, system_data, properties):
         results_list, failed = QM_task_queue.get_task_results()
         status['lifetime_failed_QM_tasks'] = status['lifetime_failed_QM_tasks'] + failed
+        results_list = [
+            molecule
+            for task_output in results_list
+            for molecule in _flatten_molecule_output(task_output)
+        ]
         #with open('temp-{:04d}.pkl'.format(status['current_h5_id']),'wb') as pickle_file:
         #    pickle.dump(results_list,pickle_file)
         results_list, screening_summary = filter_dataset_screening(

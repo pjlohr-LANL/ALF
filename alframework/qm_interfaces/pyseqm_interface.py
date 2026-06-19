@@ -584,14 +584,263 @@ def label_excited_state_molecule(
     return molecule_object
 
 
+def _mark_pyseqm_failure(
+    molecule_object: MoleculesObject,
+    exc: Exception,
+    *,
+    log_path: Path | None = None,
+    timeout: bool = False,
+    max_solve_time_seconds: float | None = None,
+) -> MoleculesObject:
+    error_metadata = {
+        "qm_backend": "pyseqm",
+        "qm_error": str(exc) if timeout else repr(exc),
+    }
+    if timeout:
+        error_metadata["qm_timeout"] = True
+    if max_solve_time_seconds is not None:
+        error_metadata["max_solve_time_seconds"] = float(max_solve_time_seconds)
+    if log_path is not None:
+        error_metadata["pyseqm_log_path"] = str(log_path)
+    molecule_object.update_metadata(error_metadata)
+    molecule_object.set_converged_flag(False)
+    return molecule_object
+
+
+def _compatible_batch_key(molecule_object: MoleculesObject) -> tuple[int, ...]:
+    atoms = molecule_object.get_atoms()
+    if atoms is None:
+        return tuple()
+    return tuple(sorted(int(value) for value in atoms.get_atomic_numbers()))
+
+
+def _batch_log_path(QM_config: dict[str, Any], molecule_objects: list[MoleculesObject]) -> Path | None:
+    if not bool(QM_config.get("capture_pyseqm_logs", False)):
+        return None
+    log_dir = Path(str(QM_config.get("pyseqm_log_dir", "pyseqm_logs"))).expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    first_id = _safe_log_component(molecule_objects[0].get_moleculeid())
+    return log_dir / f"batch-{first_id}-n{len(molecule_objects)}.pid-{os.getpid()}.{time.time_ns()}.log"
+
+
+def _write_pyseqm_batch_log_header(
+    handle,
+    molecule_objects: list[MoleculesObject],
+    device,
+    method: str,
+    scf_eps: float,
+    cis_tol: float,
+    n_states: int,
+) -> None:
+    print("=== PySEQM excited-state QM batch task start ===", file=handle, flush=True)
+    print(f"timestamp_unix: {time.time():.6f}", file=handle, flush=True)
+    print(f"hostname: {socket.gethostname()}", file=handle, flush=True)
+    print(f"pid: {os.getpid()}", file=handle, flush=True)
+    print(f"batch_size: {len(molecule_objects)}", file=handle, flush=True)
+    print(f"molecule_ids: {[item.get_moleculeid() for item in molecule_objects]}", file=handle, flush=True)
+    print(f"cuda_visible_devices: {os.environ.get('CUDA_VISIBLE_DEVICES')}", file=handle, flush=True)
+    print(f"parsl_worker_rank: {os.environ.get('PARSL_WORKER_RANK')}", file=handle, flush=True)
+    print(f"device: {device}", file=handle, flush=True)
+    print(f"method: {method}", file=handle, flush=True)
+    print(f"scf_eps: {scf_eps}", file=handle, flush=True)
+    print(f"cis_tol: {cis_tol}", file=handle, flush=True)
+    print(f"n_states: {n_states}", file=handle, flush=True)
+    print("=== PySEQM stdout/stderr follows ===", file=handle, flush=True)
+
+
+def label_excited_state_molecules(
+    molecule_objects: list[MoleculesObject],
+    *,
+    QM_config: dict[str, Any],
+    properties_list: dict[str, list[Any]],
+    sampler_config: dict[str, Any] | None = None,
+    gpus_per_node: int | None = None,
+) -> list[MoleculesObject]:
+    if not isinstance(molecule_objects, list):
+        molecule_objects = list(molecule_objects)
+    if len(molecule_objects) == 0:
+        return []
+    for molecule_object in molecule_objects:
+        if not isinstance(molecule_object, MoleculesObject):
+            raise TypeError("molecule_objects must contain only MoleculesObject instances.")
+
+    complete: list[MoleculesObject] = []
+    needs_label: list[MoleculesObject] = []
+    for molecule_object in molecule_objects:
+        if bool(QM_config.get("accept_prelabeled", False)) and _has_complete_prelabeled_results(
+            molecule_object,
+            properties_list,
+        ):
+            molecule_object.update_metadata({"qm_backend": "prelabeled_seed", "qm_skipped": True})
+            complete.append(molecule_object)
+        else:
+            needs_label.append(molecule_object)
+    if not needs_label:
+        return list(molecule_objects)
+    if len(needs_label) == 1:
+        complete.append(
+            label_excited_state_molecule(
+                needs_label[0],
+                QM_config=QM_config,
+                properties_list=properties_list,
+                sampler_config=sampler_config,
+                gpus_per_node=gpus_per_node,
+            )
+        )
+        return list(molecule_objects)
+
+    batch_key = _compatible_batch_key(needs_label[0])
+    if not batch_key or any(_compatible_batch_key(item) != batch_key for item in needs_label):
+        complete.extend(
+            label_excited_state_molecule(
+                molecule_object,
+                QM_config=QM_config,
+                properties_list=properties_list,
+                sampler_config=sampler_config,
+                gpus_per_node=gpus_per_node,
+            )
+            for molecule_object in needs_label
+        )
+        return list(molecule_objects)
+
+    state_table = derive_state_property_table(properties_list, require_forces=False)
+    atoms_list = [molecule_object.get_atoms() for molecule_object in needs_label]
+    coords = np.asarray([atoms.get_positions() for atoms in atoms_list], dtype=np.float64)
+    species = np.asarray([atoms.get_atomic_numbers() for atoms in atoms_list], dtype=np.int64)
+    offset = float(
+        QM_config.get(
+            "energy_offset_eV",
+            (sampler_config or {}).get("energy_offset_eV", 0.0),
+        )
+    )
+    method = str(QM_config.get("method", "AM1"))
+    scf_eps = float(QM_config.get("scf_eps", 1e-10))
+    cis_tol = float(QM_config.get("cis_tol", 1e-8))
+    device = _pyseqm_device(gpus_per_node)
+    max_solve_time_seconds = _pyseqm_timeout_seconds(QM_config)
+    log_path = _batch_log_path(QM_config, needs_label)
+    log_handle = None
+    start_time = time.time()
+    try:
+        if log_path is not None:
+            log_handle = open(log_path, "w", encoding="utf-8", buffering=1)
+            _write_pyseqm_batch_log_header(log_handle, needs_label, device, method, scf_eps, cis_tol, len(state_table))
+        if max_solve_time_seconds is not None:
+            if log_handle is not None:
+                log_handle.close()
+                log_handle = None
+            energies, forces = _run_pyseqm_batch_with_timeout(
+                coords_np=coords,
+                species_np=species,
+                n_states=len(state_table),
+                method=method,
+                scf_eps=scf_eps,
+                cis_tol=cis_tol,
+                device=device,
+                log_path=log_path,
+                max_solve_time_seconds=max_solve_time_seconds,
+            )
+        else:
+            with contextlib.ExitStack() as stack:
+                if log_handle is not None:
+                    stack.enter_context(contextlib.redirect_stdout(log_handle))
+                    stack.enter_context(contextlib.redirect_stderr(log_handle))
+                    stack.enter_context(warnings.catch_warnings())
+                    warnings.simplefilter("always")
+                energies, forces = run_pyseqm_batch(
+                    coords_np=coords,
+                    species_np=species,
+                    n_states=len(state_table),
+                    method=method,
+                    scf_eps=scf_eps,
+                    cis_tol=cis_tol,
+                    device=device,
+                    log_handle=log_handle,
+                )
+    except PySEQMTimeoutError as exc:
+        if log_handle is not None:
+            _write_pyseqm_log_footer(log_handle, "timeout", time.time() - start_time, error=exc)
+            log_handle.close()
+        else:
+            _append_pyseqm_log_footer(log_path, "timeout", time.time() - start_time, error=exc)
+        complete.extend(
+            label_excited_state_molecule(
+                molecule_object,
+                QM_config=QM_config,
+                properties_list=properties_list,
+                sampler_config=sampler_config,
+                gpus_per_node=gpus_per_node,
+            )
+            for molecule_object in needs_label
+        )
+        return list(molecule_objects)
+    except Exception as exc:
+        if log_handle is not None:
+            _write_pyseqm_log_footer(log_handle, "error", time.time() - start_time, error=exc)
+            log_handle.close()
+        else:
+            _append_pyseqm_log_footer(log_path, "error", time.time() - start_time, error=exc)
+        complete.extend(
+            label_excited_state_molecule(
+                molecule_object,
+                QM_config=QM_config,
+                properties_list=properties_list,
+                sampler_config=sampler_config,
+                gpus_per_node=gpus_per_node,
+            )
+            for molecule_object in needs_label
+        )
+        return list(molecule_objects)
+
+    if log_handle is not None and not log_handle.closed:
+        _write_pyseqm_log_footer(log_handle, "success", time.time() - start_time)
+        log_handle.close()
+    elif max_solve_time_seconds is not None:
+        _append_pyseqm_log_footer(log_path, "success", time.time() - start_time)
+
+    for batch_index, molecule_object in enumerate(needs_label):
+        results: dict[str, Any] = {}
+        for row in state_table:
+            state_index = int(row["state"])
+            results[row["energy_key"]] = float(energies[batch_index, state_index] - offset)
+            if row["force_key"] is not None:
+                results[row["force_key"]] = np.asarray(forces[batch_index, state_index], dtype=np.float64)
+        for row in derive_gap_property_table(properties_list):
+            lower_key = f"sE{int(row['lower_state'])}"
+            upper_key = f"sE{int(row['upper_state'])}"
+            results[row["gap_key"]] = float(results[upper_key] - results[lower_key])
+        molecule_object.store_results(results)
+        molecule_object.update_metadata(
+            {
+                "qm_backend": "pyseqm",
+                "energy_offset_eV": float(offset),
+                "n_excited_states": int(len(state_table)),
+                "pyseqm_batch_size": int(len(needs_label)),
+                **({"pyseqm_log_path": str(log_path)} if log_path is not None else {}),
+            }
+        )
+        molecule_object.set_converged_flag(True)
+        complete.append(molecule_object)
+    return list(molecule_objects)
+
+
 @python_app(executors=["alf_QM_executor"])
 def pyseqm_excited_state_task(
-    molecule_object,
-    QM_config,
-    properties_list,
+    molecule_object=None,
+    QM_config=None,
+    properties_list=None,
     sampler_config=None,
     gpus_per_node=None,
+    molecule_objects=None,
 ):
+    if molecule_objects is not None:
+        return label_excited_state_molecules(
+            molecule_objects=list(molecule_objects),
+            QM_config=dict(QM_config or {}),
+            properties_list=dict(properties_list or {}),
+            sampler_config=dict(sampler_config or {}),
+            gpus_per_node=None if gpus_per_node is None else int(gpus_per_node),
+        )
     return label_excited_state_molecule(
         molecule_object=molecule_object,
         QM_config=dict(QM_config or {}),
@@ -603,14 +852,57 @@ def pyseqm_excited_state_task(
 
 @python_app(executors=["alf_gpu_executor"])
 def pyseqm_excited_state_gpu_task(
-    molecule_object,
+    molecule_object=None,
+    QM_config=None,
+    properties_list=None,
+    sampler_config=None,
+    gpus_per_node=None,
+    molecule_objects=None,
+):
+    if molecule_objects is not None:
+        return label_excited_state_molecules(
+            molecule_objects=list(molecule_objects),
+            QM_config=dict(QM_config or {}),
+            properties_list=dict(properties_list or {}),
+            sampler_config=dict(sampler_config or {}),
+            gpus_per_node=None if gpus_per_node is None else int(gpus_per_node),
+        )
+    return label_excited_state_molecule(
+        molecule_object=molecule_object,
+        QM_config=dict(QM_config or {}),
+        properties_list=dict(properties_list or {}),
+        sampler_config=dict(sampler_config or {}),
+        gpus_per_node=None if gpus_per_node is None else int(gpus_per_node),
+    )
+
+
+@python_app(executors=["alf_QM_executor"])
+def pyseqm_excited_state_batch_task(
+    molecule_objects,
     QM_config,
     properties_list,
     sampler_config=None,
     gpus_per_node=None,
 ):
-    return label_excited_state_molecule(
-        molecule_object=molecule_object,
+    return label_excited_state_molecules(
+        molecule_objects=list(molecule_objects),
+        QM_config=dict(QM_config or {}),
+        properties_list=dict(properties_list or {}),
+        sampler_config=dict(sampler_config or {}),
+        gpus_per_node=None if gpus_per_node is None else int(gpus_per_node),
+    )
+
+
+@python_app(executors=["alf_gpu_executor"])
+def pyseqm_excited_state_batch_gpu_task(
+    molecule_objects,
+    QM_config,
+    properties_list,
+    sampler_config=None,
+    gpus_per_node=None,
+):
+    return label_excited_state_molecules(
+        molecule_objects=list(molecule_objects),
         QM_config=dict(QM_config or {}),
         properties_list=dict(properties_list or {}),
         sampler_config=dict(sampler_config or {}),
