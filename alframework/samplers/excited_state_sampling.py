@@ -24,6 +24,14 @@ from alframework.tools.molecule_payloads import (
     write_sampler_result_ref,
 )
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.molecular_topology import (
+    FixedMolecularTopology,
+    ensure_topology_atom_ids,
+    load_fixed_topology,
+    topology_enabled,
+    topology_metadata,
+    validate_fixed_topology,
+)
 from alframework.tools.tools import annealing_schedule
 
 
@@ -580,6 +588,83 @@ def _qm_candidate_reject_reason(atoms, sampler_config: dict[str, Any]) -> str | 
     return None
 
 
+def _geometry_screen(
+    atoms,
+    metrics: dict[str, Any],
+    sampler_config: dict[str, Any],
+    topology: FixedMolecularTopology | None,
+) -> dict[str, Any]:
+    """Evaluate the three independent hard geometry screens.
+
+    The primary reason uses the configured reporting precedence while all
+    triggered screens remain available in ``screen_failures``.
+    """
+
+    min_distance_failed = float(metrics["min_dist"]) < float(
+        sampler_config.get("min_distance_cutoff", 0.3)
+    )
+    max_force_failed = float(metrics["fmax"]) > float(
+        sampler_config.get("max_force_cutoff", 10.0)
+    )
+    topology_result = validate_fixed_topology(
+        atoms,
+        sampler_config,
+        topology,
+        assign_missing_ids=False,
+    )
+    topology_failed = not bool(topology_result.valid)
+    failures: list[str] = []
+    if min_distance_failed:
+        failures.append("min_distance")
+    if max_force_failed:
+        failures.append("max_force")
+    if topology_failed:
+        failures.append("topology")
+    return {
+        "screen_valid": not failures,
+        "screen_reject_reason": failures[0] if failures else None,
+        "screen_failures": failures,
+        "screen_min_distance_failed": bool(min_distance_failed),
+        "screen_max_force_failed": bool(max_force_failed),
+        "screen_topology_failed": bool(topology_failed),
+        **topology_metadata(topology_result),
+    }
+
+
+def _initial_topology_screen(
+    atoms,
+    sampler_config: dict[str, Any],
+    topology: FixedMolecularTopology | None,
+) -> dict[str, Any]:
+    ensure_topology_atom_ids(atoms, sampler_config, topology, allow_inference=True)
+    min_distance = _candidate_min_distance(atoms)
+    topology_result = validate_fixed_topology(
+        atoms,
+        sampler_config,
+        topology,
+        assign_missing_ids=False,
+    )
+    min_distance_failed = (
+        min_distance is not None
+        and min_distance < float(sampler_config.get("min_distance_cutoff", 0.3))
+    )
+    failures = []
+    if min_distance_failed:
+        failures.append("min_distance")
+    if not topology_result.valid:
+        failures.append("topology")
+    return {
+        "screen_valid": not failures,
+        "screen_reject_reason": failures[0] if failures else None,
+        "screen_failures": failures,
+        "screen_min_distance_failed": bool(min_distance_failed),
+        "screen_max_force_failed": False,
+        "screen_topology_failed": not bool(topology_result.valid),
+        "min_dist": min_distance,
+        **topology_metadata(topology_result),
+    }
+
+
 def _temperature_feed_parameters(sampler_config: dict[str, Any], rng: np.random.Generator) -> dict[str, float | None]:
     feed = {
         "Tamp": float(rng.uniform(*sampler_config["amp_temp"])),
@@ -802,6 +887,38 @@ def run_excited_state_sampling_batch(
         validate_alchemi_sampler_support,
     )
 
+    topology = load_fixed_topology(sampler_config)
+    valid_molecules: list[MoleculesObject] = []
+    meta_dir = sampler_config.get("meta_dir")
+    metadata_format = str(sampler_config.get("metadata_format", "pickle"))
+    for molecule in molecule_objects:
+        atoms = molecule.get_atoms()
+        initial_screen = _initial_topology_screen(atoms, sampler_config, topology)
+        molecule.update_metadata({"initial_geometry_screen": plain_metadata_dict(initial_screen)})
+        if bool(initial_screen["screen_valid"]):
+            valid_molecules.append(molecule)
+            continue
+        _write_metadata(
+            meta_dir,
+            molecule.get_moleculeid(),
+            {
+                **molecule.get_metadata(),
+                "best_candidate": None,
+                "top_candidates": [],
+                "geometry_reject_reason": initial_screen["screen_reject_reason"],
+                "geometry_screen_failures": initial_screen["screen_failures"],
+                "topology_last_valid_step": None,
+                "rejected_qm_candidates_min_distance": int(
+                    bool(initial_screen["screen_min_distance_failed"])
+                ),
+                "rejected_qm_candidates_screening": 1,
+            },
+            metadata_format,
+        )
+    molecule_objects = valid_molecules
+    if not molecule_objects:
+        return []
+
     ensure_alchemi_available()
     _validate_same_alchemi_batch_inputs(molecule_objects)
 
@@ -888,8 +1005,6 @@ def run_excited_state_sampling_batch(
     friction = float(sampler_config.get("friction", 0.02))
     total_md_steps = int(np.ceil((1000.0 * maxt) / dt))
     n_outer = int(np.ceil(float(total_md_steps) / float(ncheck)))
-    meta_dir = sampler_config.get("meta_dir")
-    metadata_format = str(sampler_config.get("metadata_format", "pickle"))
     return_top_n = _return_top_n(sampler_config)
     if _sample_trajectory_interval(sampler_config, rngs[0]) is not None and bool(
         sampler_config.get("write_traj_xyz", False) or sampler_config.get("write_traj_binary", False)
@@ -948,9 +1063,13 @@ def run_excited_state_sampling_batch(
 
     active = np.ones(actual_batch_size, dtype=bool)
     replica_stop_reasons: list[str | None] = [None for _ in molecule_objects]
+    replica_screen_failures: list[list[str]] = [[] for _ in molecule_objects]
+    topology_last_valid_steps: list[int] = [0 for _ in molecule_objects]
+    last_valid_positions = [np.asarray(atoms.get_positions(), dtype=np.float64).copy() for atoms in atoms_list]
     top_candidates: list[dict[str, Any]] = []
     per_molecule_records: list[list[dict[str, Any]]] = [[] for _ in molecule_objects]
     rejected_qm_candidates_min_distance: list[int] = [0 for _ in molecule_objects]
+    rejected_qm_candidates_screening: list[int] = [0 for _ in molecule_objects]
     per_molecule_geometry_trace: list[list[dict[str, Any]]] = [[] for _ in molecule_objects]
     start_time = time.time()
 
@@ -1140,6 +1259,13 @@ def run_excited_state_sampling_batch(
                     selected_state,
                     forces_override=np.asarray(graph_results["forces"], dtype=np.float64),
                 )
+                screen = _geometry_screen(
+                    atoms_list[graph_index],
+                    metrics,
+                    sampler_config,
+                    topology,
+                )
+                metrics.update(screen)
             current_temperature = float(temperatures[graph_index])
             current_total_energy = float(np.asarray(graph_results["energy"]).reshape(-1)[0] + kinetic[graph_index])
             per_molecule_geometry_trace[graph_index].append(
@@ -1150,22 +1276,40 @@ def run_excited_state_sampling_batch(
                     "fmax": float(metrics["fmax"]),
                     "max_nearest_neighbor_distance": float(metrics["max_nearest_neighbor_distance"]),
                     "nearest_neighbor_distances": np.asarray(metrics["nearest_neighbor_distances"], dtype=float),
+                    "screen_reject_reason": metrics["screen_reject_reason"],
+                    "screen_failures": list(metrics["screen_failures"]),
+                    "topology_valid": bool(metrics["topology_valid"]),
+                    "topology_reject_reason": metrics["topology_reject_reason"],
+                    "topology_min_bond_ratio": metrics.get("topology_min_bond_ratio"),
+                    "topology_max_bond_ratio": metrics.get("topology_max_bond_ratio"),
+                    "topology_min_nonbonded_covalent_ratio": metrics.get(
+                        "topology_min_nonbonded_covalent_ratio"
+                    ),
                 }
             )
 
-            stop_reason = None
-            if float(metrics["min_dist"]) < float(sampler_config.get("min_distance_cutoff", 0.3)):
-                stop_reason = "min_distance"
-            elif bool(sampler_config.get("max_nearest_neighbor_distance_check", False)):
+            stop_reason = metrics["screen_reject_reason"]
+            screen_failures = list(metrics["screen_failures"])
+            if stop_reason is None and bool(
+                sampler_config.get("max_nearest_neighbor_distance_check", False)
+            ):
                 max_nn_cutoff = float(sampler_config["max_nearest_neighbor_distance_cutoff"])
                 if float(metrics["max_nearest_neighbor_distance"]) > max_nn_cutoff:
                     stop_reason = "max_nearest_neighbor_distance"
-            if stop_reason is None and float(metrics["fmax"]) > float(sampler_config.get("max_force_cutoff", 10.0)):
-                stop_reason = "max_force"
+                    screen_failures = ["max_nearest_neighbor_distance"]
             if stop_reason is not None:
                 active[graph_index] = False
-                replica_stop_reasons[graph_index] = stop_reason
+                replica_stop_reasons[graph_index] = str(stop_reason)
+                replica_screen_failures[graph_index] = screen_failures
+                atoms_list[graph_index].set_positions(last_valid_positions[graph_index])
+                if hasattr(dyn, "freeze_graph"):
+                    dyn.freeze_graph(graph_index, positions=last_valid_positions[graph_index])
                 continue
+
+            last_valid_positions[graph_index] = np.asarray(
+                atoms_list[graph_index].get_positions(), dtype=np.float64
+            ).copy()
+            topology_last_valid_steps[graph_index] = int(current_step)
 
             if current_time_ps < min_time or not _passes_uncertainty_gate(metrics, sampler_config):
                 continue
@@ -1194,8 +1338,16 @@ def run_excited_state_sampling_batch(
                 **metrics,
             }
             candidate_atoms = atoms_list[graph_index].copy()
-            if _qm_candidate_reject_reason(candidate_atoms, sampler_config) == "min_distance":
-                rejected_qm_candidates_min_distance[graph_index] += 1
+            candidate_screen = _geometry_screen(
+                candidate_atoms,
+                metrics,
+                sampler_config,
+                topology,
+            )
+            if not bool(candidate_screen["screen_valid"]):
+                rejected_qm_candidates_screening[graph_index] += 1
+                if bool(candidate_screen["screen_min_distance_failed"]):
+                    rejected_qm_candidates_min_distance[graph_index] += 1
                 continue
             item = {"record": record, "atoms": candidate_atoms, "parent_index": graph_index}
             top_candidates.append(item)
@@ -1251,7 +1403,10 @@ def run_excited_state_sampling_batch(
             "return_top_n": int(return_top_n),
             "hard_close_contact": replica_stop_reasons[graph_index] == "min_distance",
             "geometry_reject_reason": replica_stop_reasons[graph_index],
+            "geometry_screen_failures": replica_screen_failures[graph_index],
+            "topology_last_valid_step": int(topology_last_valid_steps[graph_index]),
             "rejected_qm_candidates_min_distance": int(rejected_qm_candidates_min_distance[graph_index]),
+            "rejected_qm_candidates_screening": int(rejected_qm_candidates_screening[graph_index]),
             "geometry_metrics_trace": per_molecule_geometry_trace[graph_index],
             "max_nearest_neighbor_distance": last_geometry_metrics.get("max_nearest_neighbor_distance"),
             "nearest_neighbor_distances": last_geometry_metrics.get("nearest_neighbor_distances"),
@@ -1335,6 +1490,38 @@ def run_excited_state_sampling(
 
     if not isinstance(molecule_object, MoleculesObject):
         raise TypeError("molecule_object must be a MoleculesObject instance.")
+
+    topology = load_fixed_topology(sampler_config)
+    initial_screen = _initial_topology_screen(
+        molecule_object.get_atoms(),
+        sampler_config,
+        topology,
+    )
+    molecule_object.update_metadata({"initial_geometry_screen": plain_metadata_dict(initial_screen)})
+    if not bool(initial_screen["screen_valid"]):
+        rejection_metadata = {
+            **molecule_object.get_metadata(),
+            "best_candidate": None,
+            "top_candidates": [],
+            "geometry_reject_reason": initial_screen["screen_reject_reason"],
+            "geometry_screen_failures": initial_screen["screen_failures"],
+            "topology_last_valid_step": None,
+            "rejected_qm_candidates_min_distance": int(
+                bool(initial_screen["screen_min_distance_failed"])
+            ),
+            "rejected_qm_candidates_screening": 1,
+        }
+        _write_metadata(
+            sampler_config.get("meta_dir"),
+            molecule_object.get_moleculeid(),
+            rejection_metadata,
+            str(sampler_config.get("metadata_format", "pickle")),
+        )
+        if _return_top_n(sampler_config) == 1:
+            molecule_object.update_metadata(rejection_metadata)
+            molecule_object.update_atoms(None)
+            return molecule_object
+        return []
 
     worker_rank = int(os.environ.get("PARSL_WORKER_RANK", "0"))
     if torch.cuda.is_available() and int(gpus_per_node) > 0:
@@ -1606,6 +1793,7 @@ def run_excited_state_sampling(
     hard_close_contact = False
     geometry_reject_reason = None
     rejected_qm_candidates_min_distance = 0
+    rejected_qm_candidates_screening = 0
     start_time = time.time()
     temperatures: list[float] = []
     total_energies: list[float] = []
@@ -1621,6 +1809,9 @@ def run_excited_state_sampling(
     udd_force_history: list[tuple[float, float]] = []
     last_tau_update_step = 0
     geometry_metrics_trace: list[dict[str, Any]] = []
+    geometry_screen_failures: list[str] = []
+    topology_last_valid_step = 0
+    last_valid_positions = np.asarray(ase_atoms.get_positions(), dtype=np.float64).copy()
     gap_seeking_min_gap_trace: list[dict[str, Any]] = []
     gap_seeking_active_pair_gap_trace: list[dict[str, Any]] = []
     gap_seeking_switch_events: list[dict[str, Any]] = []
@@ -1947,6 +2138,9 @@ def run_excited_state_sampling(
                 results = _fresh_ase_results(step=current_step, context="post_md_chunk")
                 with timing.scope("metrics"):
                     metrics = _results_to_metrics(ase_atoms, results, state_table, gap_table, selected_state)
+            with timing.scope("metrics"):
+                screen = _geometry_screen(ase_atoms, metrics, sampler_config, topology)
+                metrics.update(screen)
             timing.record_chunk(step=current_step, chunk_steps=int(ncheck))
             if udd_enabled and udd_metadata["udd_gap_key"] is not None:
                 udd_gap_key = str(udd_metadata["udd_gap_key"])
@@ -1998,20 +2192,36 @@ def run_excited_state_sampling(
                     "fmax": float(metrics["fmax"]),
                     "max_nearest_neighbor_distance": float(metrics["max_nearest_neighbor_distance"]),
                     "nearest_neighbor_distances": np.asarray(metrics["nearest_neighbor_distances"], dtype=float),
+                    "screen_reject_reason": metrics["screen_reject_reason"],
+                    "screen_failures": list(metrics["screen_failures"]),
+                    "topology_valid": bool(metrics["topology_valid"]),
+                    "topology_reject_reason": metrics["topology_reject_reason"],
+                    "topology_min_bond_ratio": metrics.get("topology_min_bond_ratio"),
+                    "topology_max_bond_ratio": metrics.get("topology_max_bond_ratio"),
+                    "topology_min_nonbonded_covalent_ratio": metrics.get(
+                        "topology_min_nonbonded_covalent_ratio"
+                    ),
                 }
             )
 
-            if float(metrics["min_dist"]) < float(sampler_config.get("min_distance_cutoff", 0.3)):
-                hard_close_contact = True
-                geometry_reject_reason = "min_distance"
-                break
-            if bool(sampler_config.get("max_nearest_neighbor_distance_check", False)):
+            geometry_reject_reason = metrics["screen_reject_reason"]
+            geometry_screen_failures = list(metrics["screen_failures"])
+            if geometry_reject_reason is None and bool(
+                sampler_config.get("max_nearest_neighbor_distance_check", False)
+            ):
                 max_nn_cutoff = float(sampler_config["max_nearest_neighbor_distance_cutoff"])
                 if float(metrics["max_nearest_neighbor_distance"]) > max_nn_cutoff:
                     geometry_reject_reason = "max_nearest_neighbor_distance"
-                    break
-            if float(metrics["fmax"]) > float(sampler_config.get("max_force_cutoff", 10.0)):
+                    geometry_screen_failures = ["max_nearest_neighbor_distance"]
+            if geometry_reject_reason is not None:
+                hard_close_contact = geometry_reject_reason == "min_distance"
+                ase_atoms.set_positions(last_valid_positions)
+                if use_alchemi and hasattr(dyn, "freeze_graph"):
+                    dyn.freeze_graph(0, positions=last_valid_positions)
                 break
+
+            last_valid_positions = np.asarray(ase_atoms.get_positions(), dtype=np.float64).copy()
+            topology_last_valid_step = int(current_step)
 
             if current_time_ps < min_time:
                 continue
@@ -2050,8 +2260,16 @@ def run_excited_state_sampling(
                     **metrics,
                 }
             candidate_atoms = ase_atoms.copy()
-            if _qm_candidate_reject_reason(candidate_atoms, sampler_config) == "min_distance":
-                rejected_qm_candidates_min_distance += 1
+            candidate_screen = _geometry_screen(
+                candidate_atoms,
+                metrics,
+                sampler_config,
+                topology,
+            )
+            if not bool(candidate_screen["screen_valid"]):
+                rejected_qm_candidates_screening += 1
+                if bool(candidate_screen["screen_min_distance_failed"]):
+                    rejected_qm_candidates_min_distance += 1
                 continue
             top_candidates.append({"record": candidate_record, "atoms": candidate_atoms})
             top_candidates.sort(key=lambda item: float(item["record"]["score"]), reverse=True)
@@ -2084,7 +2302,10 @@ def run_excited_state_sampling(
         "return_top_n": int(return_top_n),
         "hard_close_contact": bool(hard_close_contact),
         "geometry_reject_reason": geometry_reject_reason,
+        "geometry_screen_failures": geometry_screen_failures,
+        "topology_last_valid_step": int(topology_last_valid_step),
         "rejected_qm_candidates_min_distance": int(rejected_qm_candidates_min_distance),
+        "rejected_qm_candidates_screening": int(rejected_qm_candidates_screening),
         "geometry_metrics_trace": geometry_metrics_trace,
         "max_nearest_neighbor_distance": last_geometry_metrics.get("max_nearest_neighbor_distance"),
         "nearest_neighbor_distances": last_geometry_metrics.get("nearest_neighbor_distances"),
@@ -2140,7 +2361,7 @@ def run_excited_state_sampling(
     ase_atoms.calc = None
     if return_top_n == 1:
         molecule_object.update_metadata(meta_dict)
-        if top_candidates and geometry_reject_reason is None:
+        if top_candidates:
             selected_atoms = top_candidates[0]["atoms"]
             selected_atoms.calc = None
             _write_qm_candidate_xyz(
@@ -2153,9 +2374,6 @@ def run_excited_state_sampling(
         else:
             molecule_object.update_atoms(None)
         return molecule_object
-
-    if geometry_reject_reason is not None:
-        return []
 
     output_candidates: list[MoleculesObject] = []
     candidate_ids = [f"{molecule_object.get_moleculeid()}-cand-{rank:02d}" for rank in range(len(top_candidates))]

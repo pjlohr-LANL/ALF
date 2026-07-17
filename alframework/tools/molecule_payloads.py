@@ -13,7 +13,7 @@ from alframework.tools.molecules_class import MoleculesObject
 
 
 MOLECULE_PAYLOAD_MARKER = "__alframework_molecule_payload__"
-MOLECULE_PAYLOAD_VERSION = 1
+MOLECULE_PAYLOAD_VERSION = 2
 SAMPLER_RESULT_REF_MARKER = "__alframework_sampler_result_ref__"
 
 
@@ -66,6 +66,12 @@ def clean_atoms(atoms) -> Atoms:
     )
     if atoms.has("momenta"):
         clean.set_momenta(np.asarray(atoms.get_momenta(), dtype=float))
+    for name, value in atoms.arrays.items():
+        if name in {"numbers", "positions", "momenta"}:
+            continue
+        array = np.asarray(value)
+        if array.dtype.kind in "biufc" and array.shape[0] == len(atoms):
+            clean.set_array(str(name), array.copy())
     return clean
 
 
@@ -78,9 +84,16 @@ def _atoms_to_payload(atoms) -> dict[str, Any] | None:
         "cell": plain_value(np.asarray(atoms.get_cell(), dtype=float)),
         "pbc": plain_value(np.asarray(atoms.get_pbc(), dtype=bool)),
         "momenta": None,
+        "arrays": {},
     }
     if atoms.has("momenta"):
         payload["momenta"] = plain_value(np.asarray(atoms.get_momenta(), dtype=float))
+    for name, value in atoms.arrays.items():
+        if name in {"numbers", "positions", "momenta"}:
+            continue
+        array = np.asarray(value)
+        if array.dtype.kind in "biufc" and array.shape[0] == len(atoms):
+            payload["arrays"][str(name)] = plain_value(array)
     return payload
 
 
@@ -96,6 +109,8 @@ def _atoms_from_payload(payload: dict[str, Any] | None) -> Atoms | None:
     momenta = payload.get("momenta")
     if momenta is not None:
         atoms.set_momenta(np.asarray(momenta, dtype=float))
+    for name, value in dict(payload.get("arrays") or {}).items():
+        atoms.set_array(str(name), np.asarray(value))
     return atoms
 
 

@@ -493,6 +493,7 @@ class AlchemiBaoabRunner:
         self.batch = batch
         self.nsteps = 0
         self._callbacks: list[tuple[Callable[[], None], int]] = []
+        self._frozen_graphs: dict[int, dict[str, Any]] = {}
         self._device = device
         initial_temperature = torch.as_tensor(temperature_K, dtype=torch.float32, device=device).reshape(-1)
         self.dynamics = NVTLangevin(
@@ -536,10 +537,51 @@ class AlchemiBaoabRunner:
     def run(self, steps: int) -> None:
         for _ in range(int(steps)):
             self.dynamics.run(self.batch, n_steps=1)
+            self._restore_frozen_graphs()
             self.nsteps = int(getattr(self.dynamics, "step_count", self.nsteps + 1))
             for callback, interval in self._callbacks:
                 if self.nsteps % interval == 0:
                     callback()
+
+    def freeze_graph(self, graph_index: int, *, positions=None) -> None:
+        """Freeze one graph at a known-valid geometry inside a shared batch."""
+
+        graph_index = int(graph_index)
+        atom_slice = _graph_slice(self.batch, graph_index)
+        batch_positions = _as_tensor(_batch_get(self.batch, "positions"))
+        if positions is not None:
+            replacement = torch.as_tensor(
+                positions,
+                dtype=batch_positions.dtype,
+                device=batch_positions.device,
+            ).reshape_as(batch_positions[atom_slice])
+            batch_positions[atom_slice] = replacement
+        frozen_positions = batch_positions[atom_slice].detach().clone()
+        try:
+            batch_velocities = _as_tensor(_batch_get(self.batch, "velocities"))
+            batch_velocities[atom_slice] = 0.0
+            frozen_velocities = torch.zeros_like(batch_velocities[atom_slice])
+        except Exception:
+            frozen_velocities = None
+        self._frozen_graphs[graph_index] = {
+            "positions": frozen_positions,
+            "velocities": frozen_velocities,
+        }
+        self._restore_frozen_graphs()
+
+    def _restore_frozen_graphs(self) -> None:
+        if not self._frozen_graphs:
+            return
+        batch_positions = _as_tensor(_batch_get(self.batch, "positions"))
+        try:
+            batch_velocities = _as_tensor(_batch_get(self.batch, "velocities"))
+        except Exception:
+            batch_velocities = None
+        for graph_index, frozen in self._frozen_graphs.items():
+            atom_slice = _graph_slice(self.batch, graph_index)
+            batch_positions[atom_slice] = frozen["positions"]
+            if batch_velocities is not None and frozen["velocities"] is not None:
+                batch_velocities[atom_slice] = frozen["velocities"]
 
     def evaluate_results(self) -> dict[str, Any]:
         if hasattr(self.dynamics, "compute"):

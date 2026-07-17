@@ -22,6 +22,13 @@ from alframework.tools.excited_state_tools import (
     validate_gap_results,
 )
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.molecular_topology import (
+    H5_TOPOLOGY_ATOM_IDS_KEY,
+    ensure_topology_atom_ids,
+    load_fixed_topology,
+    topology_atom_id_array,
+    topology_enabled,
+)
 
 
 _MANIFEST_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -439,7 +446,12 @@ def _sample_seed_frame(seed_manifest: dict[str, Any], rng: np.random.Generator) 
     return _seed_frame_to_atoms(seed_manifest, frame_idx)
 
 
-def _sample_h5_frame(h5_groups: list[dict[str, Any]], rng: np.random.Generator) -> tuple[Atoms, dict[str, Any]]:
+def _sample_h5_frame(
+    h5_groups: list[dict[str, Any]],
+    rng: np.random.Generator,
+    *,
+    sampler_config: dict[str, Any] | None = None,
+) -> tuple[Atoms, dict[str, Any]]:
     if not h5_groups:
         raise RuntimeError("HDF5 replay manifest contains no eligible groups.")
     total_frames = int(h5_groups[-1]["stop"])
@@ -466,6 +478,14 @@ def _sample_h5_frame(h5_groups: list[dict[str, Any]], rng: np.random.Generator) 
             atoms = Atoms(symbols=symbols, positions=coords, cell=cell, pbc=True)
         else:
             atoms = Atoms(symbols=symbols, positions=coords)
+        if H5_TOPOLOGY_ATOM_IDS_KEY in group:
+            stored_ids = np.asarray(group[H5_TOPOLOGY_ATOM_IDS_KEY])
+            if stored_ids.ndim == 2:
+                stored_ids = stored_ids[local_index]
+            atoms.set_array(
+                topology_atom_id_array(sampler_config),
+                np.asarray(stored_ids, dtype=np.int64).reshape(-1),
+            )
     return atoms, {
         "replay_source_kind": "h5",
         "replay_source_path": str(group_entry["path"]),
@@ -482,6 +502,7 @@ def build_excited_state_replay_structures(
     properties_list: dict[str, list[Any]],
     h5_path: str,
     current_h5_id: int,
+    sampler_config: dict[str, Any] | None = None,
 ) -> list[MoleculesObject]:
     manifest = build_replay_manifest(
         h5_path=h5_path,
@@ -498,7 +519,11 @@ def build_excited_state_replay_structures(
         rng = np.random.default_rng(seed_value)
         source_kind = _choose_source(manifest, source_priority)
         if source_kind == "h5":
-            atoms, source_meta = _sample_h5_frame(manifest["h5_groups"], rng)
+            atoms, source_meta = _sample_h5_frame(
+                manifest["h5_groups"],
+                rng,
+                sampler_config=sampler_config,
+            )
         else:
             if source_priority.strip().lower() == "seed_all_once":
                 frame_idx = _seed_all_once_frame_index(manifest["seed"], str(moleculeid))
@@ -506,6 +531,13 @@ def build_excited_state_replay_structures(
             else:
                 atoms, source_meta = _sample_seed_frame(manifest["seed"], rng)
 
+        if topology_enabled(sampler_config):
+            ensure_topology_atom_ids(
+                atoms,
+                sampler_config,
+                load_fixed_topology(sampler_config),
+                allow_inference=True,
+            )
         molecule = MoleculesObject(atoms, str(moleculeid))
         excited_state = select_excited_state(
             moleculeid=str(moleculeid),
@@ -542,6 +574,7 @@ def excited_state_replay_builder_task(
     moleculeid=None,
     moleculeids=None,
     builder_config=None,
+    sampler_config=None,
     properties_list=None,
     h5_path=None,
     current_h5_id=0,
@@ -553,6 +586,7 @@ def excited_state_replay_builder_task(
         properties_list=dict(properties_list or {}),
         h5_path=str(h5_path),
         current_h5_id=int(current_h5_id),
+        sampler_config=dict(sampler_config or {}),
     )
     if moleculeids is None:
         return outputs[0]
@@ -564,6 +598,7 @@ def excited_state_replay_builder_gpu_task(
     moleculeid=None,
     moleculeids=None,
     builder_config=None,
+    sampler_config=None,
     properties_list=None,
     h5_path=None,
     current_h5_id=0,
@@ -575,6 +610,7 @@ def excited_state_replay_builder_gpu_task(
         properties_list=dict(properties_list or {}),
         h5_path=str(h5_path),
         current_h5_id=int(current_h5_id),
+        sampler_config=dict(sampler_config or {}),
     )
     if moleculeids is None:
         return outputs[0]

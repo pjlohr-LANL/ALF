@@ -29,6 +29,10 @@ gpu_dynamics_requirements = [
     "nvalchemi-toolkit>=0.1.0",
 ]
 
+topology_requirements = [
+    "rdkit",
+]
+
 setuptools.setup(
     name="alf",
     version="0.0.1",
@@ -40,6 +44,7 @@ setuptools.setup(
         "docs": doc_requirements,
         "full": full_requirements,
         "gpu_dynamics": gpu_dynamics_requirements,
+        "topology": topology_requirements,
     },
     license="BSD 3-Clause License",
     classifiers=[

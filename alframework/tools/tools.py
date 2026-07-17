@@ -7,6 +7,14 @@ from ase.geometry import complete_cell
 from ase import Atoms
 from alframework.tools import pyanitools as pyt
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.molecular_topology import (
+    H5_TOPOLOGY_ATOM_IDS_KEY,
+    load_fixed_topology,
+    topology_metadata,
+    topology_atom_id_array,
+    topology_enabled,
+    validate_fixed_topology,
+)
 import inspect
 
 def annealing_schedule(t, tmax, amp, per, srt, end):
@@ -103,7 +111,7 @@ def random_rotation_matrix(deflection=1.0, randnums=None):
     return M
 
 
-def store_current_data(h5path, system_data, properties):
+def store_current_data(h5path, system_data, properties, sampler_config=None):
     """Stores the key results of the QM calculations in the database.
 
     Args:
@@ -135,10 +143,24 @@ def store_current_data(h5path, system_data, properties):
         if system.check_convergence():
             saved_number += 1
             atom_index = np.argsort(cur_atoms.get_atomic_numbers())
+            topology_ids = None
+            atom_id_array = topology_atom_id_array(sampler_config)
+            if cur_atoms.has(atom_id_array):
+                topology_ids = np.asarray(cur_atoms.get_array(atom_id_array), dtype=np.int64)[atom_index]
+            elif topology_enabled(sampler_config):
+                raise ValueError(
+                    "Cannot save topology-enabled data without atom ID array {!r}.".format(atom_id_array)
+                )
             # If there is already a molecule with the same formula, append
             if molkey in data_dict:
                 data_dict[molkey]["_id"].append(cur_moliculeid)
                 data_dict[molkey]["coordinates"].append(cur_atoms.get_positions()[atom_index])
+                if topology_ids is not None:
+                    if H5_TOPOLOGY_ATOM_IDS_KEY not in data_dict[molkey]:
+                        raise ValueError("Topology atom IDs are missing from earlier systems in the same HDF5 group.")
+                    data_dict[molkey][H5_TOPOLOGY_ATOM_IDS_KEY].append(topology_ids)
+                elif H5_TOPOLOGY_ATOM_IDS_KEY in data_dict[molkey]:
+                    raise ValueError("Topology atom IDs are missing from a later system in the same HDF5 group.")
                 if any(cur_atoms.get_pbc()):
                     data_dict[molkey]["cell"].append(complete_cell(cur_atoms.get_cell()))
                 for prop in properties:
@@ -154,6 +176,8 @@ def store_current_data(h5path, system_data, properties):
                 data_dict[molkey]["species"] = np.array(cur_atoms.get_chemical_symbols())[atom_index]
                 data_dict[molkey]["_id"] = [cur_moliculeid]
                 data_dict[molkey]["coordinates"] = [cur_atoms.get_positions()[atom_index]]
+                if topology_ids is not None:
+                    data_dict[molkey][H5_TOPOLOGY_ATOM_IDS_KEY] = [topology_ids]
                 if any(cur_atoms.get_pbc()):
                     data_dict[molkey]["cell"] = [complete_cell(cur_atoms.get_cell())]
                 for prop in properties.keys():
@@ -209,6 +233,7 @@ def _dataset_screening_options(sampler_config):
     return {
         "force": bool(screen_config.get("force", True)),
         "min_distance": bool(screen_config.get("min_distance", True)),
+        "topology": bool(screen_config.get("topology", False)),
         "max_force_cutoff": float(sampler_config.get("max_force_cutoff", 10.0)),
         "min_distance_cutoff": float(sampler_config.get("min_distance_cutoff", 0.3)),
     }
@@ -226,10 +251,15 @@ def _force_property_keys(properties, results):
     return keys
 
 
-def dataset_screening_metrics(system, properties):
+def dataset_screening_metrics(system, properties, sampler_config=None):
     atoms = system.get_atoms()
     results = system.get_results()
-    metrics = {"max_force_norm": None, "min_distance": None}
+    metrics = {
+        "max_force_norm": None,
+        "min_distance": None,
+        "topology_valid": True,
+        "topology_reject_reason": None,
+    }
 
     force_maxima = []
     for force_key in _force_property_keys(properties, results):
@@ -251,6 +281,15 @@ def dataset_screening_metrics(system, properties):
     elif atoms is not None:
         metrics["min_distance"] = np.inf
 
+    if atoms is not None and topology_enabled(sampler_config):
+        topology_result = validate_fixed_topology(
+            atoms,
+            sampler_config,
+            load_fixed_topology(sampler_config),
+            assign_missing_ids=False,
+        )
+        metrics.update(topology_metadata(topology_result))
+
     return metrics
 
 
@@ -263,6 +302,7 @@ def filter_dataset_screening(system_data, properties, sampler_config):
         "kept": 0,
         "rejected_force": 0,
         "rejected_min_distance": 0,
+        "rejected_topology": 0,
         "max_force_cutoff": options["max_force_cutoff"],
         "min_distance_cutoff": options["min_distance_cutoff"],
     }
@@ -276,7 +316,7 @@ def filter_dataset_screening(system_data, properties, sampler_config):
             kept.append(system)
             continue
 
-        metrics = dataset_screening_metrics(system, properties)
+        metrics = dataset_screening_metrics(system, properties, sampler_config)
         reject_force = (
             options["force"]
             and metrics["max_force_norm"] is not None
@@ -287,12 +327,15 @@ def filter_dataset_screening(system_data, properties, sampler_config):
             and metrics["min_distance"] is not None
             and metrics["min_distance"] < options["min_distance_cutoff"]
         )
+        reject_topology = options["topology"] and not bool(metrics.get("topology_valid", True))
 
         if reject_force:
             summary["rejected_force"] += 1
         if reject_distance:
             summary["rejected_min_distance"] += 1
-        if not reject_force and not reject_distance:
+        if reject_topology:
+            summary["rejected_topology"] += 1
+        if not reject_force and not reject_distance and not reject_topology:
             kept.append(system)
 
     summary["kept"] = len(kept)
@@ -307,6 +350,7 @@ def print_dataset_screening_summary(summary):
     print("Kept results: {:d}".format(int(summary["kept"])))
     print("Rejected by force: {:d}".format(int(summary["rejected_force"])))
     print("Rejected by min distance: {:d}".format(int(summary["rejected_min_distance"])))
+    print("Rejected by topology: {:d}".format(int(summary["rejected_topology"])))
     print("Max force cutoff: {:.6g}".format(float(summary["max_force_cutoff"])))
     print("Min distance cutoff: {:.6g}".format(float(summary["min_distance_cutoff"])))
 
