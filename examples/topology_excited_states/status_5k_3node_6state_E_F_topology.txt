@@ -1,0 +1,10 @@
+{
+  "current_training_id": 7,
+  "current_model_id": 5,
+  "current_h5_id": 7,
+  "current_molecule_id": 100,
+  "lifetime_failed_builder_tasks": 0,
+  "lifetime_failed_sampler_tasks": 0,
+  "lifetime_failed_ML_tasks": 0,
+  "lifetime_failed_QM_tasks": 0
+}

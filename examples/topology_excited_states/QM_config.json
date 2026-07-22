@@ -1,0 +1,12 @@
+{
+  "method": "AM1",
+  "scf_eps": 1.0e-10,
+  "cis_tol": 1.0e-8,
+  "batch_size": 1,
+  "pyseqm_batch_size": 16,
+  "accept_prelabeled": false,
+  "max_solve_time_seconds": 60,
+  "capture_pyseqm_logs": true,
+  "pyseqm_log_dir": "pyseqm_logs",
+  "energy_offset_eV": -1391.451136550848
+}

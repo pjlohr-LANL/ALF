@@ -1,0 +1,11 @@
+{
+  "seed_dataset_dir": "/vast/home/pjlohr/github/ALF/production/6_states_EF_300_2_nodes_topology/seed_dataset_scaled",
+  "source_priority": "seed_all_once",
+  "seed_file_names": {
+    "R": "4990_topology_scale_R.npy",
+    "Z": "4990_topology_scale_Z.npy"
+  },
+  "state_selection": {
+    "mode": "cyclic"
+  }
+}

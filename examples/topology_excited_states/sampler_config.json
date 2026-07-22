@@ -1,0 +1,108 @@
+{
+  "dynamics_backend": "alchemi_baoab",
+  "alchemi_baoab": {
+    "batch_size": 50,
+    "allow_partial_batches": false,
+    "strict_gpu": true,
+    "allow_cpu_debug": false,
+    "scalar_sync_policy": "control_only",
+    "require_same_selected_state": true,
+    "batched_gap_switch_policy": "global_lowest_gap_trigger"
+  },
+  "timing": {
+    "enabled": true,
+    "cuda_events": true,
+    "record_chunk_timings": false
+  },
+  "dt": 0.1,
+  "maxt": 2.0,
+  "Ncheck": 10,
+  "min_time": 0.1,
+  "friction": 0.1,
+  "srt_temp": [300.0, 300.0],
+  "end_temp": [300.0, 300.0],
+  "amp_temp": [0, 0],
+  "per_temp": [1.0, 1.0],
+  "amp_dens": null,
+  "per_dens": null,
+  "end_dens": null,
+  "meta_dir": "sampling/",
+  "metadata_format": "pickle",
+  "trajectory_frequency": 0.0,
+  "trajectory_interval": 1,
+  "write_traj_binary": false,
+  "write_traj_xyz": false,
+  "write_qm_candidate_xyz": true,
+  "qm_candidate_xyz_dir": "sampling/qm_candidates",
+  "return_top_n": 500,
+  "translate_to_center": false,
+  "energy_offset_eV": -1391.451136550848,
+  "min_distance_cutoff": 0.7,
+  "max_force_cutoff": 16.0,
+  "topology_check": {
+    "enabled": true,
+    "name": "acetylacetone_keto",
+    "reference_conformer_path": "../keto_form_coords.xyz",
+    "reference_format": "auto",
+    "reference_charge": 0,
+    "atom_id_array": "alf_topology_atom_id",
+    "bond_window_mode": "scale",
+    "bond_min_scale": 0.85,
+    "bond_max_scale": 1.50,
+    "nonbonded_min_scale": 1.40,
+    "connectivity_scale": 1.25,
+    "check_every_ncheck": true
+  },
+  "dataset_screening": {
+    "enabled": true,
+    "force": true,
+    "min_distance": true,
+    "topology": true
+  },
+  "max_nearest_neighbor_distance_check": false,
+  "max_nearest_neighbor_distance_cutoff": 3.0,
+  "state_selection": {
+    "mode": "cyclic"
+  },
+  "uncertainty": {
+    "enabled": true,
+    "min_uE": 0.001,
+    "min_uF": 0.01,
+    "logic": "either"
+  },
+  "udd": {
+    "enabled": false,
+    "mode": "gap_std_bias",
+    "target": "initial_min_gap_pair",
+    "tau_mode": "force_relative",
+    "bias_weight": 5.0,
+    "tau_relative": 0.05,
+    "tau_history_steps": 100,
+    "tau_update_interval": 100,
+    "tau_min": 0.0,
+    "tau_max": 10.0,
+    "tau_force_epsilon": 1.0e-12
+  },
+  "gap_seeking": {
+    "enabled": false,
+    "mode": "levine_coe_martinez_switch",
+    "trigger_gap_threshold_eV": 0.001,
+    "candidate_pairs": "adjacent",
+    "switch_policy": "stay_fixed",
+    "sigma": 3.5,
+    "alpha_eV": 0.05,
+    "switch_check_interval": 10
+  },
+  "score": {
+    "w_energy": 1.0,
+    "w_force": 0.1,
+    "w_gap": 0.0,
+    "w_gap_uncertainty": 0.0,
+    "gap_uncertainty_target": "udd_target",
+    "gap_threshold_eV": 0.001,
+    "gap_mode": "inverse",
+    "gap_inverse_eps_eV": 1e-6,
+    "uncertainty_scope": "selected_state",
+    "uncertainty_aggregate": "rms"
+  }
+}

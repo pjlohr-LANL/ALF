@@ -1,0 +1,51 @@
+{
+  "n_models": 4,
+  "coordinates_key": "coordinates",
+  "species_key": "species",
+  "cell_key": null,
+  "train_forces": true,
+  "network_choice": 1,
+  "n_atoms": 15,
+  "network_params": {
+    "possible_species": [0, 1, 6, 8],
+    "dist_hard_max": 11.833504244685173,
+    "dist_soft_max": 5.67638290906325,
+    "dist_soft_min": 0.7,
+    "l_max": 3,
+    "learning_rate": 0.0005,
+    "n_atom_layers": 3,
+    "n_features": 75,
+    "n_interaction_layers": 2,
+    "n_max": 4,
+    "n_sensitivities": 63
+  },
+  "energy_weight": 1.0,
+  "force_weight": 1.0,
+  "gap_targets": {
+    "enabled": false,
+    "mode": "head",
+    "pairs": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5]],
+    "weight": 1.0
+  },
+  "l2_weight": 2.0e-5,
+  "valid_size": 0.1,
+  "test_size": 0.1,
+  "learning_rate": 0.0005,
+  "batch_size": 64,
+  "eval_batch_size": 256,
+  "max_epochs": 200,
+  "termination_patience": 50,
+  "plot_frequency": 100,
+  "scheduler_options": {
+    "max_batch_size": 256,
+    "patience": 16,
+    "factor": 0.5
+  },
+  "device_string": "from_multiprocessing",
+  "exports": {
+    "pdf": true,
+    "png": true,
+    "csv": true,
+    "output_subdir": "plots"
+  }
+}
