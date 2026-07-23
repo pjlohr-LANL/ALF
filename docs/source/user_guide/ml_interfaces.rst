@@ -219,6 +219,31 @@ same exact atomic-number sequence. ``n_atoms`` and
 ``network_params.possible_species`` may be omitted and inferred, or supplied
 and validated.
 
+The excited-state trainer also accepts production HIPPYNN's four optional
+cleaning controls:
+
+.. code-block:: json
+
+   {
+     "remove_high_energy_cut": null,
+     "remove_high_energy_std": null,
+     "remove_high_forces_cut": null,
+     "remove_high_forces_std": null
+   }
+
+Filtering occurs before train/validation/test splitting. Structures below
+``network_params.dist_soft_min`` are removed first. Static cuts compare each
+energy or individual force component with that property's current mean.
+Standard-deviation cuts use the corresponding centered, sample-standardized
+deviation; any failing force component removes the whole structure. For
+multiple states, ALF unions all static-cut failures on one common survivor set,
+then recomputes statistics and unions all standard-deviation failures. This
+makes filtering independent of state order. The resulting mask is applied to
+coordinates, species, every state energy and force, derived gaps, and indices.
+Each model's ``training_log.txt`` and ``training_summary.json`` record initial,
+per-property, per-rule, and final counts. Training fails early with split
+counts if too few structures survive.
+
 Current physical and workflow limits are intentional:
 
 * Training is nonperiodic, so ``cell_key`` must be null.

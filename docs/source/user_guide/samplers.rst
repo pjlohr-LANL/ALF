@@ -254,6 +254,39 @@ ranges and adds the following fields:
      }
    }
 
+Fixed-topology gating is separately opt-in:
+
+.. code-block:: json
+
+   {
+     "topology_check": {
+       "enabled": true,
+       "reference_conformer_path": "reference.xyz",
+       "reference_format": "auto",
+       "reference_charge": 0,
+       "bond_min_scale": 0.70,
+       "bond_max_scale": 1.35,
+       "connectivity_scale": 1.25
+     }
+   }
+
+The reference path is resolved relative to ALF's ``master_directory``. RDKit
+reads XYZ, MOL, or SDF coordinates and determines one fixed reference
+connectivity; bond orders are ignored. Every input replica must have the exact
+reference atomic-number sequence and atom order. A valid geometry keeps every
+reference bond inside its inclusive scaled reference-length window and keeps
+every non-reference atom pair above
+``connectivity_scale * (r_cov,i + r_cov,j)``.
+
+Topology is checked before the initial legacy MD step and again before every
+``Ncheck`` uncertainty evaluation. A violation freezes only that replica and
+discards the violating frame before uncertainty qualification, top-K ranking,
+gap switching, or QM submission. Earlier valid continued-sampling candidates
+remain eligible. ``distcut`` remains an independent close-contact check.
+Candidate metadata records the reference content hash, bond/connectivity
+metrics, and final task rejection summary. Disable this option for reactive
+workflows intended to change connectivity.
+
 Calculator backends
 ~~~~~~~~~~~~~~~~~~~
 

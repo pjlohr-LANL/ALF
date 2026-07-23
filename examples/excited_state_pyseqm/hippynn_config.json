@@ -20,6 +20,10 @@
   "energy_weight": 1.0,
   "force_weight": 1.0,
   "l2_weight": 2.0e-5,
+  "remove_high_energy_cut": null,
+  "remove_high_energy_std": null,
+  "remove_high_forces_cut": null,
+  "remove_high_forces_std": null,
   "gap_targets": {
     "enabled": true,
     "pairs": [[0, 1]],

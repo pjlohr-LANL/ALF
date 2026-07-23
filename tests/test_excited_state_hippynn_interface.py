@@ -69,6 +69,23 @@ def _write_group(
                 group.create_dataset(key, data=value)
 
 
+def _filter_arrays(count=10, with_gap=True):
+    coordinates = np.zeros((count, 2, 3), dtype=np.float32)
+    coordinates[:, 1, 0] = 1.0
+    arrays = {
+        "coordinates": coordinates,
+        "species": np.tile(np.asarray([[1, 1]], dtype=np.int64), (count, 1)),
+        "sE0": np.zeros(count, dtype=np.float32),
+        "F0": np.zeros((count, 2, 3), dtype=np.float32),
+        "sE1": np.zeros(count, dtype=np.float32),
+        "F1": np.zeros((count, 2, 3), dtype=np.float32),
+        "indices": np.arange(count, dtype=np.int64),
+    }
+    if with_gap:
+        arrays["dE01"] = arrays["sE1"] - arrays["sE0"]
+    return arrays
+
+
 def test_explicit_h5_loader_reads_two_states_and_small_molecules(tmp_path):
     shard = tmp_path / "data-0000.h5"
     _write_group(shard, "HO", count=4)
@@ -222,6 +239,218 @@ def test_explicit_h5_loader_validates_configured_shape_and_species(tmp_path):
         )
 
 
+def test_multistate_filter_unions_state_outliers_and_aligns_all_arrays():
+    arrays = _filter_arrays()
+    arrays["sE1"][8] = 10.0
+    arrays["F0"][9, 0, 2] = 10.0
+    arrays["dE01"] = arrays["sE1"] - arrays["sE0"]
+    state_table = ml.validate_excited_state_training_properties(
+        _properties(with_gap=True)
+    )
+
+    filtered, summary = ml.filter_excited_state_training_arrays(
+        arrays,
+        state_table,
+        coordinates_key="coordinates",
+        dist_soft_min=0.5,
+        remove_high_energy_cut=5.0,
+        remove_high_forces_cut=5.0,
+    )
+
+    assert filtered["indices"].tolist() == list(range(8))
+    np.testing.assert_allclose(
+        filtered["dE01"],
+        filtered["sE1"] - filtered["sE0"],
+    )
+    assert summary["removed_static_cut_union"] == 2
+    assert summary["removed_standard_deviation_union"] == 0
+    assert summary["per_state_failures"]["0"]["forces"]["static_cut"] == 1
+    assert summary["per_state_failures"]["1"]["energy"]["static_cut"] == 1
+    assert summary["final_structures"] == 8
+
+
+def test_multistate_filter_is_state_order_independent():
+    arrays = _filter_arrays()
+    arrays["sE0"][7] = 10.0
+    arrays["F1"][8, 1, 0] = 10.0
+    state_table = ml.validate_excited_state_training_properties(_properties())
+
+    forward, _ = ml.filter_excited_state_training_arrays(
+        arrays,
+        state_table,
+        coordinates_key="coordinates",
+        dist_soft_min=0.5,
+        remove_high_energy_cut=5.0,
+        remove_high_forces_cut=5.0,
+    )
+    reverse, _ = ml.filter_excited_state_training_arrays(
+        arrays,
+        list(reversed(state_table)),
+        coordinates_key="coordinates",
+        dist_soft_min=0.5,
+        remove_high_energy_cut=5.0,
+        remove_high_forces_cut=5.0,
+    )
+
+    np.testing.assert_array_equal(forward["indices"], reverse["indices"])
+
+
+def test_multistate_filter_removes_minimum_distance_before_statistics():
+    arrays = _filter_arrays()
+    arrays["coordinates"][0, 1, 0] = 0.4
+    arrays["sE1"][0] = 1000.0
+    state_table = ml.validate_excited_state_training_properties(_properties())
+
+    filtered, summary = ml.filter_excited_state_training_arrays(
+        arrays,
+        state_table,
+        coordinates_key="coordinates",
+        dist_soft_min=0.5,
+        remove_high_energy_std=2.0,
+    )
+
+    assert filtered["indices"].tolist() == list(range(1, 10))
+    assert summary["removed_min_distance"] == 1
+    assert summary["removed_standard_deviation_union"] == 0
+
+
+def test_multistate_filter_unions_standardized_energy_and_force_outliers():
+    arrays = _filter_arrays()
+    arrays["sE1"][8] = 10.0
+    arrays["F0"][9, 0, 2] = 10.0
+    state_table = ml.validate_excited_state_training_properties(_properties())
+
+    filtered, summary = ml.filter_excited_state_training_arrays(
+        arrays,
+        state_table,
+        coordinates_key="coordinates",
+        dist_soft_min=0.5,
+        remove_high_energy_std=2.0,
+        remove_high_forces_std=2.0,
+    )
+
+    assert filtered["indices"].tolist() == list(range(8))
+    assert summary["removed_standard_deviation_union"] == 2
+    assert (
+        summary["per_state_failures"]["0"]["forces"][
+            "standard_deviation"
+        ]
+        == 1
+    )
+    assert (
+        summary["per_state_failures"]["1"]["energy"][
+            "standard_deviation"
+        ]
+        == 1
+    )
+
+
+def test_multistate_filter_handles_zero_variance_and_disabled_outlier_filters():
+    arrays = _filter_arrays()
+    state_table = ml.validate_excited_state_training_properties(_properties())
+
+    filtered, summary = ml.filter_excited_state_training_arrays(
+        arrays,
+        state_table,
+        coordinates_key="coordinates",
+        dist_soft_min=0.0,
+        remove_high_energy_std=2.0,
+        remove_high_forces_std=2.0,
+    )
+
+    assert filtered["indices"].tolist() == list(range(10))
+    assert summary["final_structures"] == 10
+
+
+def test_disabled_outlier_filters_retain_large_finite_values():
+    arrays = _filter_arrays()
+    arrays["sE1"][8] = 1000.0
+    arrays["F0"][9, 0, 0] = 1000.0
+    state_table = ml.validate_excited_state_training_properties(_properties())
+
+    filtered, summary = ml.filter_excited_state_training_arrays(
+        arrays,
+        state_table,
+        coordinates_key="coordinates",
+        dist_soft_min=0.0,
+    )
+
+    assert filtered["indices"].tolist() == list(range(10))
+    assert summary["removed_static_cut_union"] == 0
+    assert summary["removed_standard_deviation_union"] == 0
+
+
+def test_single_state_filter_matches_production_hippynn():
+    torch = pytest.importorskip("torch")
+    database_module = pytest.importorskip("hippynn.databases.database")
+    Database = database_module.Database
+    arrays = _filter_arrays(with_gap=False)
+    arrays = {
+        key: value
+        for key, value in arrays.items()
+        if key not in {"sE1", "F1"}
+    }
+    arrays["F0"][7, 0, 0] = 8.0
+    arrays["F0"][8, 0, 1] = 3.0
+    arrays["sE0"][9] = 8.0
+    properties = {
+        "sE0": ["sE0", "system", 1.0],
+        "F0": ["F0", "atomic", 1.0],
+    }
+    state_table = ml.validate_excited_state_training_properties(properties)
+    filtered, _ = ml.filter_excited_state_training_arrays(
+        arrays,
+        state_table,
+        coordinates_key="coordinates",
+        dist_soft_min=0.5,
+        remove_high_energy_cut=4.0,
+        remove_high_energy_std=2.0,
+        remove_high_forces_cut=4.0,
+        remove_high_forces_std=2.0,
+    )
+
+    production_arrays = {
+        key: torch.as_tensor(value) for key, value in arrays.items()
+    }
+    production_arrays["sE0"] = production_arrays["sE0"].reshape(-1, 1)
+    production = Database(
+        production_arrays,
+        inputs=["species", "coordinates"],
+        targets=["sE0", "F0"],
+        seed=7,
+        quiet=True,
+    )
+    production.remove_high_property(
+        "F0",
+        True,
+        species_key="species",
+        cut=4.0,
+        std_factor=2.0,
+    )
+    production.remove_high_property(
+        "sE0",
+        False,
+        species_key="species",
+        cut=4.0,
+        std_factor=2.0,
+    )
+
+    np.testing.assert_array_equal(
+        filtered["indices"],
+        production.arr_dict["indices"].cpu().numpy(),
+    )
+
+
+@pytest.mark.parametrize("count", [0, 2, 4])
+def test_filtered_split_capacity_rejects_insufficient_survivors(count):
+    with pytest.raises(ValueError, match="too few structures"):
+        ml.validate_filtered_split_capacity(
+            count,
+            test_size=0.2,
+            valid_size=0.2,
+        )
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
@@ -232,6 +461,8 @@ def test_explicit_h5_loader_validates_configured_shape_and_species(tmp_path):
         ({"optimizer": "SGD"}, "AdamW"),
         ({"gap_targets": {"enabled": True}}, "gap targets"),
         ({"exports": {"csv": True}}, "CSV"),
+        ({"remove_high_energy_cut": -1.0}, "remove_high_energy_cut"),
+        ({"remove_high_forces_std": np.inf}, "remove_high_forces_std"),
     ],
 )
 def test_training_config_rejects_unsupported_features(override, message):

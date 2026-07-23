@@ -70,6 +70,12 @@ gap values against the corresponding state-energy differences. This trainer
 is nonperiodic, requires forces for every state, and rejects independent gap
 heads and CSV export.
 
+The four `remove_high_energy_*` and `remove_high_forces_*` fields reuse
+production ALF's optional training-set cleaning behavior across every state.
+The minimum-distance filter uses `network_params.dist_soft_min`. Multi-state
+outliers are removed as a state-order-independent union, and the same mask is
+applied to every energy, force, and derived-gap array before data splitting.
+
 Model ensemble members—not electronic states—are distributed among the GPUs
 visible to `alf_ML_executor`. Every completed model predicts every trained
 state. The sampler's `selected_state` chooses which one of those predicted

@@ -176,6 +176,17 @@ def validate_excited_state_training_config(
             raise ValueError(f"{key} must be finite and nonnegative.")
     if float(config.get("learning_rate", 5.0e-4)) <= 0:
         raise ValueError("learning_rate must be positive.")
+    for key in (
+        "remove_high_energy_cut",
+        "remove_high_energy_std",
+        "remove_high_forces_cut",
+        "remove_high_forces_std",
+    ):
+        if config.get(key) is None:
+            continue
+        value = float(config[key])
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{key} must be finite and nonnegative or null.")
 
     return state_table
 
@@ -508,6 +519,296 @@ def load_excited_state_h5_arrays(
     return arrays, summary
 
 
+def _minimum_structure_distances(coordinates: np.ndarray) -> np.ndarray:
+    """Return the shortest nonperiodic pair distance in every structure."""
+
+    count, atom_count, _ = coordinates.shape
+    if atom_count < 2:
+        return np.full(count, np.inf, dtype=np.float64)
+    minima = np.full(count, np.inf, dtype=np.float64)
+    for first in range(atom_count - 1):
+        distances = np.linalg.norm(
+            coordinates[:, first + 1 :, :]
+            - coordinates[:, first : first + 1, :],
+            axis=-1,
+        )
+        minima = np.minimum(minima, np.min(distances, axis=1))
+    return minima
+
+
+def _property_outlier_mask(
+    values: np.ndarray,
+    active: np.ndarray,
+    threshold: float | None,
+    *,
+    standardized: bool,
+) -> np.ndarray:
+    """Apply production HIPPYNN's centered componentwise outlier formula."""
+
+    failures = np.zeros(active.shape, dtype=bool)
+    if threshold is None or not np.any(active):
+        return failures
+    selected = np.asarray(values, dtype=np.float64)[active]
+    mean = float(np.mean(selected))
+    if standardized:
+        flattened = selected.reshape(-1)
+        if flattened.size < 2:
+            return failures
+        deviation_scale = float(np.std(flattened, ddof=1))
+        if not np.isfinite(deviation_scale) or deviation_scale == 0.0:
+            return failures
+        element_failures = (
+            np.abs(selected - mean) / deviation_scale > float(threshold)
+        )
+    else:
+        element_failures = np.abs(selected - mean) > float(threshold)
+    structure_failures = np.any(
+        element_failures.reshape(selected.shape[0], -1),
+        axis=1,
+    )
+    failures[np.flatnonzero(active)] = structure_failures
+    return failures
+
+
+def _mask_training_arrays(
+    arrays: dict[str, np.ndarray],
+    keep: np.ndarray,
+) -> dict[str, np.ndarray]:
+    count = int(keep.shape[0])
+    filtered: dict[str, np.ndarray] = {}
+    for key, value in arrays.items():
+        array = np.asarray(value)
+        if array.shape[0] != count:
+            raise ValueError(
+                f"Training array {key!r} has {array.shape[0]} structures; "
+                f"expected {count}."
+            )
+        filtered[key] = array[keep]
+    return filtered
+
+
+def filter_excited_state_training_arrays(
+    arrays: dict[str, np.ndarray],
+    state_table: list[dict[str, Any]],
+    *,
+    coordinates_key: str,
+    dist_soft_min: float,
+    remove_high_energy_cut: float | None = None,
+    remove_high_energy_std: float | None = None,
+    remove_high_forces_cut: float | None = None,
+    remove_high_forces_std: float | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Filter fixed-composition multi-state arrays before data splitting.
+
+    Multi-state masks are computed from a common survivor pool and unioned,
+    making the result independent of state order. The one-state path preserves
+    production's force-then-energy cut/std sequence exactly.
+    """
+
+    coordinates = np.asarray(arrays[coordinates_key], dtype=np.float64)
+    if coordinates.ndim != 3 or coordinates.shape[-1] != 3:
+        raise ValueError(
+            f"{coordinates_key} must have shape [structures, atoms, 3]."
+        )
+    count = int(coordinates.shape[0])
+    minimum_distance = float(dist_soft_min)
+    if not np.isfinite(minimum_distance) or minimum_distance < 0:
+        raise ValueError("network_params.dist_soft_min must be nonnegative.")
+    options = {
+        "remove_high_energy_cut": remove_high_energy_cut,
+        "remove_high_energy_std": remove_high_energy_std,
+        "remove_high_forces_cut": remove_high_forces_cut,
+        "remove_high_forces_std": remove_high_forces_std,
+    }
+    for key, value in options.items():
+        if value is not None and (
+            not np.isfinite(float(value)) or float(value) < 0
+        ):
+            raise ValueError(f"{key} must be finite and nonnegative or null.")
+
+    active = _minimum_structure_distances(coordinates) > minimum_distance
+    summary: dict[str, Any] = {
+        "initial_structures": count,
+        "dist_soft_min": minimum_distance,
+        "removed_min_distance": int(count - np.count_nonzero(active)),
+        "static_cut_failures": {},
+        "standard_deviation_failures": {},
+    }
+    energy_names = [
+        str(row["energy_db_name"]) for row in state_table
+    ]
+    force_names = [
+        str(row["force_db_name"]) for row in state_table
+    ]
+    removed_static = 0
+    removed_standardized = 0
+
+    def apply_one(
+        property_name: str,
+        threshold: float | None,
+        *,
+        standardized: bool,
+        summary_key: str,
+    ) -> None:
+        nonlocal active, removed_static, removed_standardized
+        failures = _property_outlier_mask(
+            arrays[property_name],
+            active,
+            threshold,
+            standardized=standardized,
+        )
+        failure_count = int(np.count_nonzero(failures))
+        summary[summary_key][property_name] = failure_count
+        if standardized:
+            removed_standardized += failure_count
+        else:
+            removed_static += failure_count
+        active &= ~failures
+
+    if len(state_table) == 1:
+        # Production ground-state HIPPYNN filters force cut/std first, then
+        # energy cut/std, recomputing statistics after every removal.
+        apply_one(
+            force_names[0],
+            remove_high_forces_cut,
+            standardized=False,
+            summary_key="static_cut_failures",
+        )
+        apply_one(
+            force_names[0],
+            remove_high_forces_std,
+            standardized=True,
+            summary_key="standard_deviation_failures",
+        )
+        apply_one(
+            energy_names[0],
+            remove_high_energy_cut,
+            standardized=False,
+            summary_key="static_cut_failures",
+        )
+        apply_one(
+            energy_names[0],
+            remove_high_energy_std,
+            standardized=True,
+            summary_key="standard_deviation_failures",
+        )
+    else:
+        static_failures = np.zeros(count, dtype=bool)
+        for property_name, threshold in (
+            *(
+                (name, remove_high_forces_cut)
+                for name in force_names
+            ),
+            *(
+                (name, remove_high_energy_cut)
+                for name in energy_names
+            ),
+        ):
+            failures = _property_outlier_mask(
+                arrays[property_name],
+                active,
+                threshold,
+                standardized=False,
+            )
+            summary["static_cut_failures"][property_name] = int(
+                np.count_nonzero(failures)
+            )
+            static_failures |= failures
+        removed_static = int(
+            np.count_nonzero(static_failures & active)
+        )
+        active &= ~static_failures
+
+        standard_failures = np.zeros(count, dtype=bool)
+        for property_name, threshold in (
+            *(
+                (name, remove_high_forces_std)
+                for name in force_names
+            ),
+            *(
+                (name, remove_high_energy_std)
+                for name in energy_names
+            ),
+        ):
+            failures = _property_outlier_mask(
+                arrays[property_name],
+                active,
+                threshold,
+                standardized=True,
+            )
+            summary["standard_deviation_failures"][property_name] = int(
+                np.count_nonzero(failures)
+            )
+            standard_failures |= failures
+        removed_standardized = int(
+            np.count_nonzero(standard_failures & active)
+        )
+        active &= ~standard_failures
+
+    summary["removed_static_cut_union"] = int(removed_static)
+    summary["removed_standard_deviation_union"] = int(
+        removed_standardized
+    )
+    summary["final_structures"] = int(np.count_nonzero(active))
+    summary["per_state_failures"] = {
+        str(int(row["state"])): {
+            "energy": {
+                "static_cut": int(
+                    summary["static_cut_failures"].get(
+                        str(row["energy_db_name"]),
+                        0,
+                    )
+                ),
+                "standard_deviation": int(
+                    summary["standard_deviation_failures"].get(
+                        str(row["energy_db_name"]),
+                        0,
+                    )
+                ),
+            },
+            "forces": {
+                "static_cut": int(
+                    summary["static_cut_failures"].get(
+                        str(row["force_db_name"]),
+                        0,
+                    )
+                ),
+                "standard_deviation": int(
+                    summary["standard_deviation_failures"].get(
+                        str(row["force_db_name"]),
+                        0,
+                    )
+                ),
+            },
+        }
+        for row in state_table
+    }
+    filtered = _mask_training_arrays(arrays, active)
+    return filtered, summary
+
+
+def validate_filtered_split_capacity(
+    structure_count: int,
+    *,
+    test_size: float,
+    valid_size: float,
+) -> None:
+    """Fail before HIPPYNN attempts to create an empty data split."""
+
+    count = int(structure_count)
+    test_count = int(float(test_size) * count)
+    remaining = count - test_count
+    adjusted_valid = float(valid_size) / (1.0 - float(test_size))
+    valid_count = int(adjusted_valid * remaining)
+    train_count = remaining - valid_count
+    if min(test_count, valid_count, train_count) < 1:
+        raise ValueError(
+            "Excited-state filtering left too few structures for nonempty "
+            f"train/valid/test splits: {count} survivors produce "
+            f"train={train_count}, valid={valid_count}, test={test_count}."
+        )
+
+
 def compose_excited_state_loss(
     energy_error_terms: list[tuple[Any, Any]],
     force_error_terms: list[tuple[Any, Any]],
@@ -802,6 +1103,33 @@ def train_single_excited_state_model(
         ),
         configured_possible_species=configured_species,
     )
+    if "dist_soft_min" not in network_params:
+        raise ValueError(
+            "network_params.dist_soft_min is required for production-style "
+            "excited-state training filtering."
+        )
+    arrays, filtering_summary = filter_excited_state_training_arrays(
+        arrays,
+        state_table,
+        coordinates_key=coordinates_key,
+        dist_soft_min=float(network_params["dist_soft_min"]),
+        remove_high_energy_cut=config.get("remove_high_energy_cut"),
+        remove_high_energy_std=config.get("remove_high_energy_std"),
+        remove_high_forces_cut=config.get("remove_high_forces_cut"),
+        remove_high_forces_std=config.get("remove_high_forces_std"),
+    )
+    validate_filtered_split_capacity(
+        int(arrays[coordinates_key].shape[0]),
+        test_size=float(config.get("test_size", 0.1)),
+        valid_size=float(config.get("valid_size", 0.1)),
+    )
+    data_summary["n_structures_before_filtering"] = int(
+        data_summary["n_structures"]
+    )
+    data_summary["n_structures"] = int(
+        arrays[coordinates_key].shape[0]
+    )
+    data_summary["filtering"] = filtering_summary
     network_params["possible_species"] = data_summary["possible_species"]
     n_atoms = int(data_summary["n_atoms"])
 
@@ -818,6 +1146,8 @@ def train_single_excited_state_model(
             print(f"Model seed: {seed}")
             print(f"CUDA_VISIBLE_DEVICES: {recorded_device}")
             print(f"Training device: {device}")
+            print("Training filters:")
+            print(json.dumps(filtering_summary, indent=2))
 
             species_node = inputs.SpeciesNode(db_name=species_key)
             positions_node = inputs.PositionsNode(db_name=coordinates_key)

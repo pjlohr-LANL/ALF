@@ -24,6 +24,7 @@ from alframework.samplers.alchemi_sampling import (
     uncertainty_flags,
 )
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.molecular_topology import ReferenceTopology
 from alframework.tools.tools import annealing_schedule
 from tests.helpers.fakes import FixedCalculator
 
@@ -34,6 +35,47 @@ def _molecule(molecule_id, distance=0.74, state=None):
     if state is not None:
         molecule.update_metadata({"selected_state": state})
     return molecule
+
+
+def _topology_molecule(molecule_id, positions=None, state=None):
+    if positions is None:
+        positions = [
+            [0.0, 0.0, 0.0],
+            [1.5, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ]
+    molecule = MoleculesObject(Atoms("CCC", positions=positions), molecule_id)
+    if state is not None:
+        molecule.update_metadata({"selected_state": state})
+    return molecule
+
+
+def _reference_topology():
+    return ReferenceTopology(
+        reference_path="/master/reference.mol",
+        reference_sha256="reference-hash",
+        reference_format="mol",
+        reference_charge=0,
+        atomic_numbers=(6, 6, 6),
+        bonds=((0, 1), (1, 2)),
+        bond_lengths=(1.5, 1.5),
+        bond_min_scale=0.70,
+        bond_max_scale=1.35,
+        connectivity_scale=1.25,
+    )
+
+
+def _enable_topology(config):
+    config["topology_check"] = {
+        "enabled": True,
+        "reference_conformer_path": "reference.mol",
+        "reference_format": "auto",
+        "reference_charge": 0,
+        "bond_min_scale": 0.70,
+        "bond_max_scale": 1.35,
+        "connectivity_scale": 1.25,
+    }
+    return config
 
 
 def _config(policy="stop", batch_size=2, return_top_n=2):
@@ -178,6 +220,21 @@ class FakeRunner:
     def sync_graph_to_atoms(self, graph_index, atoms):
         atoms.set_positions(self.positions[int(graph_index)])
         atoms.set_velocities(self.velocities[int(graph_index)])
+
+
+class TopologyMutationRunner(FakeRunner):
+    def sync_graph_to_atoms(self, graph_index, atoms):
+        updates = getattr(self.model, "position_updates", {})
+        positions = updates.get(
+            self.evaluation_index + 1,
+            {},
+        ).get(int(graph_index))
+        if positions is not None:
+            self.positions[int(graph_index)] = np.asarray(
+                positions,
+                dtype=float,
+            ).copy()
+        super().sync_graph_to_atoms(graph_index, atoms)
 
 
 def _torch_batch(torch, positions=None):
@@ -985,6 +1042,188 @@ def test_stop_mode_freezes_each_replica_at_its_first_uncertainty():
     assert outputs[0].get_metadata()["calculator_loader"] == "custom.ase_loader"
     assert created[0].friction_per_fs == pytest.approx(0.02 * units.fs)
     assert DEFAULT_FRICTION_PER_FS == pytest.approx(0.02 * units.fs)
+
+
+def test_topology_gate_freezes_initial_invalid_replica_before_dynamics(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        alchemi_module,
+        "load_reference_topology",
+        lambda *args, **kwargs: _reference_topology(),
+    )
+    model = FakeModel(
+        {
+            1: [{"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}],
+        }
+    )
+    config = _enable_topology(_config(policy="stop"))
+    invalid_positions = [
+        [0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+    ]
+
+    outputs = run_alchemi_sampling(
+        [
+            _topology_molecule("invalid", invalid_positions),
+            _topology_molecule("valid"),
+        ],
+        config,
+        model,
+        runner_factory=FakeRunner,
+        master_directory="/master",
+    )
+
+    runner = FakeRunner.last_instance
+    assert runner.nsteps == 1
+    assert runner.frozen == {0, 1}
+    assert [item.get_metadata()["parent_molecule_id"] for item in outputs] == [
+        "valid"
+    ]
+    metadata = outputs[0].get_metadata()
+    assert metadata["topology_valid"] is True
+    assert metadata["topology_reference_sha256"] == "reference-hash"
+    assert metadata["topology_rejected_replica_count"] == 1
+    assert metadata["topology_rejections"][0]["stage"] == "initial"
+
+
+def test_topology_gate_skips_dynamics_when_every_replica_is_invalid(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        alchemi_module,
+        "load_reference_topology",
+        lambda *args, **kwargs: _reference_topology(),
+    )
+    called = False
+
+    def factory(**kwargs):
+        nonlocal called
+        called = True
+        return FakeRunner(**kwargs)
+
+    invalid = [
+        [0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+    ]
+    outputs = run_alchemi_sampling(
+        [
+            _topology_molecule("first", invalid),
+            _topology_molecule("second", invalid),
+        ],
+        _enable_topology(_config(policy="stop")),
+        FakeModel({}),
+        runner_factory=factory,
+    )
+
+    assert outputs == []
+    assert called is False
+
+
+def test_topology_gate_rejects_frame_before_uncertainty_and_lcm(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        alchemi_module,
+        "load_reference_topology",
+        lambda *args, **kwargs: _reference_topology(),
+    )
+    triangle_height = np.sqrt(1.5**2 - 0.75**2)
+    model = FakeModel(
+        {
+            1: [
+                {
+                    "Es": 0.0,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "dE01": 0.2,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                }
+            ],
+        }
+    )
+    model.position_updates = {
+        0: {
+            0: [
+                [0.0, 0.0, 0.0],
+                [0.75, triangle_height, 0.0],
+                [1.5, 0.0, 0.0],
+            ]
+        }
+    }
+    config = _enable_topology(_config(policy="continue"))
+    _enable_gap_seeking(config)
+
+    outputs = run_alchemi_sampling(
+        [
+            _topology_molecule("rejected", state=0),
+            _topology_molecule("survivor", state=0),
+        ],
+        config,
+        model,
+        properties_list=_excited_properties_with_gap(),
+        runner_factory=TopologyMutationRunner,
+    )
+
+    runner = TopologyMutationRunner.last_instance
+    assert outputs == []
+    assert 0 in runner.frozen
+    assert runner.lcm_calls == []
+
+
+def test_topology_rejection_preserves_earlier_valid_top_k_candidate(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        alchemi_module,
+        "load_reference_topology",
+        lambda *args, **kwargs: _reference_topology(),
+    )
+    triangle_height = np.sqrt(1.5**2 - 0.75**2)
+    model = FakeModel(
+        {
+            0: [
+                {"Es": 3.0, "Fs": 0.0, "Fsmax": 0.0},
+            ],
+            1: [
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 4.0, "Fs": 0.0, "Fsmax": 0.0},
+            ],
+        }
+    )
+    model.position_updates = {
+        1: {
+            0: [
+                [0.0, 0.0, 0.0],
+                [0.75, triangle_height, 0.0],
+                [1.5, 0.0, 0.0],
+            ]
+        }
+    }
+
+    outputs = run_alchemi_sampling(
+        [_topology_molecule("first"), _topology_molecule("second")],
+        _enable_topology(
+            _config(policy="continue", return_top_n=2)
+        ),
+        model,
+        runner_factory=TopologyMutationRunner,
+    )
+
+    assert [
+        item.get_metadata()["parent_molecule_id"] for item in outputs
+    ] == ["second", "first"]
+    assert [
+        item.get_metadata()["uncertainty_score"] for item in outputs
+    ] == [4.0, 3.0]
+    for item in outputs:
+        metadata = item.get_metadata()
+        assert metadata["topology_rejected_replica_count"] == 1
+        assert metadata["topology_rejections"][0]["batch_index"] == 0
+        assert metadata["topology_rejections"][0]["stage"] == "ncheck"
 
 
 def test_temperature_schedule_matches_legacy_timing_per_replica(monkeypatch):

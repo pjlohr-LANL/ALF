@@ -23,6 +23,12 @@ from alframework.tools.excited_state_tools import (
     parse_gap_key,
 )
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.molecular_topology import (
+    TopologyValidationResult,
+    load_reference_topology,
+    topology_metadata,
+    validate_fixed_topology,
+)
 from alframework.tools.sampler_batching import (
     sampler_batch_size,
     selected_state,
@@ -632,6 +638,7 @@ def run_alchemi_sampling(
     properties_list: dict[str, Any] | None = None,
     device: Any = None,
     runner_factory: Callable[..., Any] | None = None,
+    master_directory: str | None = None,
 ) -> list[MoleculesObject]:
     """Run one strict-full ALCHEMI batch using stop or continue selection."""
 
@@ -697,6 +704,54 @@ def run_alchemi_sampling(
     if sampler_config.get("translate_to_center", False):
         for atoms in atoms_list:
             atoms.set_positions(atoms.get_positions() - atoms.get_center_of_mass())
+    reference_topology = load_reference_topology(
+        sampler_config,
+        master_directory=master_directory,
+    )
+    topology_results: list[TopologyValidationResult] = [
+        validate_fixed_topology(atoms, reference_topology)
+        for atoms in atoms_list
+    ]
+    identity_failures = [
+        index
+        for index, result in enumerate(topology_results)
+        if result.reason == "topology_identity"
+    ]
+    if identity_failures:
+        first = identity_failures[0]
+        violation = topology_results[first].violations[0]
+        raise ValueError(
+            "ALCHEMI topology checking requires the exact reference atom "
+            f"order. Replica {first} has atomic numbers "
+            f"{violation['actual_atomic_numbers']}, expected "
+            f"{violation['expected_atomic_numbers']}."
+        )
+    active = np.asarray(
+        [result.valid for result in topology_results],
+        dtype=bool,
+    )
+    topology_rejections: list[dict[str, Any]] = [
+        {
+            "parent_molecule_id": molecule_objects[index].get_moleculeid(),
+            "batch_index": int(index),
+            "stage": "initial",
+            "step": 0,
+            "time_ps": 0.0,
+            "reason": result.reason,
+            "violations": [
+                dict(violation) for violation in result.violations
+            ],
+        }
+        for index, result in enumerate(topology_results)
+        if not result.valid
+    ]
+    if reference_topology is not None and not np.any(active):
+        print(
+            "ALCHEMI topology summary: "
+            f"{len(topology_rejections)} initial replica(s) rejected; "
+            "dynamics and uncertainty evaluation skipped."
+        )
+        return []
     temperature_parameters = _temperature_parameters(
         sampler_config,
         count=len(molecule_objects),
@@ -726,7 +781,10 @@ def run_alchemi_sampling(
         device=device,
     )
 
-    active = np.ones(len(molecule_objects), dtype=bool)
+    for index, result in enumerate(topology_results):
+        if result.valid:
+            continue
+        runner.freeze_graph(index)
     temperature_histories: list[list[float]] = [[] for _ in molecule_objects]
     gap_seeking_states: list[dict[str, Any]] = []
     for _ in molecule_objects:
@@ -752,16 +810,47 @@ def run_alchemi_sampling(
     n_outer = int(np.ceil((1000.0 * maxt) / (dt * ncheck)))
     # Preserve molecular MLMD's legacy clock: advance once, then label the
     # first uncertainty check and thermostat update as time zero.
-    runner.run(1)
+    if np.any(active):
+        runner.run(1)
     for iteration in range(n_outer):
         if not np.any(active):
             break
         time_ps = float(iteration * ncheck * dt / 1000.0)
+        for batch_index in np.where(active)[0]:
+            index = int(batch_index)
+            runner.sync_graph_to_atoms(index, atoms_list[index])
+            topology_result = validate_fixed_topology(
+                atoms_list[index],
+                reference_topology,
+            )
+            topology_results[index] = topology_result
+            if not topology_result.valid:
+                active[index] = False
+                runner.freeze_graph(index)
+                topology_rejections.append(
+                    {
+                        "parent_molecule_id": (
+                            molecule_objects[index].get_moleculeid()
+                        ),
+                        "batch_index": index,
+                        "stage": "ncheck",
+                        "step": int(runner.nsteps),
+                        "time_ps": float(time_ps),
+                        "reason": topology_result.reason,
+                        "violations": [
+                            dict(violation)
+                            for violation in topology_result.violations
+                        ],
+                    }
+                )
+                continue
+        if not np.any(active):
+            break
         runner.evaluate()
         diagnostics_by_index: dict[int, dict[str, Any]] = {}
         for batch_index in np.where(active)[0]:
             index = int(batch_index)
-            runner.sync_graph_to_atoms(index, atoms_list[index])
+            topology_result = topology_results[index]
             diagnostics = dict(runner.diagnostics_for_graph(index))
             diagnostics_by_index[index] = diagnostics
             flags = uncertainty_flags(
@@ -794,6 +883,8 @@ def run_alchemi_sampling(
                 selected_state_value=selected_state_value,
                 gap_seeking_state=gap_seeking_states[index],
             )
+            if reference_topology is not None:
+                record.update(topology_metadata(topology_result))
             candidates.append(
                 {
                     "record": record,
@@ -883,6 +974,22 @@ def run_alchemi_sampling(
         candidates = candidates[:return_top_n]
 
     outputs: list[MoleculesObject] = []
+    topology_summary = (
+        {
+            "topology_rejected_replica_count": len(topology_rejections),
+            "topology_rejections": [
+                dict(rejection) for rejection in topology_rejections
+            ],
+        }
+        if reference_topology is not None
+        else {}
+    )
+    if reference_topology is not None and not candidates:
+        print(
+            "ALCHEMI topology summary: "
+            f"{len(topology_rejections)} replica(s) rejected; "
+            "no valid uncertainty candidates returned."
+        )
     for rank, candidate in enumerate(candidates):
         parent_id = str(candidate["record"]["parent_molecule_id"])
         molecule = MoleculesObject(candidate["atoms"], f"{parent_id}-cand-{rank:04d}")
@@ -900,6 +1007,7 @@ def run_alchemi_sampling(
                 "calculator_loader": str(
                     getattr(model, "calculator_loader", type(model).__name__)
                 ),
+                **topology_summary,
                 **(
                     {"sampler_device": str(device)}
                     if device is not None
@@ -2130,6 +2238,7 @@ def alchemi_sampling_task(
     gpus_per_node,
     ML_config,
     properties_list,
+    master_directory=None,
 ):
     """Parsl task for strict-full batched ALCHEMI sampling."""
 
@@ -2172,11 +2281,14 @@ def alchemi_sampling_task(
         properties_list=properties_list,
         device=device,
     )
+    run_options = {"device": device}
+    if master_directory is not None:
+        run_options["master_directory"] = master_directory
     outputs = run_alchemi_sampling(
         molecule_objects,
         sampler_config,
         model,
-        device=device,
+        **run_options,
     )
     for molecule in outputs:
         molecule.update_metadata(

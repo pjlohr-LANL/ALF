@@ -91,6 +91,18 @@ the same calculator interface but may require their own separately installed
 dependencies. Existing ALF ASE calculators can use the compatibility fallback
 without becoming native batched models.
 
+ALCHEMI topology checking
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install RDKit for the optional fixed-topology sampler gate with:
+
+.. code-block:: bash
+
+   python -m pip install -e ".[topology]"
+
+RDKit is imported only when ``topology_check.enabled`` is true, so ordinary
+ALF samplers and ALCHEMI runs without topology gating do not require it.
+
 PySEQM excited-state labeling
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
