@@ -17,7 +17,11 @@ from ase import Atoms, units
 from ase.calculators.calculator import Calculator, all_changes
 from parsl import python_app
 
-from alframework.tools.excited_state_tools import derive_state_property_table
+from alframework.tools.excited_state_tools import (
+    derive_gap_property_table,
+    derive_state_property_table,
+    parse_gap_key,
+)
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.sampler_batching import (
     sampler_batch_size,
@@ -183,6 +187,298 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def configured_gap_diagnostics(
+    sampler_config: dict[str, Any],
+    properties_list: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return configured direct-gap diagnostics without loading a backend."""
+
+    raw = sampler_config.get("gap_diagnostics")
+    if raw is None:
+        return []
+    if isinstance(raw, bool):
+        enabled = raw
+    elif isinstance(raw, dict):
+        enabled = bool(raw.get("enabled", False))
+        unknown = sorted(set(raw) - {"enabled"})
+        if unknown:
+            raise ValueError(
+                "Unknown gap_diagnostics options: " + ", ".join(unknown)
+            )
+    else:
+        raise TypeError("gap_diagnostics must be a Boolean or dictionary.")
+    if not enabled:
+        return []
+    if (
+        str(sampler_config.get("model_mode", "ground_state")).strip().lower()
+        != "excited_state"
+    ):
+        raise ValueError(
+            "gap_diagnostics requires model_mode='excited_state'."
+        )
+    if properties_list is None:
+        raise ValueError(
+            "gap_diagnostics requires properties_list so state-gap pairs can "
+            "be validated."
+        )
+    rows = derive_gap_property_table(properties_list)
+    if not rows:
+        raise ValueError(
+            "gap_diagnostics.enabled=true requires at least one dE# system "
+            "property in properties_list."
+        )
+    return rows
+
+
+def configured_gap_seeking(
+    sampler_config: dict[str, Any],
+    properties_list: dict[str, Any] | None,
+    selected_state_value: int | None,
+) -> dict[str, Any]:
+    """Validate one-way, selected-adjacent LCM gap seeking."""
+
+    raw = sampler_config.get("gap_seeking")
+    if raw is None:
+        return {"enabled": False, "rows": []}
+    if not isinstance(raw, dict):
+        raise TypeError("gap_seeking must be a dictionary.")
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return {"enabled": False, "rows": []}
+
+    allowed = {
+        "enabled",
+        "mode",
+        "switch_policy",
+        "candidate_pairs",
+        "trigger_gap_threshold_eV",
+        "sigma",
+        "alpha_eV",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            "Unknown gap_seeking options: " + ", ".join(unknown)
+        )
+    if (
+        str(sampler_config.get("model_mode", "ground_state")).strip().lower()
+        != "excited_state"
+    ):
+        raise ValueError(
+            "gap_seeking requires model_mode='excited_state'."
+        )
+    mode = str(raw.get("mode", "")).strip().lower()
+    if mode != "levine_coe_martinez_switch":
+        raise ValueError(
+            "gap_seeking.mode must be 'levine_coe_martinez_switch'."
+        )
+    switch_policy = str(raw.get("switch_policy", "")).strip().lower()
+    if switch_policy != "stay_fixed":
+        raise ValueError(
+            "gap_seeking.switch_policy must be 'stay_fixed'; hysteresis and "
+            "LCM exit are not supported."
+        )
+    candidate_pairs = str(raw.get("candidate_pairs", "")).strip().lower()
+    if candidate_pairs != "adjacent":
+        raise ValueError(
+            "gap_seeking.candidate_pairs must be 'adjacent'."
+        )
+    required_parameters = (
+        "trigger_gap_threshold_eV",
+        "sigma",
+        "alpha_eV",
+    )
+    missing = [name for name in required_parameters if name not in raw]
+    if missing:
+        raise ValueError(
+            "Enabled gap_seeking requires explicit values for: "
+            + ", ".join(missing)
+        )
+    parameters: dict[str, float] = {}
+    for name in required_parameters:
+        try:
+            value = float(raw[name])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"gap_seeking.{name} must be finite and positive."
+            ) from exc
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"gap_seeking.{name} must be finite and positive."
+            )
+        parameters[name] = value
+    if properties_list is None:
+        raise ValueError(
+            "gap_seeking requires properties_list so eligible dE# pairs can "
+            "be validated."
+        )
+    if selected_state_value is None:
+        raise ValueError(
+            "gap_seeking requires a resolved selected state for the batch."
+        )
+
+    selected = int(selected_state_value)
+    rows = [
+        dict(row)
+        for row in derive_gap_property_table(properties_list)
+        if int(row["upper_state"]) == int(row["lower_state"]) + 1
+        and selected in {
+            int(row["lower_state"]),
+            int(row["upper_state"]),
+        }
+    ]
+    rows.sort(
+        key=lambda row: (
+            int(row["lower_state"]),
+            int(row["upper_state"]),
+        )
+    )
+    if not rows:
+        raise ValueError(
+            "gap_seeking found no explicitly configured adjacent dE# property "
+            f"containing selected state {selected}."
+        )
+    state_rows = {
+        int(row["state"]): row
+        for row in derive_state_property_table(properties_list)
+    }
+    required_force_states = sorted(
+        {
+            int(state)
+            for row in rows
+            for state in (row["lower_state"], row["upper_state"])
+        }
+    )
+    missing_force_keys = [
+        f"F{state}"
+        for state in required_force_states
+        if state_rows[state]["force_key"] is None
+    ]
+    if missing_force_keys:
+        raise ValueError(
+            "gap_seeking requires force properties for every eligible LCM "
+            "state; missing " + ", ".join(missing_force_keys) + "."
+        )
+    return {
+        "enabled": True,
+        "mode": mode,
+        "switch_policy": switch_policy,
+        "candidate_pairs": candidate_pairs,
+        "selected_state": selected,
+        "rows": rows,
+        **parameters,
+    }
+
+
+def configured_alchemi_gap_rows(
+    sampler_config: dict[str, Any],
+    properties_list: dict[str, Any] | None,
+    selected_state_value: int | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return the union of diagnostic and dynamics-required gap rows."""
+
+    diagnostic_rows = configured_gap_diagnostics(
+        sampler_config,
+        properties_list,
+    )
+    seeking = configured_gap_seeking(
+        sampler_config,
+        properties_list,
+        selected_state_value,
+    )
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for row in [*diagnostic_rows, *seeking["rows"]]:
+        pair = (int(row["lower_state"]), int(row["upper_state"]))
+        if pair not in seen:
+            seen.add(pair)
+            rows.append(dict(row))
+    return rows, seeking
+
+
+def select_gap_seeking_trigger(
+    diagnostics: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Select the deterministic, minimum-absolute eligible gap crossing."""
+
+    if not bool(settings.get("enabled", False)):
+        return None
+    candidates = []
+    for row in settings["rows"]:
+        gap_key = str(row["gap_key"])
+        if gap_key not in diagnostics:
+            raise KeyError(
+                f"gap_seeking requires calculator diagnostic {gap_key!r}."
+            )
+        gap = float(diagnostics[gap_key])
+        if not np.isfinite(gap):
+            raise ValueError(
+                f"gap_seeking received nonfinite diagnostic {gap_key}={gap!r}."
+            )
+        candidates.append(
+            {
+                "pair": [
+                    int(row["lower_state"]),
+                    int(row["upper_state"]),
+                ],
+                "gap_key": gap_key,
+                "gap_eV": gap,
+                "abs_gap_eV": abs(gap),
+            }
+        )
+    trigger = min(
+        candidates,
+        key=lambda item: (
+            float(item["abs_gap_eV"]),
+            int(item["pair"][0]),
+            int(item["pair"][1]),
+        ),
+    )
+    if float(trigger["abs_gap_eV"]) > float(
+        settings["trigger_gap_threshold_eV"]
+    ):
+        return None
+    return trigger
+
+
+def _gap_candidate_metadata(
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    means: dict[str, float] = {}
+    stdevs: dict[str, float] = {}
+    pairs: dict[str, list[int]] = {}
+    model_counts: dict[str, int] = {}
+    for key, value in diagnostics.items():
+        pair = parse_gap_key(str(key))
+        if pair is None:
+            continue
+        gap_key = str(key)
+        std_key = f"{gap_key}_stdev"
+        if std_key not in diagnostics:
+            raise ValueError(
+                f"Gap diagnostic {gap_key!r} is missing {std_key!r}."
+            )
+        means[gap_key] = float(value)
+        stdevs[gap_key] = float(diagnostics[std_key])
+        pairs[gap_key] = [int(pair[0]), int(pair[1])]
+        count_key = f"{gap_key}_model_count"
+        if count_key in diagnostics:
+            model_counts[gap_key] = int(diagnostics[count_key])
+    if not means:
+        return {}
+    minimum_key = min(means, key=lambda key: (abs(means[key]), key))
+    return {
+        "gap_means": means,
+        "gap_stds": stdevs,
+        "gap_pairs": pairs,
+        "gap_model_counts": model_counts,
+        "minimum_abs_gap": abs(means[minimum_key]),
+        "minimum_abs_gap_key": minimum_key,
+        "minimum_abs_gap_pair": pairs[minimum_key],
+    }
+
+
 def _validate_sampling_inputs(
     molecule_objects: list[MoleculesObject],
     sampler_config: dict[str, Any],
@@ -237,6 +533,12 @@ def _validate_sampling_inputs(
                 f"Selected states {unavailable_states} are not present in "
                 f"properties_list; available states are {sorted(available_states)}."
             )
+    if properties_list is not None:
+        configured_alchemi_gap_rows(
+            sampler_config,
+            properties_list,
+            next(iter(states)) if states else None,
+        )
 
     for density_key in ("end_dens", "amp_dens", "per_dens"):
         if sampler_config.get(density_key) is not None:
@@ -261,7 +563,40 @@ def _candidate_record(
     temperature_parameters: dict[str, float],
     temperature_history: list[float],
     selected_state_value: int | None,
+    gap_seeking_state: dict[str, Any],
 ) -> dict[str, Any]:
+    seeking_metadata = {
+        "gap_seeking_enabled": bool(gap_seeking_state["enabled"]),
+        "gap_seeking_current_mode": str(
+            gap_seeking_state["current_mode"]
+        ),
+        "gap_seeking_switched": bool(gap_seeking_state["switched"]),
+        "gap_seeking_pair": gap_seeking_state["pair"],
+        "gap_seeking_trigger_gap_eV": gap_seeking_state[
+            "trigger_gap_eV"
+        ],
+        "gap_seeking_trigger_step": gap_seeking_state["trigger_step"],
+        "gap_seeking_trigger_time_ps": gap_seeking_state[
+            "trigger_time_ps"
+        ],
+        "gap_seeking_switch_events": [
+            dict(event) for event in gap_seeking_state["events"]
+        ],
+    }
+    if gap_seeking_state["enabled"]:
+        seeking_metadata.update(
+            {
+                "gap_seeking_mode": str(gap_seeking_state["mode"]),
+                "gap_seeking_switch_policy": "stay_fixed",
+                "gap_seeking_trigger_gap_threshold_eV": float(
+                    gap_seeking_state["trigger_gap_threshold_eV"]
+                ),
+                "gap_seeking_sigma": float(gap_seeking_state["sigma"]),
+                "gap_seeking_alpha_eV": float(
+                    gap_seeking_state["alpha_eV"]
+                ),
+            }
+        )
     return {
         "parent_molecule_id": molecule.get_moleculeid(),
         "batch_index": int(batch_index),
@@ -283,6 +618,8 @@ def _candidate_record(
         "distcut": float(sampler_config.get("distcut", 1.2)),
         "selected_state": selected_state_value,
         "temps": [float(value) for value in temperature_history],
+        **seeking_metadata,
+        **_gap_candidate_metadata(diagnostics),
         **temperature_parameters,
     }
 
@@ -292,12 +629,57 @@ def run_alchemi_sampling(
     sampler_config: dict[str, Any],
     model: Any,
     *,
+    properties_list: dict[str, Any] | None = None,
     device: Any = None,
     runner_factory: Callable[..., Any] | None = None,
 ) -> list[MoleculesObject]:
     """Run one strict-full ALCHEMI batch using stop or continue selection."""
 
-    mode, selected_state_value = _validate_sampling_inputs(molecule_objects, sampler_config)
+    raw_gap_options = sampler_config.get("gap_diagnostics")
+    diagnostics_enabled = (
+        bool(raw_gap_options.get("enabled", False))
+        if isinstance(raw_gap_options, dict)
+        else bool(raw_gap_options)
+    )
+    raw_seeking_options = sampler_config.get("gap_seeking")
+    seeking_enabled = bool(
+        raw_seeking_options.get("enabled", False)
+    ) if isinstance(raw_seeking_options, dict) else False
+    if (
+        (diagnostics_enabled or seeking_enabled)
+        and properties_list is None
+        and not getattr(model, "gap_rows", None)
+    ):
+        raise ValueError(
+            "Gap diagnostics or gap seeking requires properties_list or a "
+            "calculator loaded with validated gap rows."
+        )
+    mode, selected_state_value = _validate_sampling_inputs(
+        molecule_objects,
+        sampler_config,
+        properties_list,
+    )
+    if properties_list is not None:
+        _, gap_seeking_settings = configured_alchemi_gap_rows(
+            sampler_config,
+            properties_list,
+            selected_state_value,
+        )
+    else:
+        gap_seeking_settings = dict(
+            getattr(
+                model,
+                "gap_seeking_settings",
+                {"enabled": False, "rows": []},
+            )
+        )
+        if seeking_enabled and not bool(
+            gap_seeking_settings.get("enabled", False)
+        ):
+            raise ValueError(
+                "gap_seeking requires properties_list or a calculator loaded "
+                "with validated gap-seeking settings."
+            )
     policy = str(sampler_config.get("uncertainty_policy", "stop")).strip().lower()
     backend = dict(sampler_config["alchemi_baoab"])
     random_seed = int(backend.get("random_seed", 42))
@@ -346,6 +728,26 @@ def run_alchemi_sampling(
 
     active = np.ones(len(molecule_objects), dtype=bool)
     temperature_histories: list[list[float]] = [[] for _ in molecule_objects]
+    gap_seeking_states: list[dict[str, Any]] = []
+    for _ in molecule_objects:
+        gap_seeking_states.append(
+            {
+                "enabled": bool(gap_seeking_settings.get("enabled", False)),
+                "mode": gap_seeking_settings.get("mode"),
+                "current_mode": "direct",
+                "switched": False,
+                "pair": None,
+                "trigger_gap_eV": None,
+                "trigger_step": None,
+                "trigger_time_ps": None,
+                "trigger_gap_threshold_eV": gap_seeking_settings.get(
+                    "trigger_gap_threshold_eV"
+                ),
+                "sigma": gap_seeking_settings.get("sigma"),
+                "alpha_eV": gap_seeking_settings.get("alpha_eV"),
+                "events": [],
+            }
+        )
     candidates: list[dict[str, Any]] = []
     n_outer = int(np.ceil((1000.0 * maxt) / (dt * ncheck)))
     # Preserve molecular MLMD's legacy clock: advance once, then label the
@@ -356,10 +758,12 @@ def run_alchemi_sampling(
             break
         time_ps = float(iteration * ncheck * dt / 1000.0)
         runner.evaluate()
+        diagnostics_by_index: dict[int, dict[str, Any]] = {}
         for batch_index in np.where(active)[0]:
             index = int(batch_index)
             runner.sync_graph_to_atoms(index, atoms_list[index])
             diagnostics = dict(runner.diagnostics_for_graph(index))
+            diagnostics_by_index[index] = diagnostics
             flags = uncertainty_flags(
                 diagnostics,
                 Escut=float(sampler_config["Escut"]),
@@ -388,6 +792,7 @@ def run_alchemi_sampling(
                 temperature_parameters=temperature_parameters[index],
                 temperature_history=temperature_histories[index],
                 selected_state_value=selected_state_value,
+                gap_seeking_state=gap_seeking_states[index],
             )
             candidates.append(
                 {
@@ -405,6 +810,51 @@ def run_alchemi_sampling(
 
         if not np.any(active):
             break
+        switched_this_check = False
+        if bool(gap_seeking_settings.get("enabled", False)):
+            for batch_index in np.where(active)[0]:
+                index = int(batch_index)
+                state = gap_seeking_states[index]
+                if state["switched"]:
+                    continue
+                trigger = select_gap_seeking_trigger(
+                    diagnostics_by_index[index],
+                    gap_seeking_settings,
+                )
+                if trigger is None:
+                    continue
+                runner.set_lcm_mode(
+                    index,
+                    pair=trigger["pair"],
+                    sigma=float(gap_seeking_settings["sigma"]),
+                    alpha_eV=float(gap_seeking_settings["alpha_eV"]),
+                )
+                state.update(
+                    {
+                        "current_mode": "lcm",
+                        "switched": True,
+                        "pair": list(trigger["pair"]),
+                        "trigger_gap_eV": float(trigger["gap_eV"]),
+                        "trigger_step": int(runner.nsteps),
+                        "trigger_time_ps": float(time_ps),
+                    }
+                )
+                state["events"].append(
+                    {
+                        "event": "enter_lcm",
+                        "step": int(runner.nsteps),
+                        "time_ps": float(time_ps),
+                        "pair": list(trigger["pair"]),
+                        "gap_key": str(trigger["gap_key"]),
+                        "gap_eV": float(trigger["gap_eV"]),
+                        "abs_gap_eV": float(trigger["abs_gap_eV"]),
+                    }
+                )
+                switched_this_check = True
+        if switched_this_check:
+            # NVTLangevin consumes the currently stored force at the start of
+            # its next step, so refresh the batch after changing graph modes.
+            runner.evaluate()
         target_temperatures = np.asarray(
             [
                 annealing_schedule(
@@ -476,6 +926,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             self,
             *,
             selected_state_value: int = 0,
+            gap_rows: list[dict[str, Any]] | None = None,
+            gap_seeking_settings: dict[str, Any] | None = None,
             well_params: dict[str, Any] | None = None,
             device: Any = None,
             model_config_template: Any = None,
@@ -484,6 +936,11 @@ if _ALCHEMI_IMPORT_ERROR is None:
         ) -> None:
             torch.nn.Module.__init__(self)
             self.selected_state_value = int(selected_state_value)
+            self.gap_rows = [dict(row) for row in (gap_rows or [])]
+            self.gap_seeking_settings = dict(
+                gap_seeking_settings or {"enabled": False, "rows": []}
+            )
+            self._lcm_controls: dict[int, dict[str, Any]] = {}
             self.well_params = None if well_params is None else dict(well_params)
             self._device = torch.device(device) if device is not None else None
             self.calculator_interface = str(calculator_interface)
@@ -523,6 +980,46 @@ if _ALCHEMI_IMPORT_ERROR is None:
             self._device = torch.device(device)
             self.to(self._device)
 
+        def set_lcm_mode(
+            self,
+            graph_index: int,
+            *,
+            pair: list[int] | tuple[int, int],
+            sigma: float,
+            alpha_eV: float,
+        ) -> None:
+            """Permanently switch one batch graph to its configured LCM pair."""
+
+            if not bool(self.gap_seeking_settings.get("enabled", False)):
+                raise RuntimeError(
+                    "Cannot enter LCM mode when gap_seeking is disabled."
+                )
+            index = int(graph_index)
+            if index < 0:
+                raise ValueError("LCM graph_index must be nonnegative.")
+            normalized_pair = (int(pair[0]), int(pair[1]))
+            allowed_pairs = {
+                (int(row["lower_state"]), int(row["upper_state"]))
+                for row in self.gap_seeking_settings["rows"]
+            }
+            if normalized_pair not in allowed_pairs:
+                raise ValueError(
+                    f"LCM pair {normalized_pair} is not eligible for selected "
+                    f"state {self.selected_state_value}."
+                )
+            control = {
+                "pair": normalized_pair,
+                "sigma": float(sigma),
+                "alpha_eV": float(alpha_eV),
+            }
+            existing = self._lcm_controls.get(index)
+            if existing is not None and existing != control:
+                raise RuntimeError(
+                    f"Graph {index} already entered stay-fixed LCM mode with "
+                    f"pair {existing['pair']}."
+                )
+            self._lcm_controls[index] = control
+
         @staticmethod
         def _batch_shape(batch) -> tuple[int, int]:
             counts = batch.num_nodes_per_graph
@@ -560,16 +1057,10 @@ if _ALCHEMI_IMPORT_ERROR is None:
             raise NotImplementedError
 
         @staticmethod
-        def _normalize_contributions(batch, energy_values, force_values):
+        def _normalize_energy_contributions(batch, energy_values):
             num_graphs = int(batch.num_graphs)
-            total_atoms = int(batch.positions.shape[0])
             energy = torch.as_tensor(
                 energy_values,
-                dtype=batch.positions.dtype,
-                device=batch.positions.device,
-            )
-            forces = torch.as_tensor(
-                force_values,
                 dtype=batch.positions.dtype,
                 device=batch.positions.device,
             )
@@ -579,6 +1070,22 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 )
             model_count = int(energy.shape[0])
             energy = energy.reshape(model_count, num_graphs, -1).sum(dim=2)
+            if model_count < 1:
+                raise ValueError("At least one calculator contribution is required.")
+            return energy
+
+        @staticmethod
+        def _normalize_contributions(batch, energy_values, force_values):
+            total_atoms = int(batch.positions.shape[0])
+            energy = ALFAlchemiCalculator._normalize_energy_contributions(
+                batch, energy_values
+            )
+            model_count = int(energy.shape[0])
+            forces = torch.as_tensor(
+                force_values,
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            )
             if forces.ndim < 3 or int(forces.shape[0]) != model_count:
                 raise ValueError(
                     "ALCHEMI force contributions must use the same model count as energies."
@@ -588,8 +1095,6 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     "ALCHEMI force contributions must have shape [models, total_atoms, 3]."
                 )
             forces = forces.reshape(model_count, total_atoms, 3)
-            if model_count < 1:
-                raise ValueError("At least one calculator contribution is required.")
             return energy, forces
 
         @staticmethod
@@ -615,6 +1120,33 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 "Fsmax": torch.amax(torch.abs(force_std_batched), dim=(1, 2)),
             }
 
+        @staticmethod
+        def _lcm_energy_forces(
+            lower_energy,
+            upper_energy,
+            lower_forces,
+            upper_forces,
+            *,
+            sigma: float,
+            alpha_eV: float,
+        ):
+            """Return the fork-compatible smooth LCM mean and analytic force."""
+
+            gap = upper_energy - lower_energy
+            smooth_abs_gap = torch.sqrt(gap * gap + 1.0e-12)
+            denominator = smooth_abs_gap + float(alpha_eV)
+            correction = float(sigma) * gap * gap / denominator
+            gap_derivative = float(sigma) * (
+                (2.0 * gap * denominator)
+                - (gap * gap * gap / smooth_abs_gap)
+            ) / (denominator * denominator)
+            energy = 0.5 * (lower_energy + upper_energy) + correction
+            forces = (
+                0.5 * (lower_forces + upper_forces)
+                + gap_derivative * (upper_forces - lower_forces)
+            )
+            return energy, forces
+
         def forward(self, batch):
             prediction = dict(self.ensemble_forward(batch))
             energy, forces = self._normalize_contributions(
@@ -624,7 +1156,12 @@ if _ALCHEMI_IMPORT_ERROR is None:
             )
             selected = self._reduce_contributions(batch, energy, forces)
             diagnostics: dict[str, Any] = {}
-            state_contributions = dict(prediction.get("state_contributions") or {})
+            state_contributions = {
+                int(state): values
+                for state, values in dict(
+                    prediction.get("state_contributions") or {}
+                ).items()
+            }
             state_contributions.setdefault(
                 self.selected_state_value,
                 {
@@ -632,6 +1169,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     "force_contributions": forces,
                 },
             )
+            state_results: dict[int, dict[str, Any]] = {}
             for state_value, values in state_contributions.items():
                 state_energy, state_forces = self._normalize_contributions(
                     batch,
@@ -642,12 +1180,73 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     batch, state_energy, state_forces
                 )
                 state = int(state_value)
+                state_results[state] = state_result
                 diagnostics[f"sE{state}"] = state_result["energy"]
                 diagnostics[f"sE{state}_stdev"] = state_result["energy_std"]
                 diagnostics[f"F{state}"] = state_result["forces"].reshape(
                     int(batch.num_graphs), -1, 3
                 )
                 diagnostics[f"F{state}_stdev"] = state_result["force_std"]
+
+            state_energy_contributions = {
+                int(state): values
+                for state, values in dict(
+                    prediction.get("state_energy_contributions") or {}
+                ).items()
+            }
+            for state_value, values in state_contributions.items():
+                state_energy_contributions.setdefault(
+                    int(state_value), values["energy_contributions"]
+                )
+            state_energy_contributions.setdefault(
+                self.selected_state_value, energy
+            )
+            selected_model_count = int(energy.shape[0])
+            for row in self.gap_rows:
+                lower = int(row["lower_state"])
+                upper = int(row["upper_state"])
+                missing_states = [
+                    state
+                    for state in (lower, upper)
+                    if state not in state_energy_contributions
+                ]
+                if missing_states:
+                    raise KeyError(
+                        f"Gap diagnostic {row['gap_key']} requires raw energy "
+                        f"contributions for states {missing_states}."
+                    )
+                lower_energy = self._normalize_energy_contributions(
+                    batch, state_energy_contributions[lower]
+                )
+                upper_energy = self._normalize_energy_contributions(
+                    batch, state_energy_contributions[upper]
+                )
+                if (
+                    int(lower_energy.shape[0]) != selected_model_count
+                    or int(upper_energy.shape[0]) != selected_model_count
+                ):
+                    raise ValueError(
+                        f"Gap diagnostic {row['gap_key']} requires the same "
+                        "ordered model members for both states and the selected "
+                        "dynamics ensemble."
+                    )
+                gap_members = upper_energy - lower_energy
+                gap_mean = torch.mean(gap_members, dim=0)
+                if selected_model_count == 1:
+                    gap_std = torch.zeros_like(gap_mean)
+                else:
+                    gap_std = torch.std(
+                        gap_members, dim=0, correction=0
+                    )
+                gap_key = str(row["gap_key"])
+                diagnostics[gap_key] = gap_mean
+                diagnostics[f"{gap_key}_stdev"] = gap_std
+                diagnostics[f"{gap_key}_model_count"] = torch.full(
+                    (int(batch.num_graphs),),
+                    selected_model_count,
+                    dtype=torch.long,
+                    device=batch.positions.device,
+                )
 
             uncertainty_override = prediction.get("uncertainty")
             if uncertainty_override is None:
@@ -669,8 +1268,43 @@ if _ALCHEMI_IMPORT_ERROR is None:
 
             num_graphs, num_atoms = self._batch_shape(batch)
             positions_batched = batch.positions.reshape(num_graphs, num_atoms, 3)
-            selected_energy = selected["energy"].reshape(num_graphs, 1)
-            selected_forces = selected["forces"].reshape(num_graphs, num_atoms, 3)
+            selected_energy = selected["energy"].reshape(num_graphs, 1).clone()
+            selected_forces = selected["forces"].reshape(
+                num_graphs, num_atoms, 3
+            ).clone()
+            for graph_index, control in sorted(self._lcm_controls.items()):
+                if graph_index >= num_graphs:
+                    raise IndexError(
+                        f"LCM graph index {graph_index} is outside batch size "
+                        f"{num_graphs}."
+                    )
+                lower, upper = control["pair"]
+                missing_states = [
+                    state
+                    for state in (lower, upper)
+                    if state not in state_results
+                ]
+                if missing_states:
+                    raise KeyError(
+                        f"LCM pair {(lower, upper)} requires raw energy and "
+                        f"force contributions for states {missing_states}."
+                    )
+                lower_result = state_results[lower]
+                upper_result = state_results[upper]
+                lcm_energy, lcm_forces = self._lcm_energy_forces(
+                    lower_result["energy"][graph_index],
+                    upper_result["energy"][graph_index],
+                    lower_result["forces"].reshape(
+                        num_graphs, num_atoms, 3
+                    )[graph_index],
+                    upper_result["forces"].reshape(
+                        num_graphs, num_atoms, 3
+                    )[graph_index],
+                    sigma=float(control["sigma"]),
+                    alpha_eV=float(control["alpha_eV"]),
+                )
+                selected_energy[graph_index, 0] = lcm_energy
+                selected_forces[graph_index] = lcm_forces
             well_energy, well_forces = self._well_energy_forces(
                 batch, positions_batched
             )
@@ -709,6 +1343,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             energy_key: str = "energy",
             force_key: str = "forces",
             selected_state_value: int = 0,
+            gap_rows: list[dict[str, Any]] | None = None,
+            gap_seeking_settings: dict[str, Any] | None = None,
             well_params: dict[str, Any] | None = None,
             device: Any = None,
             calculator_loader: str | None = None,
@@ -723,6 +1359,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 raise ValueError("Native ensemble members require incompatible batch inputs.")
             super().__init__(
                 selected_state_value=selected_state_value,
+                gap_rows=gap_rows,
+                gap_seeking_settings=gap_seeking_settings,
                 well_params=well_params,
                 device=device,
                 model_config_template=model_list[0].model_config,
@@ -744,6 +1382,15 @@ if _ALCHEMI_IMPORT_ERROR is None:
         def ensemble_forward(self, batch) -> dict[str, Any]:
             energies = []
             forces = []
+            required_lcm_states = {
+                int(state)
+                for row in self.gap_seeking_settings.get("rows", [])
+                for state in (row["lower_state"], row["upper_state"])
+            }
+            state_members = {
+                state: {"energy": [], "forces": []}
+                for state in sorted(required_lcm_states)
+            }
             for model in self.models:
                 output = model(batch)
                 if self.energy_key not in output or self.force_key not in output:
@@ -752,10 +1399,54 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     )
                 energies.append(output[self.energy_key])
                 forces.append(output[self.force_key])
-            return {
+                if required_lcm_states:
+                    raw_states = {
+                        int(state): values
+                        for state, values in dict(
+                            output.get("state_contributions") or {}
+                        ).items()
+                    }
+                    missing = sorted(required_lcm_states - set(raw_states))
+                    if missing:
+                        raise KeyError(
+                            "Native gap seeking requires state_contributions "
+                            f"with energy and force values for states {missing}."
+                        )
+                    for state in sorted(required_lcm_states):
+                        values = raw_states[state]
+                        energy_value = values.get(
+                            "energy",
+                            values.get("energy_contributions"),
+                        )
+                        force_value = values.get(
+                            "forces",
+                            values.get("force_contributions"),
+                        )
+                        if energy_value is None or force_value is None:
+                            raise KeyError(
+                                "Native gap-seeking state_contributions must "
+                                "provide energy/forces or "
+                                "energy_contributions/force_contributions."
+                            )
+                        state_members[state]["energy"].append(energy_value)
+                        state_members[state]["forces"].append(force_value)
+            prediction = {
                 "energy_contributions": torch.stack(energies, dim=0),
                 "force_contributions": torch.stack(forces, dim=0),
             }
+            if state_members:
+                prediction["state_contributions"] = {
+                    state: {
+                        "energy_contributions": torch.stack(
+                            values["energy"], dim=0
+                        ),
+                        "force_contributions": torch.stack(
+                            values["forces"], dim=0
+                        ),
+                    }
+                    for state, values in state_members.items()
+                }
+            return prediction
 
 
     class ALFASEAlchemiModel(ALFAlchemiCalculator):
@@ -767,6 +1458,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             *,
             model_mode: str,
             selected_state_value: int | None,
+            gap_rows: list[dict[str, Any]] | None = None,
+            gap_seeking_settings: dict[str, Any] | None = None,
             well_params: dict[str, Any] | None = None,
             device: Any = None,
             calculator_loader: str | None = None,
@@ -785,6 +1478,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             selected = 0 if selected_state_value is None else int(selected_state_value)
             super().__init__(
                 selected_state_value=selected,
+                gap_rows=gap_rows,
+                gap_seeking_settings=gap_seeking_settings,
                 well_params=well_params,
                 device=device,
                 calculator_interface="ase_fallback",
@@ -793,6 +1488,22 @@ if _ALCHEMI_IMPORT_ERROR is None:
             mode = str(model_mode).strip().lower()
             self.energy_key = "energy" if mode == "ground_state" else f"sE{selected}"
             self.force_key = "forces" if mode == "ground_state" else f"F{selected}"
+            gap_states = {
+                int(state)
+                for row in self.gap_rows
+                for state in (row["lower_state"], row["upper_state"])
+            }
+            self.gap_energy_keys = {
+                state: f"sE{state}" for state in sorted(gap_states)
+            }
+            lcm_states = {
+                int(state)
+                for row in self.gap_seeking_settings.get("rows", [])
+                for state in (row["lower_state"], row["upper_state"])
+            }
+            self.gap_force_keys = {
+                state: f"F{state}" for state in sorted(lcm_states)
+            }
             self.calculators = calculator_list
             self.uncertainty_mode = (
                 None if uncertainty_mode is None else str(uncertainty_mode).lower()
@@ -802,7 +1513,16 @@ if _ALCHEMI_IMPORT_ERROR is None:
             self._device = torch.device(device)
 
         def _evaluate_one(self, calculator, atoms):
-            requested = [self.energy_key, self.force_key]
+            requested = list(
+                dict.fromkeys(
+                    [
+                        self.energy_key,
+                        self.force_key,
+                        *self.gap_energy_keys.values(),
+                        *self.gap_force_keys.values(),
+                    ]
+                )
+            )
             standard_uncertainty = {
                 "energy_stdev",
                 "forces_stdev_mean",
@@ -817,7 +1537,15 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 properties=requested,
                 system_changes=all_changes,
             )
-            missing = [key for key in (self.energy_key, self.force_key) if key not in calculator.results]
+            required = [
+                self.energy_key,
+                self.force_key,
+                *self.gap_energy_keys.values(),
+                *self.gap_force_keys.values(),
+            ]
+            missing = [
+                key for key in required if key not in calculator.results
+            ]
             if missing:
                 raise KeyError(
                     "ASE fallback calculator did not provide required properties: "
@@ -825,6 +1553,14 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 )
             energy = float(np.asarray(calculator.results[self.energy_key]).sum())
             forces = np.asarray(calculator.results[self.force_key], dtype=float)
+            state_energies = {
+                state: float(np.asarray(calculator.results[key]).sum())
+                for state, key in self.gap_energy_keys.items()
+            }
+            state_forces = {
+                state: np.asarray(calculator.results[key], dtype=float)
+                for state, key in self.gap_force_keys.items()
+            }
             uncertainty = None
             if len(self.calculators) == 1:
                 if standard_uncertainty.issubset(calculator.results):
@@ -840,7 +1576,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
                         "Fs": float(force_mean),
                         "Fsmax": float(force_max),
                     }
-            return energy, forces, uncertainty
+            return energy, forces, uncertainty, state_energies, state_forces
 
         def ensemble_forward(self, batch) -> dict[str, Any]:
             num_graphs, num_atoms = self._batch_shape(batch)
@@ -852,6 +1588,14 @@ if _ALCHEMI_IMPORT_ERROR is None:
             )
             energy_members = [[] for _ in self.calculators]
             force_members = [[] for _ in self.calculators]
+            state_energy_members = {
+                state: [[] for _ in self.calculators]
+                for state in self.gap_energy_keys
+            }
+            state_force_members = {
+                state: [[] for _ in self.calculators]
+                for state in self.gap_force_keys
+            }
             uncertainty_rows = []
             for graph_index in range(num_graphs):
                 atoms = Atoms(
@@ -860,7 +1604,13 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 )
                 graph_uncertainty = None
                 for model_index, calculator in enumerate(self.calculators):
-                    energy, forces, uncertainty = self._evaluate_one(calculator, atoms)
+                    (
+                        energy,
+                        forces,
+                        uncertainty,
+                        state_energies,
+                        state_forces,
+                    ) = self._evaluate_one(calculator, atoms)
                     if forces.shape != (num_atoms, 3):
                         raise ValueError(
                             f"ASE fallback {self.force_key} must have shape "
@@ -868,6 +1618,19 @@ if _ALCHEMI_IMPORT_ERROR is None:
                         )
                     energy_members[model_index].append(energy)
                     force_members[model_index].append(forces)
+                    for state, state_energy in state_energies.items():
+                        state_energy_members[state][model_index].append(
+                            state_energy
+                        )
+                    for state, state_force in state_forces.items():
+                        if state_force.shape != (num_atoms, 3):
+                            raise ValueError(
+                                f"ASE fallback F{state} must have shape "
+                                f"({num_atoms}, 3)."
+                            )
+                        state_force_members[state][model_index].append(
+                            state_force
+                        )
                     if uncertainty is not None:
                         graph_uncertainty = uncertainty
                 uncertainty_rows.append(graph_uncertainty)
@@ -886,6 +1649,35 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     device=batch.positions.device,
                 ),
             }
+            if state_energy_members:
+                prediction["state_energy_contributions"] = {
+                    state: torch.as_tensor(
+                        values,
+                        dtype=batch.positions.dtype,
+                        device=batch.positions.device,
+                    )
+                    for state, values in state_energy_members.items()
+                }
+            if state_force_members:
+                prediction["state_contributions"] = {
+                    state: {
+                        "energy_contributions": torch.as_tensor(
+                            state_energy_members[state],
+                            dtype=batch.positions.dtype,
+                            device=batch.positions.device,
+                        ),
+                        "force_contributions": torch.as_tensor(
+                            np.asarray(values).reshape(
+                                len(self.calculators),
+                                num_graphs * num_atoms,
+                                3,
+                            ),
+                            dtype=batch.positions.dtype,
+                            device=batch.positions.device,
+                        ),
+                    }
+                    for state, values in state_force_members.items()
+                }
             if all(value is not None for value in uncertainty_rows):
                 prediction["uncertainty"] = {
                     key: [row[key] for row in uncertainty_rows]
@@ -903,6 +1695,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             ensemble_graph: Any,
             state_nodes: list[dict[str, Any]],
             selected_state_value: int,
+            gap_rows: list[dict[str, Any]] | None = None,
+            gap_seeking_settings: dict[str, Any] | None = None,
             species_key: str,
             coordinates_key: str,
             well_params: dict[str, Any] | None = None,
@@ -911,6 +1705,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
         ) -> None:
             super().__init__(
                 selected_state_value=selected_state_value,
+                gap_rows=gap_rows,
+                gap_seeking_settings=gap_seeking_settings,
                 well_params=well_params,
                 device=device,
                 calculator_interface="native",
@@ -1072,6 +1868,21 @@ if _ALCHEMI_IMPORT_ERROR is None:
         def diagnostics_for_graph(self, graph_index: int) -> dict[str, Any]:
             return self.model.diagnostics_for_graph(graph_index)
 
+        def set_lcm_mode(
+            self,
+            graph_index: int,
+            *,
+            pair: list[int] | tuple[int, int],
+            sigma: float,
+            alpha_eV: float,
+        ) -> None:
+            self.model.set_lcm_mode(
+                graph_index,
+                pair=pair,
+                sigma=sigma,
+                alpha_eV=alpha_eV,
+            )
+
         def freeze_graph(self, graph_index: int) -> None:
             index = int(graph_index)
             self.batch.status[index] = 1
@@ -1176,6 +1987,11 @@ def load_hippynn_alchemi_model(
             raise ValueError(f"Selected state {selected} is not present in properties_list.")
     else:
         raise ValueError("model_mode must be 'ground_state' or 'excited_state'.")
+    gap_rows, gap_seeking_settings = configured_alchemi_gap_rows(
+        sampler_config,
+        properties_list,
+        selected,
+    )
 
     state_nodes = []
     for row in table:
@@ -1201,6 +2017,8 @@ def load_hippynn_alchemi_model(
         ensemble_graph=ensemble_graph,
         state_nodes=state_nodes,
         selected_state_value=selected,
+        gap_rows=gap_rows,
+        gap_seeking_settings=gap_seeking_settings,
         species_key=str(ML_config.get("species_key", "species")),
         coordinates_key=str(ML_config.get("coordinates_key", "coordinates")),
         well_params=well_params,
@@ -1239,6 +2057,11 @@ def load_alchemi_calculator(
     well_params = dict(sampler_config.get("MLMD_calculator_options") or {}).get(
         "well_params"
     )
+    gap_rows, gap_seeking_settings = configured_alchemi_gap_rows(
+        sampler_config,
+        properties_list,
+        selected_state_value,
+    )
     native_loader_path = sampler_config.get("alchemi_calculator")
     if native_loader_path:
         loader = load_module_from_string(str(native_loader_path))
@@ -1257,6 +2080,8 @@ def load_alchemi_calculator(
                 "alchemi_calculator must return an ALFAlchemiCalculator instance."
             )
         model.well_params = None if well_params is None else dict(well_params)
+        model.gap_rows = [dict(row) for row in gap_rows]
+        model.gap_seeking_settings = dict(gap_seeking_settings)
         model.calculator_interface = "native"
         model.calculator_loader = str(native_loader_path)
         return model
@@ -1287,6 +2112,8 @@ def load_alchemi_calculator(
         calculators,
         model_mode=model_mode,
         selected_state_value=selected_state_value,
+        gap_rows=gap_rows,
+        gap_seeking_settings=gap_seeking_settings,
         well_params=well_params,
         device=device,
         calculator_loader=str(ase_loader_path),

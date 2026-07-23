@@ -10,13 +10,16 @@ import pytest
 from alframework.ml_interfaces import excited_state_hippynn_interface as ml
 
 
-def _properties():
-    return {
+def _properties(with_gap=False):
+    properties = {
         "sE0": ["sE0", "system", 1.0],
         "F0": ["F0", "atomic", 1.0],
         "sE1": ["sE1", "system", 1.0],
         "F1": ["F1", "atomic", 1.0],
     }
+    if with_gap:
+        properties["dE01"] = ["dE01", "system", 1.0]
+    return properties
 
 
 def _config(**overrides):
@@ -56,6 +59,7 @@ def _write_group(
             "F0": np.zeros((count, len(species), 3)),
             "sE1": np.linspace(-1.5, -0.5, count),
             "F1": np.ones((count, len(species), 3)),
+            "dE01": np.full(count, 0.5),
         }
         if nonfinite is not None:
             values[nonfinite] = np.asarray(values[nonfinite]).copy()
@@ -117,6 +121,58 @@ def test_explicit_h5_loader_uses_configured_database_names(tmp_path):
     }
     assert summary["state_table"][0]["energy_key"] == "sE0"
     assert summary["state_table"][0]["energy_db_name"] == "state_zero_energy"
+
+
+def test_explicit_h5_loader_reads_and_validates_gap_targets(tmp_path):
+    _write_group(tmp_path / "data.h5", "HO")
+
+    arrays, summary = ml.load_excited_state_h5_arrays(
+        str(tmp_path),
+        _properties(with_gap=True),
+    )
+
+    np.testing.assert_allclose(arrays["dE01"], arrays["sE1"] - arrays["sE0"])
+    assert summary["gap_table"][0]["gap_key"] == "dE01"
+
+
+def test_explicit_h5_loader_rejects_inconsistent_gap_targets(tmp_path):
+    path = tmp_path / "data.h5"
+    _write_group(path, "HO")
+    with h5py.File(path, "a") as store:
+        store["HO"]["dE01"][:] = 0.25
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        ml.load_excited_state_h5_arrays(
+            str(tmp_path),
+            _properties(with_gap=True),
+        )
+
+
+@pytest.mark.parametrize(
+    ("missing", "nonfinite", "message"),
+    [
+        ("dE01", None, "missing required datasets"),
+        (None, "dE01", "nonfinite"),
+    ],
+)
+def test_explicit_h5_loader_rejects_missing_or_nonfinite_gap(
+    tmp_path,
+    missing,
+    nonfinite,
+    message,
+):
+    _write_group(
+        tmp_path / "data.h5",
+        "HO",
+        missing=missing,
+        nonfinite=nonfinite,
+    )
+
+    with pytest.raises((KeyError, ValueError), match=message):
+        ml.load_excited_state_h5_arrays(
+            str(tmp_path),
+            _properties(with_gap=True),
+        )
 
 
 def test_explicit_h5_loader_rejects_missing_target(tmp_path):
@@ -216,6 +272,27 @@ def test_loss_matches_fork_formula_exactly():
     assert actual == pytest.approx(expected)
 
 
+def test_loss_adds_weighted_derived_gap_terms():
+    actual = ml.compose_excited_state_loss(
+        [(2.0, 1.0)],
+        [(6.0, 5.0)],
+        9.0,
+        gap_error_terms=[(4.0, 3.0)],
+        n_atoms=2,
+        energy_weight=2.0,
+        force_weight=3.0,
+        gap_weight=0.25,
+        l2_weight=0.5,
+    )
+    expected = (
+        2.0 * (2.0 + 1.0)
+        + 3.0 * (6.0 + 5.0) / np.sqrt(6.0)
+        + 0.25 * (4.0 + 3.0)
+        + 0.5 * 9.0
+    )
+    assert actual == pytest.approx(expected)
+
+
 def test_graph_uses_one_shared_trunk_and_all_state_database_names():
     hippynn = pytest.importorskip("hippynn")
     from hippynn.graphs import inputs
@@ -268,6 +345,93 @@ def test_graph_uses_one_shared_trunk_and_all_state_database_names():
         network in output.parents[0].parents
         for _, output in energy_outputs
     )
+
+
+def test_graph_exposes_derived_gap_target_without_independent_head():
+    hippynn = pytest.importorskip("hippynn")
+    from hippynn.graphs import inputs
+    from alframework.tools.excited_state_tools import derive_gap_property_table
+
+    species = inputs.SpeciesNode(db_name="species")
+    positions = inputs.PositionsNode(db_name="coordinates")
+    positions.requires_grad = True
+    network = ml._build_shared_network(
+        species,
+        positions,
+        network_choice=0,
+        network_params={
+            "possible_species": [0, 1],
+            "n_features": 4,
+            "n_sensitivities": 4,
+            "dist_soft_min": 0.5,
+            "dist_soft_max": 2.0,
+            "dist_hard_max": 2.5,
+            "n_interaction_layers": 1,
+            "n_atom_layers": 1,
+            "sensitivity_type": "inverse",
+            "resnet": True,
+        },
+    )
+    properties = _properties(with_gap=True)
+    state_table = ml.validate_excited_state_training_config(
+        _config(
+            gap_targets={
+                "enabled": True,
+                "pairs": [[0, 1]],
+                "weight": 0.5,
+            }
+        ),
+        properties,
+    )
+    gap_table = derive_gap_property_table(
+        properties,
+        gap_config={"pairs": [[0, 1]]},
+        require_properties=True,
+    )
+    _, _, total_loss, validation = ml.build_excited_state_training_graph(
+        network,
+        positions,
+        state_table,
+        gap_table=gap_table,
+        n_atoms=2,
+        energy_weight=1.0,
+        force_weight=1.0,
+        gap_weight=0.5,
+        l2_weight=2.0e-5,
+    )
+    _, db_info = hippynn.experiment.assemble_for_training(
+        total_loss,
+        validation,
+    )
+
+    assert "dE01" in db_info["targets"]
+    assert {"dE01_RMSE", "dE01_MAE"}.issubset(validation)
+
+
+def test_gap_training_config_rejects_independent_heads_and_bad_weight():
+    properties = _properties(with_gap=True)
+    with pytest.raises(ValueError, match="derived"):
+        ml.validate_excited_state_training_config(
+            _config(
+                gap_targets={
+                    "enabled": True,
+                    "mode": "head",
+                    "pairs": [[0, 1]],
+                }
+            ),
+            properties,
+        )
+    with pytest.raises(ValueError, match="weight"):
+        ml.validate_excited_state_training_config(
+            _config(
+                gap_targets={
+                    "enabled": True,
+                    "pairs": [[0, 1]],
+                    "weight": -1.0,
+                }
+            ),
+            properties,
+        )
 
 
 def test_model_member_seeds_are_deterministic():
@@ -487,6 +651,45 @@ def test_completed_ensemble_requires_every_state_output_from_every_member(
     fake_hippynn.graphs.make_ensemble = incomplete_ensemble
     with pytest.raises(RuntimeError, match="F1"):
         ml._validate_completed_ensemble("ensemble", table)
+
+
+def test_completed_ensemble_requires_derived_gap_output(monkeypatch):
+    expected = ["sE0", "F0", "sE1", "F1", "dE01"]
+    calls = {}
+
+    def make_ensemble(pattern, targets, quiet):
+        calls["targets"] = targets
+        return object(), ({}, {key: 2 for key in expected})
+
+    fake_hippynn = SimpleNamespace(
+        graphs=SimpleNamespace(make_ensemble=make_ensemble)
+    )
+    monkeypatch.setitem(sys.modules, "hippynn", fake_hippynn)
+    monkeypatch.setattr(
+        ml.glob,
+        "glob",
+        lambda pattern: ["model-00", "model-01"],
+    )
+    properties = _properties(with_gap=True)
+    state_table = ml.validate_excited_state_training_config(
+        _config(
+            gap_targets={"enabled": True, "pairs": [[0, 1]]}
+        ),
+        properties,
+    )
+    gap_table = ml.derive_gap_property_table(
+        properties,
+        gap_config={"pairs": [[0, 1]]},
+        require_properties=True,
+    )
+
+    ml._validate_completed_ensemble(
+        "ensemble",
+        state_table,
+        gap_table,
+    )
+
+    assert calls["targets"] == expected
 
 
 def test_task_signature_and_destructive_options(tmp_path, monkeypatch):

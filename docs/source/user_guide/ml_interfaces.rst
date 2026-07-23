@@ -174,7 +174,8 @@ HIPPYNN task and its configurations remain unchanged:
        "sE0": ["state_0_energy", "system", 1.0],
        "F0": ["state_0_forces", "atomic", 1.0],
        "sE1": ["state_1_energy", "system", 1.0],
-       "F1": ["state_1_forces", "atomic", 1.0]
+       "F1": ["state_1_forces", "atomic", 1.0],
+       "dE01": ["gap_01", "system", 1.0]
      }
    }
 
@@ -189,7 +190,26 @@ node and select a sampling state without a second model adapter.
 The objective preserves the fork's multi-state weighting. For each state it
 adds ``energy_weight * (energy RMSE + energy MAE)`` and
 ``force_weight * (force RMSE + force MAE) / sqrt(3N)``, then adds
-``l2_weight * L2`` once for the shared trunk.
+``l2_weight * L2`` once for the shared trunk. Optional direct gap targets add
+``gap_targets.weight * (gap RMSE + gap MAE)`` for each configured pair.
+
+Gap targets are derived from the existing state heads:
+``dEij = sEj - sEi``. They are not independent network heads. Enable them with:
+
+.. code-block:: json
+
+   {
+     "gap_targets": {
+       "enabled": true,
+       "pairs": [[0, 1]],
+       "weight": 1.0
+     }
+   }
+
+When ``pairs`` is omitted, every ``dE#`` property in ``properties_list`` is
+trained. Compact keys such as ``dE01`` support single-digit states; use an
+underscore for multi-digit states, for example ``dE0_10``. Each gap must be a
+system property and must use the same storage scale as its two state energies.
 
 The trainer reads ALF HDF5 shards explicitly instead of asking HIPPYNN to
 auto-detect PyANI fields. It reads only coordinates, species, and configured
@@ -203,7 +223,7 @@ Current physical and workflow limits are intentional:
 
 * Training is nonperiodic, so ``cell_key`` must be null.
 * Forces and saved force gradients are required for every state.
-* A present ``gap_targets`` section must have ``enabled: false``.
+* Only derived gap targets are supported; independent gap heads are rejected.
 * PDF and PNG plots are optional; CSV export is rejected.
 * ``remove_existing=True`` and a separate ``h5_test_dir`` are rejected rather
   than deleting or ignoring data.

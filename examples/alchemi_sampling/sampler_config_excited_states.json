@@ -7,6 +7,18 @@
   "alchemi_calculator": "alframework.samplers.alchemi_sampling.load_hippynn_alchemi_model",
   "alchemi_calculator_options": {},
   "uncertainty_policy": "stop",
+  "gap_diagnostics": {
+    "enabled": true
+  },
+  "gap_seeking": {
+    "enabled": true,
+    "mode": "levine_coe_martinez_switch",
+    "switch_policy": "stay_fixed",
+    "candidate_pairs": "adjacent",
+    "trigger_gap_threshold_eV": 0.05,
+    "sigma": 3.5,
+    "alpha_eV": 0.05
+  },
   "return_top_n": 1,
   "dt": 0.25,
   "maxt": 1000.0,

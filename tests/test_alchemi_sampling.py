@@ -63,12 +63,62 @@ def _config(policy="stop", batch_size=2, return_top_n=2):
     }
 
 
+def _gap_row():
+    return {
+        "lower_state": 0,
+        "upper_state": 1,
+        "gap_key": "dE01",
+        "gap_db_name": "dE01",
+    }
+
+
+def _excited_properties_with_gap():
+    return {
+        "sE0": ["sE0", "system", 1.0],
+        "F0": ["F0", "atomic", 1.0],
+        "sE1": ["sE1", "system", 1.0],
+        "F1": ["F1", "atomic", 1.0],
+        "dE01": ["dE01", "system", 1.0],
+    }
+
+
+def _excited_properties_three_states():
+    return {
+        "sE0": ["sE0", "system", 1.0],
+        "F0": ["F0", "atomic", 1.0],
+        "sE1": ["sE1", "system", 1.0],
+        "F1": ["F1", "atomic", 1.0],
+        "sE2": ["sE2", "system", 1.0],
+        "F2": ["F2", "atomic", 1.0],
+        "dE01": ["dE01", "system", 1.0],
+        "dE12": ["dE12", "system", 1.0],
+        "dE02": ["dE02", "system", 1.0],
+    }
+
+
+def _enable_gap_seeking(config, **overrides):
+    config["model_mode"] = "excited_state"
+    config["gap_seeking"] = {
+        "enabled": True,
+        "mode": "levine_coe_martinez_switch",
+        "switch_policy": "stay_fixed",
+        "candidate_pairs": "adjacent",
+        "trigger_gap_threshold_eV": 0.05,
+        "sigma": 3.5,
+        "alpha_eV": 0.05,
+        **overrides,
+    }
+    return config
+
+
 class FakeModel:
     def __init__(self, diagnostics):
         self.diagnostics = diagnostics
 
 
 class FakeRunner:
+    last_instance = None
+
     def __init__(
         self,
         *,
@@ -81,6 +131,7 @@ class FakeRunner:
         device,
     ):
         del dt_fs, random_seed, device
+        type(self).last_instance = self
         self.model = model
         self.initial_temperature_K = np.asarray(temperature_K, dtype=float)
         self.friction_per_fs = float(friction_per_fs)
@@ -88,6 +139,7 @@ class FakeRunner:
         self.positions = [atoms.get_positions().copy() for atoms in atoms_list]
         self.velocities = [np.zeros_like(value) for value in self.positions]
         self.frozen = set()
+        self.lcm_calls = []
         self.nsteps = 0
         self.evaluation_index = -1
 
@@ -107,6 +159,17 @@ class FakeRunner:
 
     def freeze_graph(self, graph_index):
         self.frozen.add(int(graph_index))
+
+    def set_lcm_mode(self, graph_index, *, pair, sigma, alpha_eV):
+        self.lcm_calls.append(
+            {
+                "graph_index": int(graph_index),
+                "pair": list(pair),
+                "sigma": float(sigma),
+                "alpha_eV": float(alpha_eV),
+                "step": int(self.nsteps),
+            }
+        )
 
     def set_temperature(self, temperature_K):
         self.temperature_K = np.asarray(temperature_K)
@@ -193,6 +256,193 @@ def test_shared_torch_reduction_matches_mlmd_calculator():
     assert diagnostics["Es"] == pytest.approx(ase_model.results["energy_stdev"])
     assert diagnostics["Fs"] == pytest.approx(ase_model.results["forces_stdev_mean"])
     assert diagnostics["Fsmax"] == pytest.approx(ase_model.results["forces_stdev_max"])
+
+
+def test_shared_calculator_uses_correlated_member_gap_uncertainty():
+    import torch
+
+    class RawEnsemble(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            zeros = torch.zeros(
+                (2, batch.positions.shape[0], 3),
+                device=batch.positions.device,
+            )
+            state_energies = {
+                0: torch.tensor(
+                    [[0.0, 0.0], [2.0, 2.0]],
+                    device=batch.positions.device,
+                ),
+                1: torch.tensor(
+                    [[4.0, 4.0], [2.0, 2.0]],
+                    device=batch.positions.device,
+                ),
+            }
+            return {
+                "energy_contributions": state_energies[0],
+                "force_contributions": zeros,
+                "state_energy_contributions": state_energies,
+            }
+
+    model = RawEnsemble(
+        selected_state_value=0,
+        gap_rows=[_gap_row()],
+        device=torch.device("cpu"),
+    )
+    model(_torch_batch(torch))
+    diagnostics = model.diagnostics_for_graph(0)
+
+    assert diagnostics["dE01"] == pytest.approx(2.0)
+    assert diagnostics["dE01_stdev"] == pytest.approx(2.0)
+    assert diagnostics["dE01_model_count"] == 2
+    assert diagnostics["dE01_stdev"] != pytest.approx(1.0 - 1.0)
+
+
+def test_gap_diagnostics_reject_inconsistent_state_ensemble_sizes():
+    import torch
+
+    class BadGapEnsemble(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            return {
+                "energy_contributions": torch.zeros(
+                    (2, batch.num_graphs)
+                ),
+                "force_contributions": torch.zeros(
+                    (2, batch.positions.shape[0], 3)
+                ),
+                "state_energy_contributions": {
+                    0: torch.zeros((2, batch.num_graphs)),
+                    1: torch.zeros((1, batch.num_graphs)),
+                },
+            }
+
+    with pytest.raises(ValueError, match="same ordered model members"):
+        BadGapEnsemble(
+            gap_rows=[_gap_row()],
+            device=torch.device("cpu"),
+        )(_torch_batch(torch))
+
+
+def test_lcm_energy_force_formula_and_per_graph_dynamics_are_exact():
+    import torch
+
+    settings = {
+        "enabled": True,
+        "selected_state": 0,
+        "rows": [_gap_row()],
+        "sigma": 3.5,
+        "alpha_eV": 0.05,
+    }
+
+    class RawStates(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            state_zero_energy = torch.tensor(
+                [[1.0, 1.0], [3.0, 3.0]],
+                device=batch.positions.device,
+            )
+            state_one_energy = state_zero_energy + 0.02
+            state_zero_forces = torch.stack(
+                [
+                    torch.ones_like(batch.positions),
+                    3.0 * torch.ones_like(batch.positions),
+                ]
+            )
+            state_one_forces = state_zero_forces + 3.0
+            states = {
+                0: {
+                    "energy_contributions": state_zero_energy,
+                    "force_contributions": state_zero_forces,
+                },
+                1: {
+                    "energy_contributions": state_one_energy,
+                    "force_contributions": state_one_forces,
+                },
+            }
+            return {
+                **states[0],
+                "state_contributions": states,
+            }
+
+    model = RawStates(
+        selected_state_value=0,
+        gap_rows=[_gap_row()],
+        gap_seeking_settings=settings,
+        device=torch.device("cpu"),
+    )
+    model.set_lcm_mode(
+        0,
+        pair=[0, 1],
+        sigma=3.5,
+        alpha_eV=0.05,
+    )
+    output = model(_torch_batch(torch))
+
+    expected_energy, expected_forces = model._lcm_energy_forces(
+        torch.tensor(2.0),
+        torch.tensor(2.02),
+        torch.full((2, 3), 2.0),
+        torch.full((2, 3), 5.0),
+        sigma=3.5,
+        alpha_eV=0.05,
+    )
+    assert output["energy"][0, 0].item() == pytest.approx(
+        expected_energy.item()
+    )
+    np.testing.assert_allclose(
+        output["forces"][:2].detach().numpy(),
+        expected_forces.detach().numpy(),
+        atol=1.0e-6,
+    )
+    assert output["energy"][1, 0].item() == pytest.approx(2.0)
+    np.testing.assert_allclose(
+        output["forces"][2:].detach().numpy(),
+        np.full((2, 3), 2.0),
+    )
+    assert model.diagnostics_for_graph(0)["Es"] == pytest.approx(1.0)
+    assert model.diagnostics_for_graph(0)["Fs"] == pytest.approx(1.0)
+    assert model.diagnostics_for_graph(0)["dE01"] == pytest.approx(0.02)
+
+    model.well_params = {
+        "r_start": 1.0,
+        "force": 2.0,
+        "origin": [0.0, 0.0, 0.0],
+        "mass_weighted": False,
+    }
+    displaced_batch = _torch_batch(
+        torch,
+        positions=np.asarray([[2.0, 0.0, 0.0]] * 4),
+    )
+    without_well_energy = output["energy"].detach().clone()
+    without_well_forces = output["forces"].detach().clone()
+    with_well = model(displaced_batch)
+    np.testing.assert_allclose(
+        (with_well["energy"] - without_well_energy).detach().numpy(),
+        np.full((2, 1), 4.0),
+        atol=1.0e-6,
+    )
+    expected_force_delta = np.zeros((4, 3))
+    expected_force_delta[:, 0] = -2.0
+    np.testing.assert_allclose(
+        (with_well["forces"] - without_well_forces).detach().numpy(),
+        expected_force_delta,
+        atol=1.0e-6,
+    )
+    assert model.diagnostics_for_graph(0)["dE01"] == pytest.approx(0.02)
+    assert model.diagnostics_for_graph(0)["Es"] == pytest.approx(1.0)
+
+    coordinate = torch.tensor(0.4, requires_grad=True)
+    energy, force = model._lcm_energy_forces(
+        coordinate,
+        3.0 * coordinate + 0.02,
+        torch.tensor([-1.0]),
+        torch.tensor([-3.0]),
+        sigma=3.5,
+        alpha_eV=0.05,
+    )
+    autograd_force = -torch.autograd.grad(energy, coordinate)[0]
+    assert force.item() == pytest.approx(
+        autograd_force.item(),
+        abs=5.0e-6,
+    )
 
 
 @pytest.mark.parametrize("mass_weighted", [True, False])
@@ -426,6 +676,258 @@ def test_ase_fallback_reads_flattened_excited_state_properties():
     np.testing.assert_allclose(output["energy"].detach().numpy(), [[3.0], [3.0]])
     np.testing.assert_allclose(output["forces"].detach().numpy(), np.full((4, 3), 2.0))
     assert model.diagnostics_for_graph(0)["Es"] == pytest.approx(1.0)
+
+
+def test_ase_fallback_gap_diagnostics_match_raw_member_reduction():
+    import torch
+
+    class MultiStateCalculator(Calculator):
+        implemented_properties = ["sE0", "sE1", "F1"]
+
+        def __init__(self, energy0, energy1):
+            super().__init__()
+            self.energy0 = float(energy0)
+            self.energy1 = float(energy1)
+
+        def calculate(
+            self,
+            atoms=None,
+            properties=("sE1",),
+            system_changes=all_changes,
+        ):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {
+                "sE0": self.energy0,
+                "sE1": self.energy1,
+                "F1": np.zeros((len(atoms), 3)),
+            }
+
+    model = ALFASEAlchemiModel(
+        [
+            MultiStateCalculator(0.0, 4.0),
+            MultiStateCalculator(2.0, 2.0),
+        ],
+        model_mode="excited_state",
+        selected_state_value=1,
+        gap_rows=[_gap_row()],
+        device=torch.device("cpu"),
+    )
+    model(_torch_batch(torch))
+    diagnostics = model.diagnostics_for_graph(0)
+
+    assert diagnostics["dE01"] == pytest.approx(2.0)
+    assert diagnostics["dE01_stdev"] == pytest.approx(2.0)
+    assert diagnostics["dE01_model_count"] == 2
+
+
+def test_single_ase_calculator_gap_deviation_is_zero():
+    import torch
+
+    class MultiStateCalculator(Calculator):
+        implemented_properties = ["sE0", "sE1", "F1"]
+
+        def calculate(
+            self,
+            atoms=None,
+            properties=("sE1",),
+            system_changes=all_changes,
+        ):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {
+                "sE0": 1.0,
+                "sE1": 1.75,
+                "F1": np.zeros((len(atoms), 3)),
+            }
+
+    model = ALFASEAlchemiModel(
+        MultiStateCalculator(),
+        model_mode="excited_state",
+        selected_state_value=1,
+        gap_rows=[_gap_row()],
+        device=torch.device("cpu"),
+    )
+    model(_torch_batch(torch))
+
+    assert model.diagnostics_for_graph(0)["dE01"] == pytest.approx(0.75)
+    assert model.diagnostics_for_graph(0)["dE01_stdev"] == pytest.approx(0.0)
+
+
+def test_ase_fallback_gap_diagnostics_require_all_state_energies():
+    import torch
+
+    class SelectedOnlyCalculator(Calculator):
+        implemented_properties = ["sE1", "F1"]
+
+        def calculate(
+            self,
+            atoms=None,
+            properties=("sE1",),
+            system_changes=all_changes,
+        ):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {
+                "sE1": 2.0,
+                "F1": np.zeros((len(atoms), 3)),
+            }
+
+    model = ALFASEAlchemiModel(
+        SelectedOnlyCalculator(),
+        model_mode="excited_state",
+        selected_state_value=1,
+        gap_rows=[_gap_row()],
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(KeyError, match="sE0"):
+        model(_torch_batch(torch))
+
+
+def test_ase_fallback_lcm_matches_native_state_contributions():
+    import torch
+
+    settings = {
+        "enabled": True,
+        "selected_state": 0,
+        "rows": [_gap_row()],
+        "sigma": 3.5,
+        "alpha_eV": 0.05,
+    }
+
+    class MultiStateCalculator(Calculator):
+        implemented_properties = ["sE0", "F0", "sE1", "F1"]
+
+        def __init__(self, energy0, force0, energy1, force1):
+            super().__init__()
+            self.values = (energy0, force0, energy1, force1)
+
+        def calculate(
+            self,
+            atoms=None,
+            properties=("sE0",),
+            system_changes=all_changes,
+        ):
+            super().calculate(atoms, properties, system_changes)
+            energy0, force0, energy1, force1 = self.values
+            self.results = {
+                "sE0": float(energy0),
+                "F0": np.full((len(atoms), 3), float(force0)),
+                "sE1": float(energy1),
+                "F1": np.full((len(atoms), 3), float(force1)),
+            }
+
+    ase_model = ALFASEAlchemiModel(
+        [
+            MultiStateCalculator(1.0, 1.0, 1.02, 4.0),
+            MultiStateCalculator(3.0, 3.0, 3.02, 6.0),
+        ],
+        model_mode="excited_state",
+        selected_state_value=0,
+        gap_rows=[_gap_row()],
+        gap_seeking_settings=settings,
+        device=torch.device("cpu"),
+    )
+
+    class NativeStates(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            state_zero = {
+                "energy_contributions": torch.tensor(
+                    [[1.0, 1.0], [3.0, 3.0]]
+                ),
+                "force_contributions": torch.stack(
+                    [
+                        torch.ones_like(batch.positions),
+                        3.0 * torch.ones_like(batch.positions),
+                    ]
+                ),
+            }
+            state_one = {
+                "energy_contributions": torch.tensor(
+                    [[1.02, 1.02], [3.02, 3.02]]
+                ),
+                "force_contributions": torch.stack(
+                    [
+                        4.0 * torch.ones_like(batch.positions),
+                        6.0 * torch.ones_like(batch.positions),
+                    ]
+                ),
+            }
+            return {
+                **state_zero,
+                "state_contributions": {0: state_zero, 1: state_one},
+            }
+
+    native_model = NativeStates(
+        selected_state_value=0,
+        gap_rows=[_gap_row()],
+        gap_seeking_settings=settings,
+        device=torch.device("cpu"),
+    )
+    for model in (ase_model, native_model):
+        model.set_lcm_mode(
+            0,
+            pair=[0, 1],
+            sigma=3.5,
+            alpha_eV=0.05,
+        )
+    batch = _torch_batch(torch)
+    ase_output = ase_model(batch)
+    native_output = native_model(batch)
+
+    np.testing.assert_allclose(
+        ase_output["energy"].detach().numpy(),
+        native_output["energy"].detach().numpy(),
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        ase_output["forces"].detach().numpy(),
+        native_output["forces"].detach().numpy(),
+        atol=1.0e-6,
+    )
+    for graph_index in range(2):
+        for key in ("Es", "Fs", "Fsmax", "dE01", "dE01_stdev"):
+            assert ase_model.diagnostics_for_graph(graph_index)[key] == (
+                pytest.approx(
+                    native_model.diagnostics_for_graph(graph_index)[key]
+                )
+            )
+
+
+def test_ase_fallback_gap_seeking_requires_both_state_forces():
+    import torch
+
+    class MissingUpperForce(Calculator):
+        implemented_properties = ["sE0", "F0", "sE1"]
+
+        def calculate(
+            self,
+            atoms=None,
+            properties=("sE0",),
+            system_changes=all_changes,
+        ):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {
+                "sE0": 0.0,
+                "F0": np.zeros((len(atoms), 3)),
+                "sE1": 0.01,
+            }
+
+    settings = {
+        "enabled": True,
+        "selected_state": 0,
+        "rows": [_gap_row()],
+        "sigma": 3.5,
+        "alpha_eV": 0.05,
+    }
+    model = ALFASEAlchemiModel(
+        MissingUpperForce(),
+        model_mode="excited_state",
+        selected_state_value=0,
+        gap_rows=[_gap_row()],
+        gap_seeking_settings=settings,
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(KeyError, match="F1"):
+        model(_torch_batch(torch))
 
 
 def test_shared_calculator_rejects_inconsistent_ensemble_sizes():
@@ -671,6 +1173,276 @@ def test_continue_mode_returns_global_top_k_with_deterministic_order():
     ]
 
 
+def test_gap_diagnostics_add_provenance_without_changing_ranking():
+    config = _config(
+        policy="continue",
+        batch_size=1,
+        return_top_n=1,
+    )
+    config.update(
+        {
+            "model_mode": "excited_state",
+            "gap_diagnostics": {"enabled": True},
+        }
+    )
+    model = FakeModel(
+        {
+            0: [
+                {
+                    "Es": 2.0,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "dE01": 10.0,
+                    "dE01_stdev": 0.4,
+                    "dE01_model_count": 4,
+                },
+                {
+                    "Es": 1.5,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "dE01": 0.01,
+                    "dE01_stdev": 2.0,
+                    "dE01_model_count": 4,
+                },
+            ]
+        }
+    )
+    model.gap_rows = [_gap_row()]
+
+    outputs = run_alchemi_sampling(
+        [_molecule("gap-ranked", state=0)],
+        config,
+        model,
+        properties_list=_excited_properties_with_gap(),
+        runner_factory=FakeRunner,
+    )
+
+    assert len(outputs) == 1
+    metadata = outputs[0].get_metadata()
+    assert metadata["uncertainty_score"] == pytest.approx(2.0)
+    assert metadata["gap_means"] == {"dE01": pytest.approx(10.0)}
+    assert metadata["gap_stds"] == {"dE01": pytest.approx(0.4)}
+    assert metadata["gap_model_counts"] == {"dE01": 4}
+    assert metadata["minimum_abs_gap_key"] == "dE01"
+
+
+def test_stay_fixed_gap_seeking_switches_replicas_independently_at_ncheck():
+    config = _enable_gap_seeking(
+        _config(policy="continue", batch_size=2, return_top_n=2)
+    )
+    quiet = {"Es": 0.0, "Fs": 0.0, "Fsmax": 0.0}
+    model = FakeModel(
+        {
+            0: [
+                {
+                    **quiet,
+                    "dE01": 0.01,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                },
+                {
+                    **quiet,
+                    "dE01": 0.20,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                },
+                {
+                    "Es": 3.0,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "dE01": 0.20,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                },
+            ],
+            1: [
+                {
+                    **quiet,
+                    "dE01": 0.10,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                },
+                {
+                    **quiet,
+                    "dE01": 0.10,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                },
+                {
+                    "Es": 2.0,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "dE01": 0.01,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                },
+            ],
+        }
+    )
+
+    outputs = run_alchemi_sampling(
+        [_molecule("first", state=0), _molecule("second", state=0)],
+        config,
+        model,
+        properties_list=_excited_properties_with_gap(),
+        runner_factory=FakeRunner,
+    )
+
+    assert FakeRunner.last_instance.lcm_calls == [
+        {
+            "graph_index": 0,
+            "pair": [0, 1],
+            "sigma": 3.5,
+            "alpha_eV": 0.05,
+            "step": 1,
+        },
+        {
+            "graph_index": 1,
+            "pair": [0, 1],
+            "sigma": 3.5,
+            "alpha_eV": 0.05,
+            "step": 2,
+        },
+    ]
+    by_parent = {
+        item.get_metadata()["parent_molecule_id"]: item.get_metadata()
+        for item in outputs
+    }
+    assert by_parent["first"]["gap_seeking_current_mode"] == "lcm"
+    assert by_parent["first"]["gap_seeking_switched"] is True
+    assert by_parent["first"]["gap_seeking_trigger_step"] == 1
+    assert by_parent["first"]["gap_seeking_trigger_time_ps"] == 0.0
+    assert by_parent["first"]["gap_seeking_pair"] == [0, 1]
+    assert by_parent["first"]["gap_seeking_switch_events"][0]["event"] == (
+        "enter_lcm"
+    )
+    # The second candidate was generated on the direct surface at the same
+    # check that subsequently triggered its one-way switch.
+    assert by_parent["second"]["gap_seeking_current_mode"] == "direct"
+    assert by_parent["second"]["gap_seeking_switched"] is False
+    # Two ordinary check evaluations plus one refresh after each distinct
+    # per-replica entry event.
+    assert FakeRunner.last_instance.evaluation_index == 3
+
+
+def test_gap_seeking_selects_a_different_adjacent_pair_per_replica():
+    config = _enable_gap_seeking(
+        _config(policy="continue", batch_size=2, return_top_n=2)
+    )
+    quiet = {"Es": 0.0, "Fs": 0.0, "Fsmax": 0.0}
+    uncertain = {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}
+
+    def gaps(d01, d12):
+        return {
+            "dE01": d01,
+            "dE01_stdev": 0.0,
+            "dE01_model_count": 2,
+            "dE12": d12,
+            "dE12_stdev": 0.0,
+            "dE12_model_count": 2,
+        }
+
+    model = FakeModel(
+        {
+            0: [
+                {**quiet, **gaps(0.01, 0.04)},
+                {**quiet, **gaps(0.20, 0.20)},
+                {**uncertain, **gaps(0.20, 0.20)},
+            ],
+            1: [
+                {**quiet, **gaps(0.04, 0.01)},
+                {**quiet, **gaps(0.20, 0.20)},
+                {**uncertain, **gaps(0.20, 0.20)},
+            ],
+        }
+    )
+
+    outputs = run_alchemi_sampling(
+        [_molecule("lower", state=1), _molecule("upper", state=1)],
+        config,
+        model,
+        properties_list=_excited_properties_three_states(),
+        runner_factory=FakeRunner,
+    )
+
+    assert [call["pair"] for call in FakeRunner.last_instance.lcm_calls] == [
+        [0, 1],
+        [1, 2],
+    ]
+    metadata = {
+        item.get_metadata()["parent_molecule_id"]: item.get_metadata()
+        for item in outputs
+    }
+    assert metadata["lower"]["gap_seeking_current_mode"] == "lcm"
+    assert metadata["lower"]["gap_seeking_pair"] == [0, 1]
+    assert metadata["upper"]["gap_seeking_current_mode"] == "lcm"
+    assert metadata["upper"]["gap_seeking_pair"] == [1, 2]
+
+
+def test_stop_mode_frozen_replica_does_not_enter_lcm():
+    config = _enable_gap_seeking(
+        _config(policy="stop", batch_size=1, return_top_n=1)
+    )
+    model = FakeModel(
+        {
+            0: [
+                {
+                    "Es": 2.0,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "dE01": 0.01,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                }
+            ]
+        }
+    )
+
+    outputs = run_alchemi_sampling(
+        [_molecule("frozen", state=0)],
+        config,
+        model,
+        properties_list=_excited_properties_with_gap(),
+        runner_factory=FakeRunner,
+    )
+
+    assert len(outputs) == 1
+    assert FakeRunner.last_instance.lcm_calls == []
+    assert outputs[0].get_metadata()["gap_seeking_switched"] is False
+
+
+def test_distance_rejected_replica_does_not_enter_lcm():
+    config = _enable_gap_seeking(
+        _config(policy="continue", batch_size=1, return_top_n=1)
+    )
+    config["distcut"] = 1.0
+    model = FakeModel(
+        {
+            0: [
+                {
+                    "Es": 0.0,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "dE01": 0.01,
+                    "dE01_stdev": 0.0,
+                    "dE01_model_count": 2,
+                }
+            ]
+        }
+    )
+
+    outputs = run_alchemi_sampling(
+        [_molecule("too-close", distance=0.74, state=0)],
+        config,
+        model,
+        properties_list=_excited_properties_with_gap(),
+        runner_factory=FakeRunner,
+    )
+
+    assert outputs == []
+    assert FakeRunner.last_instance.lcm_calls == []
+
+
 def test_continue_mode_tie_breaks_by_batch_index():
     tied = {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}
     model = FakeModel({0: [tied], 1: [tied]})
@@ -742,6 +1514,171 @@ def test_resolved_state_must_exist_in_properties():
             config,
             properties,
         )
+
+
+def test_gap_diagnostics_configuration_requires_excited_gap_properties():
+    config = _config(policy="stop", batch_size=1)
+    config["gap_diagnostics"] = {"enabled": True}
+    with pytest.raises(ValueError, match="excited_state"):
+        alchemi_module.configured_gap_diagnostics(config, {})
+
+    config["model_mode"] = "excited_state"
+    with pytest.raises(ValueError, match="at least one dE"):
+        alchemi_module.configured_gap_diagnostics(
+            config,
+            {
+                "sE0": ["sE0", "system", 1.0],
+                "F0": ["F0", "atomic", 1.0],
+            },
+        )
+
+    config["gap_diagnostics"]["unexpected"] = True
+    with pytest.raises(ValueError, match="Unknown"):
+        alchemi_module.configured_gap_diagnostics(
+            config,
+            _excited_properties_with_gap(),
+        )
+
+
+def test_gap_seeking_configuration_selects_only_adjacent_selected_pairs():
+    config = _enable_gap_seeking(
+        _config(policy="stop", batch_size=1)
+    )
+
+    settings = alchemi_module.configured_gap_seeking(
+        config,
+        _excited_properties_three_states(),
+        selected_state_value=1,
+    )
+
+    assert [row["gap_key"] for row in settings["rows"]] == [
+        "dE01",
+        "dE12",
+    ]
+    assert settings["selected_state"] == 1
+    assert settings["trigger_gap_threshold_eV"] == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize(
+    ("mutator", "message"),
+    [
+        (
+            lambda config: config.update({"model_mode": "ground_state"}),
+            "excited_state",
+        ),
+        (
+            lambda config: config["gap_seeking"].pop(
+                "trigger_gap_threshold_eV"
+            ),
+            "explicit values",
+        ),
+        (
+            lambda config: config["gap_seeking"].update({"sigma": 0.0}),
+            "sigma",
+        ),
+        (
+            lambda config: config["gap_seeking"].update(
+                {"switch_policy": "hysteresis"}
+            ),
+            "stay_fixed",
+        ),
+        (
+            lambda config: config["gap_seeking"].update(
+                {"candidate_pairs": "all_adjacent"}
+            ),
+            "adjacent",
+        ),
+        (
+            lambda config: config["gap_seeking"].update({"mode": "other"}),
+            "levine_coe_martinez_switch",
+        ),
+    ],
+)
+def test_gap_seeking_configuration_rejects_unsupported_values(
+    mutator,
+    message,
+):
+    config = _enable_gap_seeking(
+        _config(policy="stop", batch_size=1)
+    )
+    mutator(config)
+
+    with pytest.raises(ValueError, match=message):
+        alchemi_module.configured_gap_seeking(
+            config,
+            _excited_properties_with_gap(),
+            selected_state_value=0,
+        )
+
+
+def test_gap_seeking_requires_an_explicit_adjacent_gap_for_selected_state():
+    config = _enable_gap_seeking(
+        _config(policy="stop", batch_size=1)
+    )
+
+    with pytest.raises(ValueError, match="no explicitly configured adjacent"):
+        alchemi_module.configured_gap_seeking(
+            config,
+            {
+                "sE0": ["sE0", "system", 1.0],
+                "F0": ["F0", "atomic", 1.0],
+                "sE1": ["sE1", "system", 1.0],
+                "F1": ["F1", "atomic", 1.0],
+            },
+            selected_state_value=0,
+        )
+
+
+def test_gap_seeking_requires_forces_for_each_eligible_pair_state():
+    config = _enable_gap_seeking(
+        _config(policy="stop", batch_size=1)
+    )
+
+    with pytest.raises(ValueError, match="missing F1"):
+        alchemi_module.configured_gap_seeking(
+            config,
+            {
+                "sE0": ["sE0", "system", 1.0],
+                "F0": ["F0", "atomic", 1.0],
+                "sE1": ["sE1", "system", 1.0],
+                "dE01": ["dE01", "system", 1.0],
+            },
+            selected_state_value=0,
+        )
+
+
+def test_gap_seeking_trigger_uses_minimum_absolute_gap_and_pair_tie_break():
+    settings = {
+        "enabled": True,
+        "trigger_gap_threshold_eV": 0.05,
+        "rows": [
+            {
+                "lower_state": 1,
+                "upper_state": 2,
+                "gap_key": "dE12",
+            },
+            {
+                "lower_state": 0,
+                "upper_state": 1,
+                "gap_key": "dE01",
+            },
+        ],
+    }
+
+    trigger = alchemi_module.select_gap_seeking_trigger(
+        {"dE01": -0.02, "dE12": 0.02},
+        settings,
+    )
+
+    assert trigger["pair"] == [0, 1]
+    assert trigger["gap_key"] == "dE01"
+    assert (
+        alchemi_module.select_gap_seeking_trigger(
+            {"dE01": 0.06, "dE12": -0.07},
+            settings,
+        )
+        is None
+    )
 
 
 def test_task_gpu_assignment_is_independent_of_selected_state(monkeypatch):
@@ -888,6 +1825,22 @@ def test_native_model_ensemble_uses_shared_reduction():
     assert diagnostics["Es"] == pytest.approx(1.0)
     assert diagnostics["Fs"] == pytest.approx(1.0)
     assert diagnostics["Fsmax"] == pytest.approx(1.0)
+
+    seeking_model = ALFNativeEnsembleModel(
+        [ConstantModel(1.0, 1.0), ConstantModel(3.0, 3.0)],
+        selected_state_value=0,
+        gap_rows=[_gap_row()],
+        gap_seeking_settings={
+            "enabled": True,
+            "selected_state": 0,
+            "rows": [_gap_row()],
+            "sigma": 3.5,
+            "alpha_eV": 0.05,
+        },
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(KeyError, match="state_contributions"):
+        seeking_model(_torch_batch(torch))
 
 
 def test_single_plain_ase_calculator_has_zero_uncertainty():
@@ -1161,6 +2114,14 @@ def test_hippynn_adapter_uses_raw_members_and_selects_excited_state(monkeypatch)
         ensemble_graph=Graph(),
         state_nodes=state_nodes,
         selected_state_value=1,
+        gap_rows=[_gap_row()],
+        gap_seeking_settings={
+            "enabled": True,
+            "selected_state": 1,
+            "rows": [_gap_row()],
+            "sigma": 3.5,
+            "alpha_eV": 0.05,
+        },
         species_key="species",
         coordinates_key="coordinates",
         device=torch.device("cpu"),
@@ -1183,6 +2144,9 @@ def test_hippynn_adapter_uses_raw_members_and_selects_excited_state(monkeypatch)
     assert diagnostics["Es"] == pytest.approx(1.0)
     assert diagnostics["Fs"] == pytest.approx(1.0)
     assert diagnostics["Fsmax"] == pytest.approx(1.0)
+    assert diagnostics["dE01"] == pytest.approx(2.0)
+    assert diagnostics["dE01_stdev"] == pytest.approx(0.0)
+    assert diagnostics["dE01_model_count"] == 2
 
     model.well_params = {
         "r_start": 1.0,
@@ -1198,3 +2162,31 @@ def test_hippynn_adapter_uses_raw_members_and_selects_excited_state(monkeypatch)
     np.testing.assert_allclose(
         output_with_well["forces"].detach().numpy()[:, 0], np.ones(4)
     )
+    with_well_diagnostics = model.diagnostics_for_graph(0)
+    assert with_well_diagnostics["dE01"] == pytest.approx(2.0)
+    assert with_well_diagnostics["dE01_stdev"] == pytest.approx(0.0)
+    model.well_params = None
+    model.set_lcm_mode(
+        0,
+        pair=[0, 1],
+        sigma=3.5,
+        alpha_eV=0.05,
+    )
+    lcm_output = model(Batch())
+    expected_energy, expected_forces = model._lcm_energy_forces(
+        torch.tensor(2.0),
+        torch.tensor(4.0),
+        torch.full((2, 3), 1.0),
+        torch.full((2, 3), 3.0),
+        sigma=3.5,
+        alpha_eV=0.05,
+    )
+    assert lcm_output["energy"][0, 0].item() == pytest.approx(
+        expected_energy.item()
+    )
+    np.testing.assert_allclose(
+        lcm_output["forces"][:2].detach().numpy(),
+        expected_forces.detach().numpy(),
+        atol=1.0e-6,
+    )
+    assert lcm_output["energy"][1, 0].item() == pytest.approx(4.0)

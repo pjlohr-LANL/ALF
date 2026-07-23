@@ -20,7 +20,10 @@ from typing import Any
 import numpy as np
 from parsl import python_app
 
-from alframework.tools.excited_state_tools import derive_state_property_table
+from alframework.tools.excited_state_tools import (
+    derive_gap_property_table,
+    derive_state_property_table,
+)
 from alframework.tools.pyanitools import anidataloader
 
 
@@ -50,12 +53,14 @@ def validate_excited_state_training_properties(
         database_names.extend(
             [str(row["energy_db_name"]), str(row["force_db_name"])]
         )
+    gap_table = derive_gap_property_table(properties_list)
+    database_names.extend(str(row["gap_db_name"]) for row in gap_table)
     if any(not name for name in database_names):
         raise ValueError("Excited-state HDF5 database names cannot be empty.")
     if len(database_names) != len(set(database_names)):
         raise ValueError(
-            "Every excited-state energy and force requires a unique HDF5 "
-            "database name."
+            "Every excited-state energy, force, and gap requires a unique "
+            "HDF5 database name."
         )
     return state_table
 
@@ -89,14 +94,29 @@ def validate_excited_state_training_config(
         )
 
     gap_config = config.get("gap_targets")
-    if gap_config is not None:
-        if not isinstance(gap_config, dict):
-            raise TypeError("gap_targets must be a dictionary when provided.")
-        if bool(gap_config.get("enabled", False)):
-            raise ValueError(
-                "Enabled gap targets are not supported by this incremental "
-                "trainer. Train only the flattened sE#/F# targets."
-            )
+    if gap_config is not None and not isinstance(gap_config, dict):
+        raise TypeError("gap_targets must be a dictionary when provided.")
+    gap_options = dict(gap_config or {})
+    gap_enabled = bool(gap_options.get("enabled", False))
+    gap_mode = str(gap_options.get("mode", "derived")).strip().lower()
+    if gap_mode != "derived":
+        raise ValueError(
+            "gap_targets.mode must be 'derived'; independent gap heads are "
+            "not supported."
+        )
+    gap_weight = float(gap_options.get("weight", 1.0))
+    if not np.isfinite(gap_weight) or gap_weight < 0:
+        raise ValueError("gap_targets.weight must be finite and nonnegative.")
+    configured_gaps = derive_gap_property_table(
+        properties_list,
+        gap_config=gap_options,
+        require_properties=gap_enabled,
+    )
+    if gap_enabled and not configured_gaps:
+        raise ValueError(
+            "Enabled gap targets require at least one dE# property in "
+            "properties_list."
+        )
 
     exports = config.get("exports")
     if exports is not None:
@@ -219,7 +239,13 @@ def _group_species_rows(
     )
 
 
-def _normalize_energy(values: Any, *, n_systems: int, context: str) -> np.ndarray:
+def _normalize_energy(
+    values: Any,
+    *,
+    n_systems: int,
+    context: str,
+    output_dtype: Any = np.float32,
+) -> np.ndarray:
     array = np.asarray(values, dtype=np.float64)
     if array.ndim == 0 and n_systems == 1:
         array = array.reshape(1)
@@ -232,7 +258,7 @@ def _normalize_energy(values: Any, *, n_systems: int, context: str) -> np.ndarra
         )
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{context} contains nonfinite values.")
-    return array.astype(np.float32, copy=False)
+    return array.astype(output_dtype, copy=False)
 
 
 def _normalize_forces(
@@ -288,6 +314,7 @@ def load_excited_state_h5_arrays(
     """
 
     state_table = validate_excited_state_training_properties(properties_list)
+    gap_table = derive_gap_property_table(properties_list)
     chunks: dict[str, list[np.ndarray]] = {
         str(coordinates_key): [],
         str(species_key): [],
@@ -295,6 +322,8 @@ def load_excited_state_h5_arrays(
     for row in state_table:
         chunks[str(row["energy_db_name"])] = []
         chunks[str(row["force_db_name"])] = []
+    for row in gap_table:
+        chunks[str(row["gap_db_name"])] = []
 
     reference_species: np.ndarray | None = None
     group_count = 0
@@ -316,6 +345,10 @@ def load_excited_state_h5_arrays(
                     ):
                         if key not in group:
                             missing.append(key)
+                for row in gap_table:
+                    gap_name = str(row["gap_db_name"])
+                    if gap_name not in group:
+                        missing.append(gap_name)
                 if missing:
                     raise KeyError(
                         f"{context} is missing required datasets: "
@@ -364,15 +397,19 @@ def load_excited_state_h5_arrays(
                     coordinates.astype(np.float32, copy=False)
                 )
                 chunks[str(species_key)].append(species_rows)
+                group_state_energies: dict[int, np.ndarray] = {}
                 for row in state_table:
                     energy_name = str(row["energy_db_name"])
                     force_name = str(row["force_db_name"])
+                    energy_values = _normalize_energy(
+                        group[energy_name],
+                        n_systems=n_systems,
+                        context=f"{context}:{energy_name}",
+                        output_dtype=np.float64,
+                    )
+                    group_state_energies[int(row["state"])] = energy_values
                     chunks[energy_name].append(
-                        _normalize_energy(
-                            group[energy_name],
-                            n_systems=n_systems,
-                            context=f"{context}:{energy_name}",
-                        )
+                        energy_values.astype(np.float32, copy=False)
                     )
                     chunks[force_name].append(
                         _normalize_forces(
@@ -381,6 +418,36 @@ def load_excited_state_h5_arrays(
                             n_atoms=n_atoms,
                             context=f"{context}:{force_name}",
                         )
+                    )
+                for row in gap_table:
+                    gap_name = str(row["gap_db_name"])
+                    gap_values = _normalize_energy(
+                        group[gap_name],
+                        n_systems=n_systems,
+                        context=f"{context}:{gap_name}",
+                        output_dtype=np.float64,
+                    )
+                    expected_gap = (
+                        group_state_energies[int(row["upper_state"])]
+                        - group_state_energies[int(row["lower_state"])]
+                    )
+                    if not np.allclose(
+                        gap_values,
+                        expected_gap,
+                        rtol=1.0e-7,
+                        atol=1.0e-8,
+                    ):
+                        max_error = float(
+                            np.max(np.abs(gap_values - expected_gap))
+                        )
+                        raise ValueError(
+                            f"HDF5 gap target {gap_name!r} is inconsistent "
+                            f"with {row['upper_energy_key']} - "
+                            f"{row['lower_energy_key']}; maximum absolute "
+                            f"error is {max_error:.6g}."
+                        )
+                    chunks[gap_name].append(
+                        gap_values.astype(np.float32, copy=False)
                     )
         finally:
             loader.cleanup()
@@ -436,6 +503,7 @@ def load_excited_state_h5_arrays(
         "atomic_numbers": reference_species.tolist(),
         "possible_species": possible_species,
         "state_table": state_table,
+        "gap_table": gap_table,
     }
     return arrays, summary
 
@@ -445,12 +513,14 @@ def compose_excited_state_loss(
     force_error_terms: list[tuple[Any, Any]],
     l2_term: Any,
     *,
+    gap_error_terms: list[tuple[Any, Any]] | None = None,
     n_atoms: int,
     energy_weight: float,
     force_weight: float,
+    gap_weight: float = 1.0,
     l2_weight: float,
 ) -> Any:
-    """Compose the fork-compatible multi-state E/F/L2 objective."""
+    """Compose the fork-compatible multi-state E/F/gap/L2 objective."""
 
     if not energy_error_terms:
         raise ValueError("At least one state-energy loss term is required.")
@@ -465,6 +535,10 @@ def compose_excited_state_loss(
     total = total + sum(
         float(force_weight) * (rmse + mae) / force_normalizer
         for rmse, mae in force_error_terms
+    )
+    total = total + sum(
+        float(gap_weight) * (rmse + mae)
+        for rmse, mae in (gap_error_terms or [])
     )
     return total + float(l2_weight) * l2_term
 
@@ -535,9 +609,11 @@ def build_excited_state_training_graph(
     positions_node: Any,
     state_table: list[dict[str, Any]],
     *,
+    gap_table: list[dict[str, Any]] | None = None,
     n_atoms: int,
     energy_weight: float,
     force_weight: float,
+    gap_weight: float = 1.0,
     l2_weight: float,
     first_is_interacting: bool = False,
 ) -> tuple[
@@ -552,8 +628,10 @@ def build_excited_state_training_graph(
 
     energy_outputs: list[tuple[dict[str, Any], Any]] = []
     force_outputs: list[tuple[dict[str, Any], Any]] = []
+    gap_outputs: list[tuple[dict[str, Any], Any]] = []
     energy_error_terms: list[tuple[Any, Any]] = []
     force_error_terms: list[tuple[Any, Any]] = []
+    gap_error_terms: list[tuple[Any, Any]] = []
     validation_losses: dict[str, Any] = {}
     for row in state_table:
         state = int(row["state"])
@@ -584,19 +662,44 @@ def build_excited_state_training_graph(
         validation_losses[f"F{state}_RMSE"] = force_rmse
         validation_losses[f"F{state}_MAE"] = force_mae
 
+    energy_by_state = {
+        int(row["state"]): output for row, output in energy_outputs
+    }
+    for row in gap_table or []:
+        gap_key = str(row["gap_key"])
+        gap_output = (
+            energy_by_state[int(row["upper_state"])]
+            - energy_by_state[int(row["lower_state"])]
+        )
+        gap_output.name = f"derived_{gap_key}"
+        gap_output.db_name = str(row["gap_db_name"])
+        gap_outputs.append((row, gap_output))
+        gap_rmse = loss.MSELoss.of_node(gap_output) ** 0.5
+        gap_mae = loss.MAELoss.of_node(gap_output)
+        gap_error_terms.append((gap_rmse, gap_mae))
+        validation_losses[f"{gap_key}_RMSE"] = gap_rmse
+        validation_losses[f"{gap_key}_MAE"] = gap_mae
+
     l2_term = loss.l2reg(network)
     total_loss = compose_excited_state_loss(
         energy_error_terms,
         force_error_terms,
         l2_term,
+        gap_error_terms=gap_error_terms,
         n_atoms=n_atoms,
         energy_weight=energy_weight,
         force_weight=force_weight,
+        gap_weight=gap_weight,
         l2_weight=l2_weight,
     )
     validation_losses["L2"] = l2_term
     validation_losses["Loss"] = total_loss
-    return energy_outputs, force_outputs, total_loss, validation_losses
+    return (
+        energy_outputs,
+        force_outputs,
+        total_loss,
+        validation_losses,
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -641,6 +744,16 @@ def train_single_excited_state_model(
     state_table = validate_excited_state_training_config(
         config,
         properties_list,
+    )
+    gap_options = dict(config.get("gap_targets") or {})
+    gap_table = (
+        derive_gap_property_table(
+            properties_list,
+            gap_config=gap_options,
+            require_properties=True,
+        )
+        if bool(gap_options.get("enabled", False))
+        else []
     )
     visible_device, recorded_device = _configure_cuda_visible_devices(
         str(config.get("device_string", "from_multiprocessing")),
@@ -729,9 +842,11 @@ def train_single_excited_state_model(
                 network,
                 positions_node,
                 state_table,
+                gap_table=gap_table,
                 n_atoms=n_atoms,
                 energy_weight=float(config.get("energy_weight", 1.0)),
                 force_weight=float(config.get("force_weight", 1.0)),
+                gap_weight=float(gap_options.get("weight", 1.0)),
                 l2_weight=float(config.get("l2_weight", 2.0e-5)),
                 first_is_interacting=bool(
                     config.get("first_is_interacting", False)
@@ -877,6 +992,12 @@ def train_single_excited_state_model(
                 "device": str(device),
                 "cuda_visible_devices": recorded_device,
                 "state_table": state_table,
+                "gap_table": gap_table,
+                "gap_targets": {
+                    "enabled": bool(gap_table),
+                    "weight": float(gap_options.get("weight", 1.0)),
+                    "mode": "derived",
+                },
                 "data": data_summary,
                 "metric": _json_safe(metric_tracker.best_metric_values),
                 "average_epoch_time": float(
@@ -926,6 +1047,7 @@ def _training_complete(model_dir: str) -> bool:
 def _validate_completed_ensemble(
     ensemble_dir: str,
     state_table: list[dict[str, Any]],
+    gap_table: list[dict[str, Any]] | None = None,
 ) -> None:
     """Ensure saved checkpoints expose every target used by ALCHEMI."""
 
@@ -936,6 +1058,9 @@ def _validate_completed_ensemble(
         expected_targets.extend(
             [str(row["energy_db_name"]), str(row["force_db_name"])]
         )
+    expected_targets.extend(
+        str(row["gap_db_name"]) for row in (gap_table or [])
+    )
     _, (_, output_info) = hippynn.graphs.make_ensemble(
         os.path.join(str(ensemble_dir), "model-*"),
         targets=expected_targets,
@@ -983,6 +1108,16 @@ def train_excited_state_ensemble(
     state_table = validate_excited_state_training_config(
         config,
         properties_list,
+    )
+    gap_options = dict(config.get("gap_targets") or {})
+    gap_table = (
+        derive_gap_property_table(
+            properties_list,
+            gap_config=gap_options,
+            require_properties=True,
+        )
+        if bool(gap_options.get("enabled", False))
+        else []
     )
     n_models = int(config["n_models"])
     ensemble_dir = model_path.format(int(current_training_id))
@@ -1051,7 +1186,14 @@ def train_excited_state_ensemble(
 
     if all(completed):
         try:
-            _validate_completed_ensemble(ensemble_dir, state_table)
+            if gap_table:
+                _validate_completed_ensemble(
+                    ensemble_dir,
+                    state_table,
+                    gap_table,
+                )
+            else:
+                _validate_completed_ensemble(ensemble_dir, state_table)
         except Exception as exc:
             completed = [False for _ in completed]
             ensemble_root = Path(ensemble_dir).expanduser().resolve()

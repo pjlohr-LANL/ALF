@@ -288,6 +288,69 @@ calculator layer computes the same population statistics as production ALF:
 componentwise force deviation, and ``Fsmax`` is its maximum. This common
 reduction avoids model-library standard-deviation convention differences.
 
+Direct gap diagnostics are optional in excited-state mode:
+
+.. code-block:: json
+
+   {
+     "gap_diagnostics": {
+       "enabled": true
+     }
+   }
+
+When enabled, every ``dE#`` property in ``properties_list`` is evaluated.
+Calculator adapters provide paired state-energy contributions for each model
+member. The shared layer computes each member's ``sEj - sEi`` first and then
+uses a population standard deviation; it never subtracts two state standard
+deviations. Native HIPPYNN uses raw ``.all`` outputs. ASE fallback requests
+the additional flattened ``sE#`` properties and fails clearly if its
+calculator does not provide them. A single ordinary calculator has zero gap
+ensemble deviation.
+
+One-way Levine--Coe--Martinez gap seeking is independently opt-in:
+
+.. code-block:: json
+
+   {
+     "gap_seeking": {
+       "enabled": true,
+       "mode": "levine_coe_martinez_switch",
+       "switch_policy": "stay_fixed",
+       "candidate_pairs": "adjacent",
+       "trigger_gap_threshold_eV": 0.05,
+       "sigma": 3.5,
+       "alpha_eV": 0.05
+     }
+   }
+
+Gap seeking is available only in ``excited_state`` mode. Eligible pairs are
+adjacent, explicitly declared ``dE#`` properties containing the batch's
+selected state; both states must also declare ``F#`` properties. At each
+existing ``Ncheck`` evaluation, including the legacy time-zero check after the
+initial MD step, the sampler first applies its normal uncertainty and geometry
+handling. Each remaining replica independently selects the eligible pair with
+the smallest absolute ensemble-mean gap, using ascending state pairs to break
+ties. A gap at or below ``trigger_gap_threshold_eV`` permanently switches only
+that replica to
+
+.. math::
+
+   E_\mathrm{LCM} =
+   \frac{E_i + E_j}{2}
+   + \sigma \frac{\Delta E^2}
+     {\sqrt{\Delta E^2 + 10^{-12}} + \alpha}.
+
+The corresponding force is evaluated analytically from the two state-mean
+forces. The model is reevaluated immediately after entry so the next MD step
+uses LCM forces. ``stay_fixed`` does not switch back, even if the gap later
+grows; hysteresis and LCM exit are intentionally unsupported.
+
+Gap seeking loads its required all-state energy and force contributions even
+when ``gap_diagnostics`` is disabled. Native HIPPYNN uses raw ensemble
+``.all`` outputs, while ASE fallback requests only the extra flattened
+``sE#``/``F#`` properties needed by the eligible pairs. Other native
+calculators must implement the optional all-state contribution contract.
+
 ``stop`` is the compatibility mode. Each replica is frozen independently at
 its first valid uncertainty event, while other replicas in the GPU batch keep
 running. At most one candidate is returned for each input replica.
@@ -344,7 +407,8 @@ state contract:
      "sE0": ["state_0_energy", "system", 1.0],
      "F0": ["state_0_forces", "atomic", 1.0],
      "sE1": ["state_1_energy", "system", 1.0],
-     "F1": ["state_1_forces", "atomic", 1.0]
+     "F1": ["state_1_forces", "atomic", 1.0],
+     "dE01": ["gap_01", "system", 1.0]
    }
 
 State numbers must be contiguous from zero, and every sampled state requires a
@@ -353,6 +417,17 @@ force; uncertainty uses that state's population energy and force deviations.
 An excited-state ASE fallback calculator must expose the selected flattened
 ``sE#`` and ``F#`` properties; unsupported calculators fail with an actionable
 missing-property error.
+
+Candidate provenance records configured gap means, population deviations,
+state pairs, model counts, and the minimum absolute gap. These values do not
+affect uncertainty flags, stopping, qualification, or top-K order. The
+spherical well is applied only to the selected dynamics mean and is excluded
+from ensemble uncertainty, gap diagnostics, and switching decisions. With gap
+seeking enabled, provenance also records the replica's direct or LCM mode,
+active pair, trigger gap, step and time, physical parameters, and its single
+entry event. A candidate generated at the triggering check records ``direct``
+because that surface produced the frame; later candidates record ``lcm``.
+Uncertainty and ranking always remain based on the original selected state.
 
 For one surface, use a fixed policy:
 
@@ -398,8 +473,8 @@ state and actual sampler device/worker assignment. With
 ``shake: 0.0`` for exact CFG reuse, and ensure the CFG library has compatible
 atomic-number ordering for strict batches.
 
-Gap targets, gap scoring, GUDD, hysteresis, and Martinez--Levine gap seeking are
-not enabled by this sampler version.
+Gap scoring, GUDD, hysteresis, and LCM exit are not enabled by this sampler
+version.
 
 For ``--test_sampler``, use a debug sampler configuration with
 ``alchemi_baoab.batch_size`` set to ``1`` because the stage-test command obtains

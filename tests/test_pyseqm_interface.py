@@ -25,7 +25,7 @@ from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.tools import build_input_dict, store_current_data
 
 
-def _properties(include_forces=True):
+def _properties(include_forces=True, include_gaps=False):
     properties = {
         "sE0": ["state_0_energy", "system", 1.0],
         "sE1": ["state_1_energy", "system", 1.0],
@@ -37,6 +37,8 @@ def _properties(include_forces=True):
                 "F1": ["state_1_forces", "atomic", 1.0],
             }
         )
+    if include_gaps:
+        properties["dE01"] = ["gap_01", "system", 1.0]
     return properties
 
 
@@ -186,6 +188,33 @@ def test_single_molecule_labeling_maps_flattened_results_and_offset(monkeypatch)
     assert metadata["qm_scf_converged"] is True
 
 
+def test_gap_labels_use_shifted_state_difference_and_offset_cancels(
+    monkeypatch,
+):
+    energies, forces = _predictions()
+    monkeypatch.setattr(
+        pyseqm_module,
+        "run_pyseqm_batch",
+        lambda *args, **kwargs: (energies.copy(), forces.copy()),
+    )
+    monkeypatch.setattr(pyseqm_module, "_pyseqm_device", lambda count: "cpu")
+
+    labeled = label_excited_state_molecule(
+        _molecule("gap-label"),
+        QM_config={
+            "energy_offset_eV": -100.0,
+            "max_solve_time_seconds": 0,
+        },
+        properties_list=_properties(include_gaps=True),
+    )
+
+    assert labeled.check_convergence() is True
+    assert labeled.get_results()["sE0"] == pytest.approx(10.0)
+    assert labeled.get_results()["sE1"] == pytest.approx(10.5)
+    assert labeled.get_results()["dE01"] == pytest.approx(0.5)
+    assert labeled.get_metadata()["gap_properties"] == ["dE01"]
+
+
 def test_energy_only_contract_and_sampler_offset_fallback(monkeypatch):
     energies, forces = _predictions()
     monkeypatch.setattr(
@@ -214,7 +243,7 @@ def test_labeled_results_use_existing_hdf5_storage_path(monkeypatch, tmp_path):
         lambda *args, **kwargs: (energies.copy(), forces.copy()),
     )
     monkeypatch.setattr(pyseqm_module, "_pyseqm_device", lambda count: "cpu")
-    properties = _properties()
+    properties = _properties(include_gaps=True)
     labeled = label_excited_state_molecule(
         _molecule("labeled-water"),
         QM_config={"max_solve_time_seconds": 0},
@@ -230,8 +259,10 @@ def test_labeled_results_use_existing_hdf5_storage_path(monkeypatch, tmp_path):
         assert group["state_1_energy"].shape == (1,)
         assert group["state_0_forces"].shape == (1, 3, 3)
         assert group["state_1_forces"].shape == (1, 3, 3)
+        assert group["gap_01"].shape == (1,)
         assert group["state_0_energy"][0] == pytest.approx(-90.0)
         assert group["state_1_energy"][0] == pytest.approx(-89.5)
+        assert group["gap_01"][0] == pytest.approx(0.5)
 
 
 def test_existing_qm_task_input_contract_routes_without_driver_changes(monkeypatch):
@@ -304,7 +335,7 @@ def test_malformed_backend_results_are_nonconverged(
 def test_unsupported_properties_and_periodic_molecules_fail_cleanly(monkeypatch):
     monkeypatch.setattr(pyseqm_module, "_pyseqm_device", lambda count: "cpu")
     unsupported = _properties()
-    unsupported["dE01"] = ["gap_01", "system", 1.0]
+    unsupported["dipole"] = ["dipole", "system", 1.0]
     labeled = label_excited_state_molecule(
         _molecule(),
         QM_config={},
@@ -365,12 +396,19 @@ def test_scf_failure_is_nonconverged_and_removes_state_labels(monkeypatch):
 
     monkeypatch.setattr(pyseqm_module, "run_pyseqm_batch", fail_scf)
     molecule = _molecule("scf-failure")
-    molecule.store_results({"sE0": -1.0, "F0": np.ones((3, 3)), "other": 7})
+    molecule.store_results(
+        {
+            "sE0": -1.0,
+            "F0": np.ones((3, 3)),
+            "dE01": 99.0,
+            "other": 7,
+        }
+    )
 
     failed = label_excited_state_molecule(
         molecule,
         QM_config={"max_solve_time_seconds": 0},
-        properties_list=_properties(),
+        properties_list=_properties(include_gaps=True),
     )
 
     assert failed.check_convergence() is False

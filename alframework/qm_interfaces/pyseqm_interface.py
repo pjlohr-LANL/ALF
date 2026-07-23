@@ -21,7 +21,10 @@ from typing import Any
 import numpy as np
 from parsl import python_app
 
-from alframework.tools.excited_state_tools import derive_state_property_table
+from alframework.tools.excited_state_tools import (
+    derive_gap_property_table,
+    derive_state_property_table,
+)
 from alframework.tools.molecules_class import MoleculesObject
 
 
@@ -590,17 +593,19 @@ def label_excited_state_molecule(
         state_table = derive_state_property_table(
             properties_list, require_forces=False
         )
+        gap_table = derive_gap_property_table(properties_list)
         supported_keys = {
             key
             for row in state_table
             for key in (row["energy_key"], row["force_key"])
             if key is not None
         }
+        supported_keys.update(str(row["gap_key"]) for row in gap_table)
         unsupported = sorted(set(properties_list) - supported_keys)
         if unsupported:
             raise ValueError(
-                "The PySEQM interface currently supports only flattened sE#/F# "
-                f"properties; unsupported keys: {unsupported}."
+                "The PySEQM interface currently supports only flattened "
+                f"sE#/F#/dE# properties; unsupported keys: {unsupported}."
             )
 
         atoms = molecule_object.get_atoms()
@@ -721,6 +726,11 @@ def label_excited_state_molecule(
             results[str(row["force_key"])] = np.asarray(
                 forces[0, state_index], dtype=np.float64
             )
+    for row in gap_table:
+        results[str(row["gap_key"])] = float(
+            results[str(row["upper_energy_key"])]
+            - results[str(row["lower_energy_key"])]
+        )
     elapsed = time.time() - start_time
     _finish_log(
         log_handle,
@@ -738,6 +748,9 @@ def label_excited_state_molecule(
             "energy_offset_eV": float(offset),
             "energy_offset_source": offset_source,
             "n_excited_states": len(state_table),
+            "gap_properties": [
+                str(row["gap_key"]) for row in gap_table
+            ],
             **(
                 {"pyseqm_log_path": str(log_path)}
                 if log_path is not None

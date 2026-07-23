@@ -21,7 +21,9 @@
   "force_weight": 1.0,
   "l2_weight": 2.0e-5,
   "gap_targets": {
-    "enabled": false
+    "enabled": true,
+    "pairs": [[0, 1]],
+    "weight": 1.0
   },
   "valid_size": 0.1,
   "test_size": 0.1,

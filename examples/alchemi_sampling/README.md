@@ -76,6 +76,31 @@ batch is an ordinary Parsl task and may run on any available sampler GPU.
 Candidate metadata records `selected_state`, `sampler_device`,
 `sampler_worker_rank`, and `sampler_visible_device` for acceptance checks.
 
+The excited-state example also enables optional direct gap diagnostics. Add
+the corresponding gap property, such as
+`"dE01": ["gap_01", "system", 1.0]`, to the master `properties_list`.
+ALCHEMI computes each model member's state-energy difference before reducing
+the ensemble. Candidate metadata records the gap mean, population deviation,
+pair, and model count, but gaps do not affect uncertainty stopping or top-K
+ranking.
+
+The example also enables one-way Levine–Coe–Martinez gap seeking. Declare each
+adjacent gap needed by the configured states (`dE01`, `dE12`, `dE23` for
+states 0–3) and keep the corresponding state energies and forces in
+`properties_list`. At an ordinary `Ncheck`, every surviving replica tests only
+the adjacent declared pairs that contain its selected state. If its smallest
+absolute mean gap crosses `trigger_gap_threshold_eV`, that replica enters the
+LCM surface and remains there for the rest of the trajectory. Other replicas
+are unaffected.
+
+The triggering frame was produced by the direct selected-state surface, so a
+candidate captured at that check records `gap_seeking_current_mode: "direct"`.
+Candidates from later checks record `"lcm"` and carry the pair, trigger
+gap/step/time, and the single entry event. Uncertainty selection and ranking
+remain based on the original selected state. Disable `gap_diagnostics` if
+those general diagnostics are not wanted; gap seeking still loads the state
+energies and forces it needs.
+
 ## Darwin GPU acceptance profile
 
 Use `alframework.parsl_resource_configs.darwin.config_atdm_ml_short` for the

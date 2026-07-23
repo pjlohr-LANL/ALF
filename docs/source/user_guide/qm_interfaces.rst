@@ -83,6 +83,19 @@ molecule non-converged if the limit is exceeded. Zero or ``null`` disables the
 timeout. Optional logs include the selected state, ALCHEMI candidate context,
 device, solver settings, elapsed time, and failure details.
 
+Optional flattened gap labels are ordinary ALF system properties:
+
+.. code-block:: json
+
+   {
+     "dE01": ["gap_01", "system", 1.0]
+   }
+
+PySEQM derives ``dEij = sEj - sEi`` after producing all requested state
+energies. The common energy offset therefore cancels. Gap properties must use
+the same storage scale as both source energies. Missing or malformed gap
+schemas reject the molecule before labels are stored.
+
 PySEQM requires atoms to be ordered by decreasing atomic number. The interface
 performs that stable ordering internally and restores every state force to the
 original ALF atom order before storing results. Malformed or non-finite backend
@@ -92,8 +105,8 @@ metadata.
 This first integration intentionally submits one molecule per ALF QM task.
 PySEQM tensor evaluation still has a leading batch dimension of one, but there
 is no QM buffer or batching change in the main ALF driver. Periodic systems,
-gap properties, topology filtering, and pre-labeled bypasses are not supported
-by this interface version.
+topology filtering, and pre-labeled bypasses are not supported by this
+interface version.
 
 .. note::
 
