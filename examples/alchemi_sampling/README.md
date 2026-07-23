@@ -29,6 +29,15 @@ sequentially and therefore does not provide native batched inference speed.
 Candidate metadata and `status.txt` report which interface and loader were
 selected.
 
+Temperature parameters are sampled independently for every replica from
+`srt_temp`, `end_temp`, `amp_temp`, and `per_temp`. The sampler intentionally
+uses base ALF's legacy MLMD timing: it initializes at schedule time zero, runs
+one MD step, and performs the first check with reported time zero before each
+later `Ncheck` block. Returned candidates include the applied schedule updates
+in `temps` plus their sampled `Tamp`, `Tper`, `Tsrt`, and `Tend`. The default
+`friction_per_fs` is the ALCHEMI-unit equivalent of base MLMD's ASE friction of
+`0.02`.
+
 For excited-state checkpoints, set `model_mode` to `excited_state`, provide
 contiguous `sE#`/`F#` entries in the master `properties_list`, and have the
 builder place `selected_state` in each molecule's metadata.

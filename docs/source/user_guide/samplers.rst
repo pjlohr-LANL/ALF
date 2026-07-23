@@ -314,6 +314,22 @@ families can use the native calculator contract or ASE fallback. Set
 Periodic cells, density schedules, UDD bias, and reactive sampling remain on
 their existing sampler tasks.
 
+Temperature scheduling deliberately follows the established molecular MLMD
+loop exactly. Each replica independently samples ``Tamp``, ``Tper``, ``Tsrt``,
+and ``Tend`` from the configured ranges and starts at
+``annealing_schedule(0, ...)``. Dynamics advances one step before the first
+uncertainty check; that check is reported at time zero. Subsequent thermostat
+updates use the reported interval time before each ``Ncheck``-step block. This
+preserves MLMD's legacy one-``dt`` offset between reported time and the
+coordinates being checked. Candidate metadata stores the applied update
+history in ``temps`` and the four sampled schedule parameters. Temperature
+ranges must be finite, ordered two-value ranges, and sampled ``Tper`` values
+must be positive.
+
+``friction_per_fs`` is passed directly to ALCHEMI's BAOAB integrator. Its
+default, ``0.02 * ase.units.fs`` (approximately ``0.0019645`` per fs), matches
+the established ASE MLMD ``Langevin(..., friction=0.02)`` setting.
+
 Excited-state mode
 ~~~~~~~~~~~~~~~~~~
 

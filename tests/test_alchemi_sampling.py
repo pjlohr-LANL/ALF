@@ -1,9 +1,12 @@
 import numpy as np
 import pytest
-from ase import Atoms
+from ase import Atoms, units
 from ase.calculators.calculator import Calculator, all_changes
 
-from alframework.samplers.ASE_ensemble_constructor import MLMD_calculator
+from alframework.samplers.ASE_ensemble_constructor import (
+    MLMD_calculator,
+    Well_Potential,
+)
 import alframework.samplers.alchemi_sampling as alchemi_module
 from alframework.samplers.alchemi_sampling import (
     ALFASEAlchemiModel,
@@ -11,6 +14,7 @@ from alframework.samplers.alchemi_sampling import (
     ALFHippynnAlchemiModel,
     ALFNativeEnsembleModel,
     AlchemiDynamicsRunner,
+    DEFAULT_FRICTION_PER_FS,
     alchemi_calculator_status,
     calculate_uncertainty,
     load_alchemi_calculator,
@@ -18,6 +22,7 @@ from alframework.samplers.alchemi_sampling import (
     uncertainty_flags,
 )
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.tools import annealing_schedule
 from tests.helpers.fakes import FixedCalculator
 
 
@@ -73,8 +78,11 @@ class FakeRunner:
         random_seed,
         device,
     ):
-        del dt_fs, temperature_K, friction_per_fs, random_seed, device
+        del dt_fs, random_seed, device
         self.model = model
+        self.initial_temperature_K = np.asarray(temperature_K, dtype=float)
+        self.friction_per_fs = float(friction_per_fs)
+        self.temperature_calls = []
         self.positions = [atoms.get_positions().copy() for atoms in atoms_list]
         self.velocities = [np.zeros_like(value) for value in self.positions]
         self.frozen = set()
@@ -100,6 +108,7 @@ class FakeRunner:
 
     def set_temperature(self, temperature_K):
         self.temperature_K = np.asarray(temperature_K)
+        self.temperature_calls.append(self.temperature_K.copy())
 
     def sync_graph_to_atoms(self, graph_index, atoms):
         atoms.set_positions(self.positions[int(graph_index)])
@@ -182,6 +191,99 @@ def test_shared_torch_reduction_matches_mlmd_calculator():
     assert diagnostics["Es"] == pytest.approx(ase_model.results["energy_stdev"])
     assert diagnostics["Fs"] == pytest.approx(ase_model.results["forces_stdev_mean"])
     assert diagnostics["Fsmax"] == pytest.approx(ase_model.results["forces_stdev_max"])
+
+
+@pytest.mark.parametrize("mass_weighted", [True, False])
+def test_alchemi_well_matches_production_without_changing_uncertainty(
+    mass_weighted,
+):
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    origin = np.asarray([0.5, -0.25, 0.1])
+    atoms_list = [
+        Atoms(
+            "HHe",
+            positions=[origin, origin + np.asarray([1.2, 0.0, 0.0])],
+        ),
+        Atoms(
+            "HHe",
+            positions=[
+                origin + np.asarray([0.0, 1.0, 0.0]),
+                origin + np.asarray([0.0, 0.0, -1.5]),
+            ],
+        ),
+    ]
+    well_params = {
+        "r_start": 0.8,
+        "force": 0.3,
+        "origin": origin.tolist(),
+        "mass_weighted": mass_weighted,
+    }
+
+    class Batch:
+        positions = torch.as_tensor(
+            np.concatenate([atoms.get_positions() for atoms in atoms_list]),
+            dtype=torch.float32,
+        )
+        atomic_numbers = torch.as_tensor(
+            np.concatenate([atoms.get_atomic_numbers() for atoms in atoms_list]),
+            dtype=torch.long,
+        )
+        atomic_masses = torch.as_tensor(
+            np.concatenate([atoms.get_masses() for atoms in atoms_list]),
+            dtype=torch.float32,
+        )
+        num_graphs = 2
+        num_nodes_per_graph = torch.as_tensor([2, 2])
+
+    class RawEnsemble(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            return {
+                "energy_contributions": torch.tensor(
+                    [[1.0, 2.0], [3.0, 6.0]], device=batch.positions.device
+                ),
+                "force_contributions": torch.stack(
+                    [
+                        torch.zeros_like(batch.positions),
+                        2.0 * torch.ones_like(batch.positions),
+                    ]
+                ),
+            }
+
+    unbiased_model = RawEnsemble(device=torch.device("cpu"))
+    biased_model = RawEnsemble(
+        well_params=well_params,
+        device=torch.device("cpu"),
+    )
+    unbiased = unbiased_model(Batch())
+    biased = biased_model(Batch())
+
+    energy_delta = (biased["energy"] - unbiased["energy"]).detach().cpu().numpy()
+    energy_delta = energy_delta.reshape(-1)
+    force_delta = (biased["forces"] - unbiased["forces"]).detach().cpu().numpy()
+    force_delta = force_delta.reshape(2, 2, 3)
+    for graph_index, atoms in enumerate(atoms_list):
+        production_well = Well_Potential(**well_params)
+        production_well.calculate(atoms, properties=["energy", "forces"])
+        assert energy_delta[graph_index] == pytest.approx(
+            production_well.results["energy"], abs=1.0e-6
+        )
+        np.testing.assert_allclose(
+            force_delta[graph_index],
+            production_well.results["forces"],
+            atol=1.0e-6,
+        )
+
+    for graph_index in range(2):
+        unbiased_diagnostics = unbiased_model.diagnostics_for_graph(graph_index)
+        biased_diagnostics = biased_model.diagnostics_for_graph(graph_index)
+        for key in ("Es", "Fs", "Fsmax"):
+            assert biased_diagnostics[key] == pytest.approx(
+                unbiased_diagnostics[key]
+            )
 
 
 def test_ase_fallback_list_matches_shared_ensemble_reduction():
@@ -377,6 +479,123 @@ def test_stop_mode_freezes_each_replica_at_its_first_uncertainty():
     assert outputs[1].get_atoms().positions[0, 0] == pytest.approx(0.02)
     assert outputs[0].get_metadata()["calculator_interface"] == "ase_fallback"
     assert outputs[0].get_metadata()["calculator_loader"] == "custom.ase_loader"
+    assert created[0].friction_per_fs == pytest.approx(0.02 * units.fs)
+    assert DEFAULT_FRICTION_PER_FS == pytest.approx(0.02 * units.fs)
+
+
+def test_temperature_schedule_matches_legacy_timing_per_replica(monkeypatch):
+    temperature_parameters = [
+        {"Tamp": 10.0, "Tper": 0.2, "Tsrt": 100.0, "Tend": 160.0},
+        {"Tamp": 20.0, "Tper": 0.4, "Tsrt": 200.0, "Tend": 260.0},
+    ]
+    monkeypatch.setattr(
+        alchemi_module,
+        "_temperature_parameters",
+        lambda sampler_config, count, random_seed: temperature_parameters,
+    )
+    model = FakeModel(
+        {
+            0: [
+                {"Es": 0.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 0.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+            ],
+            1: [
+                {"Es": 0.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+            ],
+        }
+    )
+    config = _config(policy="stop")
+    config["maxt"] = 0.3
+    created = []
+
+    def factory(**kwargs):
+        runner = FakeRunner(**kwargs)
+        created.append(runner)
+        return runner
+
+    outputs = run_alchemi_sampling(
+        [_molecule("first"), _molecule("second")],
+        config,
+        model,
+        runner_factory=factory,
+    )
+
+    runner = created[0]
+    expected_by_time = [
+        np.asarray(
+            [
+                annealing_schedule(
+                    time_ps,
+                    config["maxt"],
+                    row["Tamp"],
+                    row["Tper"],
+                    row["Tsrt"],
+                    row["Tend"],
+                )
+                for row in temperature_parameters
+            ]
+        )
+        for time_ps in (0.0, 0.1)
+    ]
+    np.testing.assert_allclose(runner.initial_temperature_K, expected_by_time[0])
+    assert len(runner.temperature_calls) == 2
+    for actual, expected in zip(runner.temperature_calls, expected_by_time):
+        np.testing.assert_allclose(actual, expected)
+
+    metadata_by_parent = {
+        item.get_metadata()["parent_molecule_id"]: item.get_metadata()
+        for item in outputs
+    }
+    assert metadata_by_parent["first"]["temps"] == pytest.approx(
+        [expected_by_time[0][0], expected_by_time[1][0]]
+    )
+    assert metadata_by_parent["second"]["temps"] == pytest.approx(
+        [expected_by_time[0][1]]
+    )
+    for replica_index, parent_id in enumerate(("first", "second")):
+        metadata = metadata_by_parent[parent_id]
+        for key, value in temperature_parameters[replica_index].items():
+            assert metadata[key] == value
+        assert metadata["step"] * config["dt"] / 1000.0 == pytest.approx(
+            metadata["time_ps"] + config["dt"] / 1000.0
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("srt_temp", [300.0], "two-value numeric range"),
+        ("end_temp", ["cold", 300.0], "finite numeric values"),
+        ("amp_temp", [10.0, -10.0], "minimum must not exceed"),
+        ("srt_temp", [300.0, np.inf], "finite numeric values"),
+    ],
+)
+def test_temperature_schedule_rejects_malformed_ranges(key, value, message):
+    config = _config()
+    config[key] = value
+
+    with pytest.raises(ValueError, match=message):
+        run_alchemi_sampling(
+            [_molecule("first"), _molecule("second")],
+            config,
+            FakeModel({}),
+            runner_factory=FakeRunner,
+        )
+
+
+def test_temperature_schedule_rejects_sampled_nonpositive_period():
+    config = _config()
+    config["per_temp"] = [0.0, 0.0]
+
+    with pytest.raises(ValueError, match="nonpositive temperature period"):
+        run_alchemi_sampling(
+            [_molecule("first"), _molecule("second")],
+            config,
+            FakeModel({}),
+            runner_factory=FakeRunner,
+        )
 
 
 def test_stop_mode_honors_min_time_before_flagging():

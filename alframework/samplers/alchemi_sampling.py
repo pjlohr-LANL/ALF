@@ -118,8 +118,24 @@ def uncertainty_flags(
 
 def _sample_range(rng: np.random.Generator, value: Any, name: str) -> float:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError(f"{name} must be a two-value range.")
-    return float(rng.uniform(float(value[0]), float(value[1])))
+        raise ValueError(
+            f"{name} must be a two-value numeric range [minimum, maximum]."
+        )
+    try:
+        lower, upper = (float(value[0]), float(value[1]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must contain two finite numeric values; received {value!r}."
+        ) from exc
+    if not np.isfinite(lower) or not np.isfinite(upper):
+        raise ValueError(
+            f"{name} must contain two finite numeric values; received {value!r}."
+        )
+    if lower > upper:
+        raise ValueError(
+            f"{name} minimum must not exceed its maximum; received {value!r}."
+        )
+    return float(rng.uniform(lower, upper))
 
 
 def _temperature_parameters(
@@ -130,15 +146,20 @@ def _temperature_parameters(
 ) -> list[dict[str, float]]:
     rng = np.random.default_rng(int(random_seed))
     parameters = []
-    for _ in range(int(count)):
-        parameters.append(
-            {
-                "Tamp": _sample_range(rng, sampler_config["amp_temp"], "amp_temp"),
-                "Tper": _sample_range(rng, sampler_config["per_temp"], "per_temp"),
-                "Tsrt": _sample_range(rng, sampler_config["srt_temp"], "srt_temp"),
-                "Tend": _sample_range(rng, sampler_config["end_temp"], "end_temp"),
-            }
-        )
+    for replica_index in range(int(count)):
+        row = {
+            "Tamp": _sample_range(rng, sampler_config.get("amp_temp"), "amp_temp"),
+            "Tper": _sample_range(rng, sampler_config.get("per_temp"), "per_temp"),
+            "Tsrt": _sample_range(rng, sampler_config.get("srt_temp"), "srt_temp"),
+            "Tend": _sample_range(rng, sampler_config.get("end_temp"), "end_temp"),
+        }
+        if row["Tper"] <= 0:
+            raise ValueError(
+                "per_temp sampled a nonpositive temperature period "
+                f"({row['Tper']}) for replica {replica_index}; configure "
+                "strictly positive period bounds."
+            )
+        parameters.append(row)
     return parameters
 
 
@@ -220,7 +241,8 @@ def _candidate_record(
     distance: float,
     sampler_config: dict[str, Any],
     policy: str,
-    temperatures: dict[str, float],
+    temperature_parameters: dict[str, float],
+    temperature_history: list[float],
     selected_state_value: int | None,
 ) -> dict[str, Any]:
     return {
@@ -243,7 +265,8 @@ def _candidate_record(
         "distmin": float(distance),
         "distcut": float(sampler_config.get("distcut", 1.2)),
         "selected_state": selected_state_value,
-        **temperatures,
+        "temps": [float(value) for value in temperature_history],
+        **temperature_parameters,
     }
 
 
@@ -275,7 +298,7 @@ def run_alchemi_sampling(
     if sampler_config.get("translate_to_center", False):
         for atoms in atoms_list:
             atoms.set_positions(atoms.get_positions() - atoms.get_center_of_mass())
-    temperatures = _temperature_parameters(
+    temperature_parameters = _temperature_parameters(
         sampler_config,
         count=len(molecule_objects),
         random_seed=random_seed,
@@ -283,10 +306,15 @@ def run_alchemi_sampling(
     initial_temperatures = np.asarray(
         [
             annealing_schedule(0.0, maxt, row["Tamp"], row["Tper"], row["Tsrt"], row["Tend"])
-            for row in temperatures
+            for row in temperature_parameters
         ],
         dtype=float,
     )
+    friction_per_fs = float(
+        sampler_config.get("friction_per_fs", DEFAULT_FRICTION_PER_FS)
+    )
+    if not np.isfinite(friction_per_fs) or friction_per_fs < 0:
+        raise ValueError("friction_per_fs must be a finite nonnegative value.")
     if runner_factory is None:
         runner_factory = AlchemiDynamicsRunner
     runner = runner_factory(
@@ -294,14 +322,17 @@ def run_alchemi_sampling(
         atoms_list=atoms_list,
         dt_fs=dt,
         temperature_K=initial_temperatures,
-        friction_per_fs=float(sampler_config.get("friction_per_fs", DEFAULT_FRICTION_PER_FS)),
+        friction_per_fs=friction_per_fs,
         random_seed=random_seed,
         device=device,
     )
 
     active = np.ones(len(molecule_objects), dtype=bool)
+    temperature_histories: list[list[float]] = [[] for _ in molecule_objects]
     candidates: list[dict[str, Any]] = []
     n_outer = int(np.ceil((1000.0 * maxt) / (dt * ncheck)))
+    # Preserve molecular MLMD's legacy clock: advance once, then label the
+    # first uncertainty check and thermostat update as time zero.
     runner.run(1)
     for iteration in range(n_outer):
         if not np.any(active):
@@ -337,7 +368,8 @@ def run_alchemi_sampling(
                 distance=distance,
                 sampler_config=sampler_config,
                 policy=policy,
-                temperatures=temperatures[index],
+                temperature_parameters=temperature_parameters[index],
+                temperature_history=temperature_histories[index],
                 selected_state_value=selected_state_value,
             )
             candidates.append(
@@ -366,10 +398,14 @@ def run_alchemi_sampling(
                     row["Tsrt"],
                     row["Tend"],
                 )
-                for row in temperatures
+                for row in temperature_parameters
             ],
             dtype=float,
         )
+        for index in np.where(active)[0]:
+            temperature_histories[int(index)].append(
+                float(target_temperatures[int(index)])
+            )
         runner.set_temperature(target_temperatures)
         runner.run(ncheck)
 
