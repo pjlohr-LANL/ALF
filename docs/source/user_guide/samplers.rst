@@ -47,6 +47,10 @@ Supported Sampler Tasks
        structures for QM labeling.
      - Reaction-pathway active learning with reactant, transition-state, and
        product structures.
+   * - ``alframework.samplers.alchemi_sampling.alchemi_sampling_task``
+     - Runs strict-full batched BAOAB dynamics with a HIPPYNN ensemble through
+       NVIDIA ALCHEMI and supports stop-on-uncertainty or continued sampling.
+     - GPU-resident, nonperiodic ground- or excited-state molecular dynamics.
 
 Common Configuration Fields
 ---------------------------
@@ -216,6 +220,88 @@ Reactive sampler fields
         - Multiplier applied to ``Fscut`` for maximum force uncertainty. The
           default is ``3.0``.
 
+ALCHEMI batched sampling
+------------------------
+
+Select the dedicated ALCHEMI task in the master configuration. Existing MLMD,
+UDD, reactive, and NeuroChem task names continue to use their original
+implementations.
+
+.. code-block:: json
+
+   {
+     "sampler_task": "alframework.samplers.alchemi_sampling.alchemi_sampling_task"
+   }
+
+The sampler configuration retains the existing MLMD thresholds and temperature
+ranges and adds the following fields:
+
+.. code-block:: json
+
+   {
+     "model_mode": "ground_state",
+     "uncertainty_policy": "stop",
+     "return_top_n": 1,
+     "friction_per_fs": 0.0019645,
+     "alchemi_baoab": {
+       "batch_size": 50,
+       "partial_policy": "full_only",
+       "strict_gpu": true,
+       "allow_cpu_debug": false,
+       "random_seed": 42
+     }
+   }
+
+``stop`` is the compatibility mode. Each replica is frozen independently at
+its first valid uncertainty event, while other replicas in the GPU batch keep
+running. At most one candidate is returned for each input replica.
+
+``continue`` keeps uncertain replicas active. At every ``Ncheck`` interval,
+qualifying frames are ranked across the whole task batch using
+``max(Es/Escut, Fs/Fscut, Fsmax/(3*Fscut))``. Only the global
+``return_top_n`` frames are returned. Results are sent directly through Parsl,
+so large values of ``return_top_n`` increase task-result serialization and
+driver memory use.
+
+Batches are grouped by exact atomic-number sequence. Excited-state batches are
+also grouped by selected state. ``partial_policy`` currently accepts only
+``full_only``: incomplete buckets stay in the running ALF driver's memory,
+remain there across model retraining, and use the latest model when they
+eventually fill. ``status.txt`` reports bucket counts and ages. The buffers are
+not checkpointed across a driver restart.
+
+The first ALCHEMI implementation supports nonperiodic, fixed-cell HIPPYNN
+models. Set ``end_dens``, ``amp_dens``, and ``per_dens`` to ``null``. Existing
+``MLMD_calculator_options.well_params`` spherical-well settings are supported.
+Periodic cells, density schedules, UDD bias, reactive sampling, and NeuroChem
+remain on their existing sampler tasks.
+
+Excited-state mode
+~~~~~~~~~~~~~~~~~~
+
+Set ``model_mode`` to ``excited_state`` and attach ``selected_state`` metadata
+to each input molecule. The master ``properties_list`` uses a flat state
+contract:
+
+.. code-block:: json
+
+   {
+     "sE0": ["state_0_energy", "system", 1.0],
+     "F0": ["state_0_forces", "atomic", 1.0],
+     "sE1": ["state_1_energy", "system", 1.0],
+     "F1": ["state_1_forces", "atomic", 1.0]
+   }
+
+State numbers must be contiguous from zero, and every sampled state requires a
+force property. Dynamics uses the selected state's ensemble-mean energy and
+force; uncertainty uses that state's population energy and force deviations.
+Gap targets, gap scoring, GUDD, hysteresis, and Martinez--Levine gap seeking are
+not enabled by this sampler version.
+
+For ``--test_sampler``, use a debug sampler configuration with
+``alchemi_baoab.batch_size`` set to ``1`` because the stage-test command obtains
+one builder result.
+
 What The Sampler Returns
 ------------------------
 
@@ -226,6 +312,10 @@ task queue for labeling.
 If sampling completes without selecting a configuration, the sampler sets the
 atoms to ``None`` on the returned ``MoleculesObject``. ALF treats this as a
 successful sampling attempt that does not need QM labeling.
+
+The ALCHEMI sampler instead returns a list containing zero or more
+``MoleculesObject`` candidates. The driver normalizes both interfaces before
+QM submission.
 
 Sampler metadata records the relevant diagnostics, including uncertainty
 values, temperature and density schedule history, distance checks, selection
@@ -274,3 +364,4 @@ You can link from this guide directly to API pages:
 * :doc:`MLMD sampling module <../api_documentation/alframework.samplers.mlmd_sampling>`
 * :doc:`Reactive sampler module <../api_documentation/alframework.samplers.reactive_sampler>`
 * :doc:`ASE ensemble calculator module <../api_documentation/alframework.samplers.ASE_ensemble_constructor>`
+* :doc:`ALCHEMI sampling module <../api_documentation/alframework.samplers.alchemi_sampling>`

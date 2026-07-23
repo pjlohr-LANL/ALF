@@ -30,6 +30,12 @@ test_requirements = [
     "pytest",
 ]
 
+gpu_dynamics_requirements = [
+    "hippynn",
+    "torch",
+    "nvalchemi-toolkit>=0.1.0,<0.2",
+]
+
 setuptools.setup(
     name="alf",
     version="0.0.1",
@@ -37,7 +43,12 @@ setuptools.setup(
     author_email="",
     python_requires=">3.9",
     install_requires=install_requirements,
-    extras_require={"docs": doc_requirements, "full": full_requirements, "tests": test_requirements},
+    extras_require={
+        "docs": doc_requirements,
+        "full": full_requirements,
+        "tests": test_requirements,
+        "gpu_dynamics": gpu_dynamics_requirements,
+    },
     license="BSD 3-Clause License",
     classifiers=[
         "Development Status :: 3 - Alpha",

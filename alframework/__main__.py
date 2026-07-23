@@ -30,6 +30,10 @@ from alframework.tools.tools import load_module_from_string
 from alframework.tools.tools import build_input_dict
 from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.sampler_batching import SamplerBatchBuffer
+from alframework.tools.sampler_batching import flatten_molecule_output
+from alframework.tools.sampler_batching import sampler_batch_size
+from alframework.tools.sampler_batching import sampler_uses_batches
 #import logging
 #logging.basicConfig(level=logging.DEBUG)
 
@@ -66,6 +70,7 @@ QM_task_queue = parsl_task_queue()
 ML_task_queue = parsl_task_queue()
 builder_task_queue = parsl_task_queue()
 sampler_task_queue = parsl_task_queue()
+sampler_batch_buffer = SamplerBatchBuffer()
 
 if (args.test_builder or args.test_qm or args.test_sampler or args.test_ml) and 'parsl_debug_configuration' in master_config:
     parsl_configuration = load_module_from_string(master_config['parsl_debug_configuration'])
@@ -107,6 +112,34 @@ for cur_Exec in sampler_task.executors:
     if cur_Exec.replace('_executor', '_standby_executor') in executor_list:
         sampler_task.executors.append(cur_Exec.replace('_executor', '_standby_executor'))
 
+
+def submit_sampler_batch(molecule_objects):
+    """Submit either a legacy single input or a strict-full sampler batch."""
+    if sampler_uses_batches(sampler_config):
+        feed = {"molecule_objects": molecule_objects, "sampler_config": sampler_config}
+    else:
+        if len(molecule_objects) != 1:
+            raise ValueError("Legacy sampler tasks accept exactly one molecule.")
+        feed = {"molecule_object": molecule_objects[0], "sampler_config": sampler_config}
+    task_input = build_input_dict(
+        sampler_task.func,
+        [feed, *all_configs, status],
+        raise_on_fail=True,
+    )
+    sampler_task_queue.add_task(sampler_task(**task_input))
+
+
+def route_molecule_to_sampler(molecule):
+    """Buffer a batched input or immediately submit a legacy sampler task."""
+    if sampler_uses_batches(sampler_config):
+        sampler_batch_buffer.add(molecule, sampler_config)
+        for ready_batch in sampler_batch_buffer.pop_ready(
+            sampler_batch_size(sampler_config)
+        ):
+            submit_sampler_batch(ready_batch)
+    else:
+        submit_sampler_batch([molecule])
+
 # QM
 qm_task = load_module_from_string(master_config['QM_task'])
 for cur_Exec in qm_task.executors:
@@ -144,6 +177,7 @@ else:
     status['lifetime_failed_ML_tasks'] = 0
     status['lifetime_failed_QM_tasks'] = 0
 
+status['sampler_batching'] = sampler_batch_buffer.status()
 with open(master_config['status_path'], "w") as outfile:
     json.dump(status, outfile, indent=2)
 
@@ -176,14 +210,31 @@ if args.test_sampler:
     if status['current_model_id'] < 0:
         raise RuntimeError("Need to train model before testing sampling")
     print(master_config['model_path'].format(status['current_model_id']))
+    if sampler_uses_batches(sampler_config):
+        if sampler_batch_size(sampler_config) != 1:
+            raise ValueError(
+                "--test_sampler uses one builder result; set "
+                "alchemi_baoab.batch_size to 1 in the debug sampler config."
+            )
+        sampler_feed = {
+            "molecule_objects": [test_configuration],
+            "sampler_config": sampler_config,
+        }
+    else:
+        sampler_feed = {
+            "molecule_object": test_configuration,
+            "sampler_config": sampler_config,
+        }
     task_input = build_input_dict(sampler_task.func,
-                                  [{"molecule_object": test_configuration, "sampler_config": sampler_config},
-                                   *all_configs, status],
+                                  [sampler_feed, *all_configs, status],
                                   raise_on_fail=True)
     sampler_task_queue.add_task(sampler_task(**task_input))
     sampled_configuration = sampler_task_queue.task_list[0].result()
     queue_output = sampler_task_queue.get_task_results()
-    test_configuration = queue_output[0][0]
+    sampler_outputs = flatten_molecule_output(queue_output[0][0])
+    if not sampler_outputs:
+        raise RuntimeError("Sampler testing returned no configuration for QM labeling.")
+    test_configuration = sampler_outputs[0]
     assert isinstance(test_configuration, MoleculesObject), 'test_configuration must be a MoleculesObject instance'
     print("Sampler testing returned:")
     print(test_configuration)
@@ -371,7 +422,7 @@ while True:
     # Run more builders
     if (QM_task_queue.get_queued_number() < master_config['target_queued_QM']) and \
             (QM_task_queue.get_number() < master_config.get('maximum_completed_QM', 1e12)):
-        while sampler_task_queue.get_number() + builder_task_queue.get_number() * master_config.get('maximum_builder_structures', 1) \
+        while sampler_task_queue.get_number() * sampler_batch_size(sampler_config) + builder_task_queue.get_number() * master_config.get('maximum_builder_structures', 1) \
                 < master_config['parallel_samplers']:
             moleculeids = ['mol-{:04d}-{:010d}'.format(status['current_model_id'], it_ind) for it_ind in
                            range(status['current_molecule_id'], status['current_molecule_id']+master_config.get('maximum_builder_structures',1))]
@@ -387,37 +438,23 @@ while True:
     if builder_task_queue.get_exec_done_number() > 0:
         structure_list, failed = builder_task_queue.get_task_results()
         status['lifetime_failed_builder_tasks'] = status['lifetime_failed_builder_tasks'] + failed
-        # Douple loop to facilitate possiblitiy of multiple sctructures returned by builder
+        # Flatten builder lists before routing structures through the sampler.
         for structure in structure_list:
-            # If builders return a single structure:
-            if isinstance(structure, MoleculesObject):
-                task_input = build_input_dict(sampler_task.func,
-                                              [{"molecule_object": structure, "sampler_config": sampler_config},
-                                               *all_configs, status],
-                                              raise_on_fail=True)
-                sampler_task_queue.add_task(sampler_task(**task_input))
-            # If builders return multiple structures
-            elif isinstance(structure, list):
-                for substructure in structure:
-                    assert isinstance(substructure, MoleculesObject), 'substructure must be a MoleculesObject instance'
-                    task_input = build_input_dict(sampler_task.func,
-                                                  [{"molecule_object": substructure, "sampler_config": sampler_config},
-                                                   *all_configs, status],
-                                                  raise_on_fail=True)
-                    sampler_task_queue.add_task(sampler_task(**task_input))
+            for substructure in flatten_molecule_output(structure):
+                route_molecule_to_sampler(substructure)
 
     # Run more QM
     if sampler_task_queue.get_completed_number() > master_config['minimum_QM']:
         sampler_results, failed = sampler_task_queue.get_task_results()
         status['lifetime_failed_sampler_tasks'] = status['lifetime_failed_sampler_tasks'] + failed
-        for structure in sampler_results: #may need [0]
-            assert isinstance(structure, MoleculesObject), 'structure must be a MoleculesObject instance'
-            if structure.get_atoms() is not None:
-                task_input = build_input_dict(qm_task.func,
-                                              [{"molecule_object": structure, "QM_config": QM_config}, master_config,
-                                               *all_configs, status],
-                                              raise_on_fail=True)
-                QM_task_queue.add_task(qm_task(**task_input))
+        for sampler_output in sampler_results:
+            for structure in flatten_molecule_output(sampler_output):
+                if structure.get_atoms() is not None:
+                    task_input = build_input_dict(qm_task.func,
+                                                  [{"molecule_object": structure, "QM_config": QM_config}, master_config,
+                                                   *all_configs, status],
+                                                  raise_on_fail=True)
+                    QM_task_queue.add_task(qm_task(**task_input))
 
     # Train more models
     if (QM_task_queue.get_completed_number() > master_config['save_h5_threshold']) and (ML_task_queue.get_number() < 1):
@@ -457,6 +494,10 @@ while True:
     builder_task_queue.print_status()
     print("sampling status:")
     sampler_task_queue.print_status()
+    status['sampler_batching'] = sampler_batch_buffer.status()
+    if sampler_uses_batches(sampler_config):
+        print("sampler strict-full buffer:")
+        print(status['sampler_batching'])
     print("QM status:")
     QM_task_queue.print_status()
     print("ML status:")

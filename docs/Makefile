@@ -8,7 +8,7 @@ SPHINXBUILD   ?= sphinx-build
 SOURCEDIR     = source
 BUILDDIR      = build
 
-APIDOCOPTS = --separate --implicit-namespaces --module-first -d 5 --templatedir source/_templates
+APIDOCOPTS = --force --separate --implicit-namespaces --module-first -d 5 --templatedir source/_templates
 
 
 # Put it first so that "make" without argument is like "make help".

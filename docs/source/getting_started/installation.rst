@@ -74,6 +74,20 @@ workflow-specific. ASE-supported QM engines can still require separately
 installed executables, environment variables, pseudopotential paths, and license
 or module setup.
 
+ALCHEMI GPU dynamics
+~~~~~~~~~~~~~~~~~~~~
+
+Install HIPPYNN, PyTorch, and the supported NVIDIA ALCHEMI release with the
+``gpu_dynamics`` extra:
+
+.. code-block:: bash
+
+   python -m pip install -e ".[gpu_dynamics]"
+
+ALF currently targets ``nvalchemi-toolkit>=0.1.0,<0.2``. A CUDA-capable worker
+is required for production sampling. CPU execution is available only as an
+explicit debugging mode for small smoke tests.
+
 See :doc:`../user_guide/ml_interfaces`, :doc:`../user_guide/qm_interfaces`, and
 :doc:`../user_guide/builders` for backend-specific configuration patterns.
 
