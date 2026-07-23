@@ -45,6 +45,22 @@ def sampler_batch_size(sampler_config: dict[str, Any]) -> int:
     return size
 
 
+def _nonnegative_integer(value: Any, *, name: str) -> int:
+    """Return one validated nonnegative queue or capacity count."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a nonnegative integer.")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a nonnegative integer.") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{name} must be a nonnegative integer.")
+    if normalized < 0:
+        raise ValueError(f"{name} must be a nonnegative integer.")
+    return normalized
+
+
 def _state_index(value: Any, *, name: str) -> int:
     """Return one validated, nonnegative electronic-state index."""
 
@@ -151,6 +167,211 @@ def validate_state_selection(
             f"properties_list; available states are {sorted(available)}."
         )
     return selection
+
+
+def sampler_batching_signature(
+    master_config: dict[str, Any],
+    sampler_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the batching-critical portion of the live ALF configuration."""
+
+    batched = sampler_uses_batches(sampler_config)
+    mode = str(
+        sampler_config.get("model_mode", "ground_state")
+    ).strip().lower()
+    if mode not in {"ground_state", "excited_state"}:
+        raise ValueError(
+            "model_mode must be either 'ground_state' or 'excited_state'."
+        )
+    if batched:
+        batch_size = sampler_batch_size(sampler_config)
+        partial_policy = str(
+            sampler_config["alchemi_baoab"].get(
+                "partial_policy", "full_only"
+            )
+        ).strip().lower()
+        selection = _configured_state_selection(sampler_config)
+        state_selection = (
+            None
+            if selection is None
+            else {
+                "mode": selection[0],
+                "states": list(selection[1]),
+            }
+        )
+    else:
+        batch_size = 1
+        partial_policy = None
+        state_selection = None
+    return {
+        "sampler_task": str(master_config.get("sampler_task", "")),
+        "batched": bool(batched),
+        "batch_size": int(batch_size),
+        "partial_policy": partial_policy,
+        "model_mode": mode,
+        "state_selection": state_selection,
+    }
+
+
+def changed_batching_signature_fields(
+    current_master_config: dict[str, Any],
+    current_sampler_config: dict[str, Any],
+    new_master_config: dict[str, Any],
+    new_sampler_config: dict[str, Any],
+) -> list[str]:
+    """Return batching-critical fields changed by a proposed hot reload."""
+
+    current = sampler_batching_signature(
+        current_master_config, current_sampler_config
+    )
+    proposed = sampler_batching_signature(
+        new_master_config, new_sampler_config
+    )
+    return sorted(
+        key for key in current if current[key] != proposed[key]
+    )
+
+
+def validate_batching_config_reload(
+    current_master_config: dict[str, Any],
+    current_sampler_config: dict[str, Any],
+    new_master_config: dict[str, Any],
+    new_sampler_config: dict[str, Any],
+    sampler_batch_buffer: "SamplerBatchBuffer",
+) -> list[str]:
+    """Reject incompatible hot reloads while strict-full inputs are waiting.
+
+    The proposed signature is always validated.  A critical change is safe
+    once no molecule remains in the strict-full input buffer.  Already
+    submitted tasks retain their recorded replica widths separately.
+    """
+
+    changed = changed_batching_signature_fields(
+        current_master_config,
+        current_sampler_config,
+        new_master_config,
+        new_sampler_config,
+    )
+    buffered_count = len(sampler_batch_buffer)
+    if changed and buffered_count:
+        raise ValueError(
+            "Cannot apply batching-critical configuration changes while "
+            f"{buffered_count} sampler structure(s) are buffered. "
+            "Changed fields: "
+            + ", ".join(changed)
+            + ". ALF retained the current configuration and buffer; retry "
+            "after the buffer is empty."
+        )
+    return changed
+
+
+def sampler_task_replicas(
+    tasks: Iterable[Any],
+    task_replica_counts: dict[int, Any],
+    *,
+    completed_only: bool = False,
+) -> int:
+    """Count input replicas represented by registered sampler tasks.
+
+    Replica widths are recorded when each task is submitted.  This keeps
+    accounting correct when a batching-critical reload is accepted after the
+    input buffer empties but tasks from the previous batch width are still
+    running.
+    """
+
+    total = 0
+    for task in tasks:
+        if completed_only and not task.done():
+            continue
+        task_key = id(task)
+        if task_key not in task_replica_counts:
+            raise RuntimeError(
+                "Sampler task is missing its input-replica accounting entry."
+            )
+        total += _nonnegative_integer(
+            task_replica_counts[task_key],
+            name="sampler task replica count",
+        )
+    return total
+
+
+def sampler_capacity_status(
+    *,
+    parallel_sampler_limit: Any,
+    submitted_sampler_replicas: Any,
+    builder_task_count: Any,
+    maximum_builder_structures: Any,
+    buffered_structure_count: Any,
+) -> dict[str, int]:
+    """Return replica-based accounting for ALF's sampler capacity."""
+
+    limit = _nonnegative_integer(
+        parallel_sampler_limit,
+        name="parallel_sampler_limit",
+    )
+    submitted = _nonnegative_integer(
+        submitted_sampler_replicas,
+        name="submitted_sampler_replicas",
+    )
+    builder_tasks = _nonnegative_integer(
+        builder_task_count,
+        name="builder_task_count",
+    )
+    builder_width = _nonnegative_integer(
+        maximum_builder_structures,
+        name="maximum_builder_structures",
+    )
+    if builder_width < 1:
+        raise ValueError("maximum_builder_structures must be at least one.")
+    buffered = _nonnegative_integer(
+        buffered_structure_count,
+        name="buffered_structure_count",
+    )
+    builder_capacity = builder_tasks * builder_width
+    total = submitted + builder_capacity + buffered
+    return {
+        "parallel_sampler_limit": limit,
+        "submitted_sampler_replicas": submitted,
+        "pending_builder_replicas": builder_capacity,
+        "buffered_replicas": buffered,
+        "accounted_replicas": total,
+        "available_replica_slots": max(0, limit - total),
+    }
+
+
+def sampler_has_builder_capacity(
+    capacity_status: dict[str, Any],
+    maximum_builder_structures: Any,
+) -> bool:
+    """Return whether one more builder fits without exceeding the limit."""
+
+    builder_width = _nonnegative_integer(
+        maximum_builder_structures,
+        name="maximum_builder_structures",
+    )
+    if builder_width < 1:
+        raise ValueError("maximum_builder_structures must be at least one.")
+    available = _nonnegative_integer(
+        capacity_status.get("available_replica_slots"),
+        name="sampler_capacity.available_replica_slots",
+    )
+    return available >= builder_width
+
+
+def configured_sampler_calculator_status(
+    sampler_config: dict[str, Any],
+) -> dict[str, str] | None:
+    """Describe the configured calculator for status output."""
+
+    if not sampler_uses_batches(sampler_config):
+        return None
+    native_loader = sampler_config.get("alchemi_calculator")
+    if native_loader:
+        return {"interface": "native", "loader": str(native_loader)}
+    ase_loader = sampler_config.get("ase_calculator")
+    if ase_loader:
+        return {"interface": "ase_fallback", "loader": str(ase_loader)}
+    return {"interface": "unconfigured", "loader": ""}
 
 
 def _molecule_sequence_index(molecule: MoleculesObject) -> int:
@@ -273,6 +494,32 @@ def flatten_molecule_output(output: Any) -> list[MoleculesObject]:
     )
 
 
+def sampler_task_feed(
+    molecule_objects: list[MoleculesObject],
+    sampler_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the task feed for a legacy or strict-full sampler."""
+
+    molecules = list(molecule_objects)
+    if sampler_uses_batches(sampler_config):
+        expected = sampler_batch_size(sampler_config)
+        if len(molecules) != expected:
+            raise ValueError(
+                "Strict-full sampler tasks require exactly "
+                f"{expected} molecules; received {len(molecules)}."
+            )
+        return {
+            "molecule_objects": molecules,
+            "sampler_config": sampler_config,
+        }
+    if len(molecules) != 1:
+        raise ValueError("Legacy sampler tasks accept exactly one molecule.")
+    return {
+        "molecule_object": molecules[0],
+        "sampler_config": sampler_config,
+    }
+
+
 @dataclass
 class _BufferedMolecule:
     molecule: MoleculesObject
@@ -359,3 +606,22 @@ class SamplerBatchBuffer:
         for bucket in self._buckets.values():
             for entry in bucket:
                 yield entry.molecule
+
+
+def sampler_submission_groups(
+    molecule: MoleculesObject,
+    sampler_config: dict[str, Any],
+    sampler_batch_buffer: SamplerBatchBuffer,
+) -> list[list[MoleculesObject]]:
+    """Route one builder result into legacy or strict-full submission groups."""
+
+    if not isinstance(molecule, MoleculesObject):
+        raise TypeError(
+            "Sampler routing requires a MoleculesObject instance."
+        )
+    if not sampler_uses_batches(sampler_config):
+        return [[molecule]]
+    sampler_batch_buffer.add(molecule, sampler_config)
+    return sampler_batch_buffer.pop_ready(
+        sampler_batch_size(sampler_config)
+    )

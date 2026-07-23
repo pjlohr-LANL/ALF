@@ -31,9 +31,16 @@ from alframework.tools.tools import build_input_dict
 from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.sampler_batching import SamplerBatchBuffer
+from alframework.tools.sampler_batching import configured_sampler_calculator_status
 from alframework.tools.sampler_batching import flatten_molecule_output
 from alframework.tools.sampler_batching import sampler_batch_size
+from alframework.tools.sampler_batching import sampler_capacity_status
+from alframework.tools.sampler_batching import sampler_has_builder_capacity
+from alframework.tools.sampler_batching import sampler_submission_groups
+from alframework.tools.sampler_batching import sampler_task_replicas
+from alframework.tools.sampler_batching import sampler_task_feed
 from alframework.tools.sampler_batching import sampler_uses_batches
+from alframework.tools.sampler_batching import validate_batching_config_reload
 #import logging
 #logging.basicConfig(level=logging.DEBUG)
 
@@ -71,6 +78,7 @@ ML_task_queue = parsl_task_queue()
 builder_task_queue = parsl_task_queue()
 sampler_task_queue = parsl_task_queue()
 sampler_batch_buffer = SamplerBatchBuffer()
+sampler_task_replica_counts = {}
 
 if (args.test_builder or args.test_qm or args.test_sampler or args.test_ml) and 'parsl_debug_configuration' in master_config:
     parsl_configuration = load_module_from_string(master_config['parsl_debug_configuration'])
@@ -115,30 +123,52 @@ for cur_Exec in sampler_task.executors:
 
 def submit_sampler_batch(molecule_objects):
     """Submit either a legacy single input or a strict-full sampler batch."""
-    if sampler_uses_batches(sampler_config):
-        feed = {"molecule_objects": molecule_objects, "sampler_config": sampler_config}
-    else:
-        if len(molecule_objects) != 1:
-            raise ValueError("Legacy sampler tasks accept exactly one molecule.")
-        feed = {"molecule_object": molecule_objects[0], "sampler_config": sampler_config}
+    feed = sampler_task_feed(molecule_objects, sampler_config)
     task_input = build_input_dict(
         sampler_task.func,
         [feed, *all_configs, status],
         raise_on_fail=True,
     )
-    sampler_task_queue.add_task(sampler_task(**task_input))
+    task = sampler_task(**task_input)
+    sampler_task_queue.add_task(task)
+    sampler_task_replica_counts[id(task)] = len(molecule_objects)
 
 
 def route_molecule_to_sampler(molecule):
     """Buffer a batched input or immediately submit a legacy sampler task."""
-    if sampler_uses_batches(sampler_config):
-        sampler_batch_buffer.add(molecule, sampler_config)
-        for ready_batch in sampler_batch_buffer.pop_ready(
-            sampler_batch_size(sampler_config)
-        ):
-            submit_sampler_batch(ready_batch)
+    for submission_group in sampler_submission_groups(
+        molecule,
+        sampler_config,
+        sampler_batch_buffer,
+    ):
+        submit_sampler_batch(submission_group)
+
+
+def current_sampler_capacity_status():
+    """Return live replica-based capacity accounting for status and routing."""
+    return sampler_capacity_status(
+        parallel_sampler_limit=master_config['parallel_samplers'],
+        submitted_sampler_replicas=sampler_task_replicas(
+            sampler_task_queue.task_list,
+            sampler_task_replica_counts,
+        ),
+        builder_task_count=builder_task_queue.get_number(),
+        maximum_builder_structures=master_config.get(
+            'maximum_builder_structures', 1
+        ),
+        buffered_structure_count=len(sampler_batch_buffer),
+    )
+
+
+def refresh_sampler_driver_status():
+    """Refresh all sampler fields exposed in ALF's status file."""
+    status['sampler_batching'] = sampler_batch_buffer.status()
+    status['sampler_capacity'] = current_sampler_capacity_status()
+    calculator_status = configured_sampler_calculator_status(sampler_config)
+    if calculator_status is None:
+        status.pop('sampler_calculator', None)
     else:
-        submit_sampler_batch([molecule])
+        status['sampler_calculator'] = calculator_status
 
 # QM
 qm_task = load_module_from_string(master_config['QM_task'])
@@ -177,23 +207,7 @@ else:
     status['lifetime_failed_ML_tasks'] = 0
     status['lifetime_failed_QM_tasks'] = 0
 
-status['sampler_batching'] = sampler_batch_buffer.status()
-if sampler_uses_batches(sampler_config):
-    if sampler_config.get('alchemi_calculator'):
-        status['sampler_calculator'] = {
-            'interface': 'native',
-            'loader': str(sampler_config['alchemi_calculator']),
-        }
-    elif sampler_config.get('ase_calculator'):
-        status['sampler_calculator'] = {
-            'interface': 'ase_fallback',
-            'loader': str(sampler_config['ase_calculator']),
-        }
-    else:
-        status['sampler_calculator'] = {
-            'interface': 'unconfigured',
-            'loader': '',
-        }
+refresh_sampler_driver_status()
 with open(master_config['status_path'], "w") as outfile:
     json.dump(status, outfile, indent=2)
 
@@ -424,6 +438,28 @@ while True:
         
         # Load the ML config:
         ML_config_new = load_config_file(master_config_new['ML_config_path'], master_config_new['master_directory'])
+
+        validate_batching_config_reload(
+            master_config,
+            sampler_config,
+            master_config_new,
+            sampler_config_new,
+            sampler_batch_buffer,
+        )
+        sampler_task_new = sampler_task
+        if master_config_new['sampler_task'] != master_config['sampler_task']:
+            sampler_task_new = load_module_from_string(
+                master_config_new['sampler_task']
+            )
+            for cur_Exec in list(sampler_task_new.executors):
+                standby_executor = cur_Exec.replace(
+                    '_executor', '_standby_executor'
+                )
+                if (
+                    standby_executor in executor_list
+                    and standby_executor not in sampler_task_new.executors
+                ):
+                    sampler_task_new.executors.append(standby_executor)
     except Exception as e:
         print("Failed to re-load configuration files:")
         print(e)
@@ -433,13 +469,17 @@ while True:
         sampler_config = sampler_config_new
         QM_config = QM_config_new
         ML_config = ML_config_new
+        sampler_task = sampler_task_new
         all_configs = [master_config, builder_config, sampler_config, QM_config, ML_config]
+        refresh_sampler_driver_status()
 	
     # Run more builders
     if (QM_task_queue.get_queued_number() < master_config['target_queued_QM']) and \
             (QM_task_queue.get_number() < master_config.get('maximum_completed_QM', 1e12)):
-        while sampler_task_queue.get_number() * sampler_batch_size(sampler_config) + builder_task_queue.get_number() * master_config.get('maximum_builder_structures', 1) \
-                < master_config['parallel_samplers']:
+        while sampler_has_builder_capacity(
+            current_sampler_capacity_status(),
+            master_config.get('maximum_builder_structures', 1),
+        ):
             moleculeids = ['mol-{:04d}-{:010d}'.format(status['current_model_id'], it_ind) for it_ind in
                            range(status['current_molecule_id'], status['current_molecule_id']+master_config.get('maximum_builder_structures',1))]
             task_input = build_input_dict(builder_task.func,
@@ -460,8 +500,19 @@ while True:
                 route_molecule_to_sampler(substructure)
 
     # Run more QM
-    if sampler_task_queue.get_completed_number() > master_config['minimum_QM']:
+    if sampler_task_replicas(
+        sampler_task_queue.task_list,
+        sampler_task_replica_counts,
+        completed_only=True,
+    ) > master_config['minimum_QM']:
+        previous_sampler_tasks = list(sampler_task_queue.task_list)
         sampler_results, failed = sampler_task_queue.get_task_results()
+        remaining_sampler_task_ids = {
+            id(task) for task in sampler_task_queue.task_list
+        }
+        for task in previous_sampler_tasks:
+            if id(task) not in remaining_sampler_task_ids:
+                sampler_task_replica_counts.pop(id(task), None)
         status['lifetime_failed_sampler_tasks'] = status['lifetime_failed_sampler_tasks'] + failed
         for sampler_output in sampler_results:
             for structure in flatten_molecule_output(sampler_output):
@@ -510,10 +561,12 @@ while True:
     builder_task_queue.print_status()
     print("sampling status:")
     sampler_task_queue.print_status()
-    status['sampler_batching'] = sampler_batch_buffer.status()
+    refresh_sampler_driver_status()
     if sampler_uses_batches(sampler_config):
         print("sampler strict-full buffer:")
         print(status['sampler_batching'])
+        print("sampler replica capacity:")
+        print(status['sampler_capacity'])
         print("sampler calculator:")
         print(status['sampler_calculator'])
     print("QM status:")

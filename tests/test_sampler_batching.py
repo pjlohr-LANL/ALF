@@ -7,12 +7,23 @@ from alframework.builders.builders import simple_cfg_loader_task
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.sampler_batching import (
     SamplerBatchBuffer,
+    changed_batching_signature_fields,
+    configured_sampler_calculator_status,
     flatten_molecule_output,
     sampler_batch_key,
     sampler_batch_size,
+    sampler_batching_signature,
+    sampler_capacity_status,
+    sampler_has_builder_capacity,
+    sampler_submission_groups,
+    sampler_task_feed,
+    sampler_task_replicas,
     selected_state,
+    validate_batching_config_reload,
     validate_state_selection,
 )
+from alframework.tools.tools import parsl_task_queue
+from tests.helpers.fakes import FakeTask
 
 
 def _molecule(molecule_id, symbols="H2", state=None):
@@ -269,3 +280,307 @@ def test_batch_configuration_accepts_only_full_only_policy():
         sampler_batch_size(
             {"alchemi_baoab": {"batch_size": 3, "partial_policy": "timeout"}}
         )
+
+
+def test_replica_capacity_counts_tasks_builders_and_incomplete_buffer():
+    status = sampler_capacity_status(
+        parallel_sampler_limit=20,
+        submitted_sampler_replicas=8,
+        builder_task_count=1,
+        maximum_builder_structures=3,
+        buffered_structure_count=2,
+    )
+
+    assert status == {
+        "parallel_sampler_limit": 20,
+        "submitted_sampler_replicas": 8,
+        "pending_builder_replicas": 3,
+        "buffered_replicas": 2,
+        "accounted_replicas": 13,
+        "available_replica_slots": 7,
+    }
+
+
+def test_replica_capacity_preserves_legacy_task_units():
+    status = sampler_capacity_status(
+        parallel_sampler_limit=10,
+        submitted_sampler_replicas=3,
+        builder_task_count=2,
+        maximum_builder_structures=1,
+        buffered_structure_count=0,
+    )
+
+    assert status["submitted_sampler_replicas"] == 3
+    assert status["pending_builder_replicas"] == 2
+    assert status["accounted_replicas"] == 5
+    tasks = [
+        FakeTask("exec_done", result=[], done=True),
+        FakeTask("running", done=False),
+    ]
+    replica_counts = {id(tasks[0]): 1, id(tasks[1]): 1}
+    assert sampler_task_replicas(tasks, replica_counts) == 2
+    assert sampler_task_replicas(
+        tasks, replica_counts, completed_only=True
+    ) == 1
+
+
+def test_completed_batches_count_input_replicas_even_without_candidates():
+    queue = parsl_task_queue()
+    queue.add_task(FakeTask("exec_done", result=[], done=True))
+    queue.add_task(FakeTask("failed", done=True))
+
+    assert queue.get_completed_number() == 2
+    replica_counts = {id(task): 4 for task in queue.task_list}
+    assert sampler_task_replicas(
+        queue.task_list,
+        replica_counts,
+        completed_only=True,
+    ) == 8
+    results, failed = queue.get_task_results()
+    assert results == [[]]
+    assert failed == 1
+    assert queue.get_number() == 0
+
+
+def test_buffered_replicas_close_parallel_sampler_capacity():
+    config = {"alchemi_baoab": {"batch_size": 4}}
+    buffer = SamplerBatchBuffer()
+    for index in range(3):
+        buffer.add(_molecule(f"buffered-{index}"), config)
+
+    status = sampler_capacity_status(
+        parallel_sampler_limit=4,
+        submitted_sampler_replicas=0,
+        builder_task_count=1,
+        maximum_builder_structures=1,
+        buffered_structure_count=len(buffer),
+    )
+
+    assert status["accounted_replicas"] == 4
+    assert status["available_replica_slots"] == 0
+    assert not sampler_has_builder_capacity(status, 1)
+
+
+def test_sampler_submission_groups_and_feeds_preserve_legacy_behavior():
+    molecule = _molecule("legacy")
+    buffer = SamplerBatchBuffer()
+
+    groups = sampler_submission_groups(molecule, {}, buffer)
+
+    assert groups == [[molecule]]
+    assert len(buffer) == 0
+    assert sampler_task_feed(groups[0], {}) == {
+        "molecule_object": molecule,
+        "sampler_config": {},
+    }
+
+
+def test_sampler_submission_groups_emit_only_complete_batches():
+    config = {"alchemi_baoab": {"batch_size": 2}}
+    buffer = SamplerBatchBuffer()
+    first = _molecule("first")
+    second = _molecule("second")
+
+    assert sampler_submission_groups(first, config, buffer) == []
+    assert len(buffer) == 1
+    groups = sampler_submission_groups(second, config, buffer)
+
+    assert groups == [[first, second]]
+    assert len(buffer) == 0
+    assert sampler_task_feed(groups[0], config) == {
+        "molecule_objects": [first, second],
+        "sampler_config": config,
+    }
+
+
+def test_batching_signature_normalizes_state_selection_and_calculator():
+    master = {"sampler_task": "package.alchemi_task"}
+    config = {
+        "model_mode": "excited_state",
+        "state_selection": {"mode": "fixed", "selected_state": 1},
+        "alchemi_calculator": "package.native_loader",
+        "alchemi_baoab": {
+            "batch_size": 4,
+            "partial_policy": "full_only",
+        },
+    }
+
+    signature = sampler_batching_signature(master, config)
+
+    assert signature == {
+        "sampler_task": "package.alchemi_task",
+        "batched": True,
+        "batch_size": 4,
+        "partial_policy": "full_only",
+        "model_mode": "excited_state",
+        "state_selection": {"mode": "fixed", "states": [1]},
+    }
+    assert configured_sampler_calculator_status(config) == {
+        "interface": "native",
+        "loader": "package.native_loader",
+    }
+    assert configured_sampler_calculator_status({}) is None
+
+
+def test_noncritical_reload_is_accepted_without_reassigning_buffered_state():
+    master = {"sampler_task": "package.alchemi_task"}
+    current = {
+        "model_mode": "excited_state",
+        "state_selection": {"mode": "fixed", "state": 1},
+        "Escut": 1.0,
+        "alchemi_baoab": {"batch_size": 2},
+    }
+    proposed = {
+        **current,
+        "Escut": 2.0,
+        "gap_diagnostics": {"enabled": True},
+    }
+    buffer = SamplerBatchBuffer()
+    molecule = _molecule("waiting")
+    buffer.add(molecule, current)
+
+    assert validate_batching_config_reload(
+        master,
+        current,
+        master,
+        proposed,
+        buffer,
+    ) == []
+    assert next(buffer.molecules()) is molecule
+    assert molecule.get_metadata()["selected_state"] == 1
+
+
+@pytest.mark.parametrize(
+    "master_update,config_update,changed_field",
+    [
+        ({"sampler_task": "package.other_task"}, {}, "sampler_task"),
+        ({}, {"alchemi_baoab": None}, "batched"),
+        ({}, {"alchemi_baoab": {"batch_size": 3}}, "batch_size"),
+        ({}, {"model_mode": "ground_state"}, "model_mode"),
+        (
+            {},
+            {"state_selection": {"mode": "fixed", "state": 0}},
+            "state_selection",
+        ),
+    ],
+)
+def test_critical_reload_is_rejected_during_an_active_batching_epoch(
+    master_update,
+    config_update,
+    changed_field,
+):
+    master = {"sampler_task": "package.alchemi_task"}
+    current = {
+        "model_mode": "excited_state",
+        "state_selection": {"mode": "fixed", "state": 1},
+        "alchemi_baoab": {"batch_size": 2},
+    }
+    proposed_master = {**master, **master_update}
+    proposed_config = {**current, **config_update}
+    buffer = SamplerBatchBuffer()
+    waiting = _molecule("waiting")
+    buffer.add(waiting, current)
+
+    assert changed_field in changed_batching_signature_fields(
+        master,
+        current,
+        proposed_master,
+        proposed_config,
+    )
+    with pytest.raises(ValueError, match=changed_field):
+        validate_batching_config_reload(
+            master,
+            current,
+            proposed_master,
+            proposed_config,
+            buffer,
+        )
+    assert list(buffer.molecules()) == [waiting]
+
+
+def test_critical_reload_is_accepted_after_buffer_drains():
+    master = {"sampler_task": "package.alchemi_task"}
+    current = {"alchemi_baoab": {"batch_size": 2}}
+    proposed = {"alchemi_baoab": {"batch_size": 4}}
+    buffer = SamplerBatchBuffer()
+
+    assert validate_batching_config_reload(
+        master,
+        current,
+        master,
+        proposed,
+        buffer,
+    ) == ["batch_size"]
+
+
+def test_mixed_batch_width_tasks_keep_their_submitted_replica_counts():
+    old_batch = FakeTask("exec_done", result=[], done=True)
+    new_legacy = FakeTask("exec_done", result=[], done=True)
+    tasks = [old_batch, new_legacy]
+    replica_counts = {id(old_batch): 4, id(new_legacy): 1}
+
+    assert sampler_task_replicas(tasks, replica_counts) == 5
+    assert sampler_task_replicas(
+        tasks,
+        replica_counts,
+        completed_only=True,
+    ) == 5
+
+
+def test_builder_submission_requires_capacity_for_its_complete_width():
+    status = sampler_capacity_status(
+        parallel_sampler_limit=5,
+        submitted_sampler_replicas=4,
+        builder_task_count=0,
+        maximum_builder_structures=2,
+        buffered_structure_count=0,
+    )
+
+    assert status["available_replica_slots"] == 1
+    assert not sampler_has_builder_capacity(status, 2)
+    assert sampler_has_builder_capacity(status, 1)
+
+
+@pytest.mark.parametrize(
+    "current,proposed",
+    [
+        (
+            {"alchemi_baoab": {"batch_size": 2}},
+            {},
+        ),
+        (
+            {},
+            {"alchemi_baoab": {"batch_size": 2}},
+        ),
+        (
+            {
+                "model_mode": "excited_state",
+                "state_selection": {"mode": "fixed", "state": 0},
+                "alchemi_baoab": {"batch_size": 2},
+            },
+            {
+                "model_mode": "excited_state",
+                "state_selection": {
+                    "mode": "batch_cycle",
+                    "states": [0, 1],
+                },
+                "alchemi_baoab": {"batch_size": 2},
+            },
+        ),
+    ],
+)
+def test_batching_mode_and_state_changes_are_accepted_when_epoch_is_empty(
+    current,
+    proposed,
+):
+    master = {"sampler_task": "package.sampler_task"}
+
+    changed = validate_batching_config_reload(
+        master,
+        current,
+        master,
+        proposed,
+        SamplerBatchBuffer(),
+    )
+
+    assert changed

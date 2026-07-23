@@ -369,6 +369,32 @@ remain there across model retraining, and use the latest model when they
 eventually fill. ``status.txt`` reports bucket counts and ages. The buffers are
 not checkpointed across a driver restart.
 
+ALF accounts for batched sampler concurrency in input replicas rather than
+Parsl tasks. ``parallel_samplers`` includes replicas in submitted sampler
+tasks, the capacity represented by pending builder tasks, and structures
+waiting in incomplete sampler buckets. Likewise, ``minimum_QM`` counts
+completed input replicas, so a completed batch is drained even when it returns
+no candidates. A batch of 50 therefore counts as 50 trajectories; legacy
+single-input samplers retain their existing one-task/one-replica behavior.
+
+The status file exposes this accounting under ``sampler_capacity`` with the
+configured limit, submitted sampler replicas, pending builder replicas,
+buffered replicas, the accounted total, and available replica slots.
+``sampler_batching`` continues to report each incomplete compatibility bucket
+and its oldest age.
+
+Configuration reloads preserve incomplete structures. Changes to the sampler
+task, batched versus legacy mode, batch size, partial policy, model mode, or
+state-selection policy are rejected while a sampler batching epoch is active.
+An epoch remains active until the strict-full buffer is empty. ALF retains the
+complete previous configuration and reports the changed fields. Once the
+buffer is empty, the change is accepted and a changed sampler task is reloaded.
+Already-submitted tasks retain their recorded input-replica widths, so capacity
+and completion accounting remain correct across that boundary.
+Threshold, temperature, gap, ranking, and calculator-option edits remain safe
+to reload while structures wait and apply when those structures are eventually
+submitted.
+
 The first ALCHEMI implementation supports nonperiodic, fixed-cell models.
 HIPPYNN is the first fully validated native accelerated backend; other model
 families can use the native calculator contract or ASE fallback. Set

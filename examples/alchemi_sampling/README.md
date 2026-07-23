@@ -66,6 +66,23 @@ directly in the configured HDF5 store so ALF trains from them before sampling.
 }
 ```
 
+`parallel_samplers` and `minimum_QM` retain trajectory-based meanings with
+strict batching. For example, one submitted batch of 50 counts as 50 input
+replicas, not one Parsl task. Pending builders and incomplete buffered
+structures also count toward `parallel_samplers`, preventing the driver from
+oversubscribing builders while it waits for a compatible batch.
+
+The status file reports this under `sampler_capacity` and reports incomplete
+bucket counts and ages under `sampler_batching`. Incomplete buffers are
+memory-only and are not restored after a driver restart.
+
+Batch size, state-selection policy, model mode, sampler task, and batched versus
+legacy mode cannot be hot-reloaded until the current buffer is empty. ALF keeps
+the previous complete configuration instead of discarding or reinterpreting
+waiting molecules. Already-submitted tasks retain their original replica
+widths for capacity and completion accounting. Temperature, threshold, gap,
+ranking, and calculator-option changes can still reload while a batch waits.
+
 Explicit molecule metadata takes precedence over the configured policy. Use
 `state_selection.mode: "fixed"` with `state_selection.state` for a single
 dynamics surface. PySEQM still labels every state in `properties_list`; state
