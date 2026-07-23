@@ -1,15 +1,24 @@
 import numpy as np
 import pytest
 from ase import Atoms
+from ase.calculators.calculator import Calculator, all_changes
 
+from alframework.samplers.ASE_ensemble_constructor import MLMD_calculator
+import alframework.samplers.alchemi_sampling as alchemi_module
 from alframework.samplers.alchemi_sampling import (
+    ALFASEAlchemiModel,
+    ALFAlchemiCalculator,
     ALFHippynnAlchemiModel,
+    ALFNativeEnsembleModel,
     AlchemiDynamicsRunner,
+    alchemi_calculator_status,
     calculate_uncertainty,
+    load_alchemi_calculator,
     run_alchemi_sampling,
     uncertainty_flags,
 )
 from alframework.tools.molecules_class import MoleculesObject
+from tests.helpers.fakes import FixedCalculator
 
 
 def _molecule(molecule_id, distance=0.74, state=None):
@@ -97,6 +106,21 @@ class FakeRunner:
         atoms.set_velocities(self.velocities[int(graph_index)])
 
 
+def _torch_batch(torch, positions=None):
+    class Batch:
+        pass
+
+    batch = Batch()
+    if positions is None:
+        positions = np.zeros((4, 3), dtype=float)
+    batch.positions = torch.as_tensor(positions, dtype=torch.float32)
+    batch.atomic_numbers = torch.ones(4, dtype=torch.long)
+    batch.atomic_masses = torch.ones(4)
+    batch.num_graphs = 2
+    batch.num_nodes_per_graph = torch.as_tensor([2, 2])
+    return batch
+
+
 def test_uncertainty_statistics_match_production_population_std():
     metrics = calculate_uncertainty(
         [1.0, 3.0],
@@ -114,6 +138,209 @@ def test_uncertainty_statistics_match_production_population_std():
     assert flags["uncertainty_score"] == 2.0
 
 
+def test_shared_torch_reduction_matches_mlmd_calculator():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    class RawEnsemble(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            energy = torch.tensor(
+                [[1.0, 1.0], [3.0, 3.0]], device=batch.positions.device
+            )
+            forces_one = torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] * 2,
+                device=batch.positions.device,
+            )
+            forces_two = torch.tensor(
+                [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0]] * 2,
+                device=batch.positions.device,
+            )
+            return {
+                "energy_contributions": energy,
+                "force_contributions": torch.stack([forces_one, forces_two]),
+            }
+
+    model = RawEnsemble(device=torch.device("cpu"))
+    output = model(_torch_batch(torch))
+    diagnostics = model.diagnostics_for_graph(0)
+
+    atoms = _molecule("parity").get_atoms()
+    ase_model = MLMD_calculator(
+        [
+            FixedCalculator(1.0, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            FixedCalculator(3.0, [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0]]),
+        ]
+    )
+    ase_model.calculate(
+        atoms,
+        ["energy", "forces", "energy_stdev", "forces_stdev_mean", "forces_stdev_max"],
+    )
+
+    np.testing.assert_allclose(output["energy"].detach().numpy(), [[2.0], [2.0]])
+    assert diagnostics["Es"] == pytest.approx(ase_model.results["energy_stdev"])
+    assert diagnostics["Fs"] == pytest.approx(ase_model.results["forces_stdev_mean"])
+    assert diagnostics["Fsmax"] == pytest.approx(ase_model.results["forces_stdev_max"])
+
+
+def test_ase_fallback_list_matches_shared_ensemble_reduction():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    model = ALFASEAlchemiModel(
+        [
+            FixedCalculator(1.0, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            FixedCalculator(3.0, [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0]]),
+        ],
+        model_mode="ground_state",
+        selected_state_value=None,
+        device=torch.device("cpu"),
+        calculator_loader="tests.fake_loader",
+    )
+    output = model(_torch_batch(torch))
+    diagnostics = model.diagnostics_for_graph(1)
+
+    np.testing.assert_allclose(output["energy"].detach().numpy(), [[2.0], [2.0]])
+    assert diagnostics["Es"] == pytest.approx(1.0)
+    assert diagnostics["Fs"] == pytest.approx(1.0 / 3.0)
+    assert diagnostics["Fsmax"] == pytest.approx(1.0)
+    assert model.calculator_interface == "ase_fallback"
+
+
+def test_ase_fallback_uses_standard_uncertainty_properties():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    class StandardUncertaintyCalculator(Calculator):
+        implemented_properties = [
+            "energy",
+            "forces",
+            "energy_stdev",
+            "forces_stdev_mean",
+            "forces_stdev_max",
+        ]
+
+        def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {
+                "energy": 4.0,
+                "forces": np.zeros((len(atoms), 3)),
+                "energy_stdev": 2.5,
+                "forces_stdev_mean": 0.4,
+                "forces_stdev_max": 1.3,
+            }
+
+    model = ALFASEAlchemiModel(
+        StandardUncertaintyCalculator(),
+        model_mode="ground_state",
+        selected_state_value=None,
+        device=torch.device("cpu"),
+    )
+    model(_torch_batch(torch))
+
+    assert model.diagnostics_for_graph(0)["Es"] == pytest.approx(2.5)
+    assert model.diagnostics_for_graph(0)["Fs"] == pytest.approx(0.4)
+    assert model.diagnostics_for_graph(0)["Fsmax"] == pytest.approx(1.3)
+
+
+def test_ase_fallback_retains_legacy_neurochem_uncertainty():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    class NeuroChemLikeCalculator(FixedCalculator):
+        Estddev = 0.004
+
+        def get_Fstddev(self):
+            return 0.2, 0.7
+
+    model = ALFASEAlchemiModel(
+        NeuroChemLikeCalculator(1.0, np.zeros((2, 3))),
+        model_mode="ground_state",
+        selected_state_value=None,
+        device=torch.device("cpu"),
+        uncertainty_mode="neurochem",
+    )
+    model(_torch_batch(torch))
+
+    assert model.diagnostics_for_graph(0)["Es"] == pytest.approx(4.0)
+    assert model.diagnostics_for_graph(0)["Fs"] == pytest.approx(0.2)
+    assert model.diagnostics_for_graph(0)["Fsmax"] == pytest.approx(0.7)
+
+
+def test_ase_fallback_rejects_missing_excited_state_properties():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    model = ALFASEAlchemiModel(
+        FixedCalculator(1.0, np.zeros((2, 3))),
+        model_mode="excited_state",
+        selected_state_value=1,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(KeyError, match="sE1, F1"):
+        model(_torch_batch(torch))
+
+
+def test_ase_fallback_reads_flattened_excited_state_properties():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    class ExcitedCalculator(Calculator):
+        implemented_properties = ["sE1", "F1"]
+
+        def __init__(self, energy, force):
+            super().__init__()
+            self.energy = float(energy)
+            self.force = float(force)
+
+        def calculate(self, atoms=None, properties=("sE1",), system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {
+                "sE1": self.energy,
+                "F1": np.full((len(atoms), 3), self.force),
+            }
+
+    model = ALFASEAlchemiModel(
+        [ExcitedCalculator(2.0, 1.0), ExcitedCalculator(4.0, 3.0)],
+        model_mode="excited_state",
+        selected_state_value=1,
+        device=torch.device("cpu"),
+    )
+    output = model(_torch_batch(torch))
+
+    np.testing.assert_allclose(output["energy"].detach().numpy(), [[3.0], [3.0]])
+    np.testing.assert_allclose(output["forces"].detach().numpy(), np.full((4, 3), 2.0))
+    assert model.diagnostics_for_graph(0)["Es"] == pytest.approx(1.0)
+
+
+def test_shared_calculator_rejects_inconsistent_ensemble_sizes():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    class BadCalculator(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            return {
+                "energy_contributions": torch.zeros((2, batch.num_graphs)),
+                "force_contributions": torch.zeros((1, batch.positions.shape[0], 3)),
+            }
+
+    with pytest.raises(ValueError, match="same model count"):
+        BadCalculator(device=torch.device("cpu"))(_torch_batch(torch))
+
+
 def test_stop_mode_freezes_each_replica_at_its_first_uncertainty():
     model = FakeModel(
         {
@@ -124,6 +351,8 @@ def test_stop_mode_freezes_each_replica_at_its_first_uncertainty():
             ],
         }
     )
+    model.calculator_interface = "ase_fallback"
+    model.calculator_loader = "custom.ase_loader"
     created = []
 
     def factory(**kwargs):
@@ -146,6 +375,8 @@ def test_stop_mode_freezes_each_replica_at_its_first_uncertainty():
     assert created[0].frozen == {0, 1}
     assert outputs[0].get_atoms().positions[0, 0] == pytest.approx(0.01)
     assert outputs[1].get_atoms().positions[0, 0] == pytest.approx(0.02)
+    assert outputs[0].get_metadata()["calculator_interface"] == "ase_fallback"
+    assert outputs[0].get_metadata()["calculator_loader"] == "custom.ase_loader"
 
 
 def test_stop_mode_honors_min_time_before_flagging():
@@ -272,6 +503,178 @@ def test_periodic_and_density_sampling_are_rejected():
         )
 
 
+def test_native_model_ensemble_uses_shared_reduction():
+    try:
+        import torch
+        from nvalchemi.models.base import BaseModelMixin, ModelConfig
+    except Exception as exc:
+        pytest.skip(f"Optional ALCHEMI stack is unavailable: {exc}")
+
+    class ConstantModel(torch.nn.Module, BaseModelMixin):
+        def __init__(self, energy, force):
+            torch.nn.Module.__init__(self)
+            self.energy_value = float(energy)
+            self.force_value = float(force)
+            self.model_config = ModelConfig(
+                outputs=frozenset({"energy", "forces"}),
+                autograd_outputs=frozenset(),
+                autograd_inputs=frozenset(),
+                active_outputs={"energy", "forces"},
+            )
+
+        @property
+        def embedding_shapes(self):
+            return {}
+
+        def compute_embeddings(self, data, **kwargs):
+            return data
+
+        def direct_derivative_keys(self):
+            return {"forces"}
+
+        def forward(self, batch):
+            return {
+                "energy": torch.full(
+                    (batch.num_graphs, 1),
+                    self.energy_value,
+                    device=batch.positions.device,
+                ),
+                "forces": torch.full_like(batch.positions, self.force_value),
+            }
+
+    model = ALFNativeEnsembleModel(
+        [ConstantModel(1.0, 1.0), ConstantModel(3.0, 3.0)],
+        device=torch.device("cpu"),
+    )
+    output = model(_torch_batch(torch))
+    diagnostics = model.diagnostics_for_graph(0)
+
+    np.testing.assert_allclose(output["energy"].detach().numpy(), [[2.0], [2.0]])
+    np.testing.assert_allclose(output["forces"].detach().numpy(), np.full((4, 3), 2.0))
+    assert diagnostics["Es"] == pytest.approx(1.0)
+    assert diagnostics["Fs"] == pytest.approx(1.0)
+    assert diagnostics["Fsmax"] == pytest.approx(1.0)
+
+
+def test_single_plain_ase_calculator_has_zero_uncertainty():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    model = ALFASEAlchemiModel(
+        FixedCalculator(1.0, np.zeros((2, 3))),
+        model_mode="ground_state",
+        selected_state_value=None,
+        device=torch.device("cpu"),
+    )
+    model(_torch_batch(torch))
+
+    assert model.diagnostics_for_graph(0)["Es"] == 0.0
+    assert model.diagnostics_for_graph(0)["Fs"] == 0.0
+    assert model.diagnostics_for_graph(0)["Fsmax"] == 0.0
+
+
+def test_calculator_loader_prefers_native_and_forwards_options(monkeypatch):
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    calls = []
+
+    class RawCalculator(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            return {
+                "energy_contributions": torch.zeros(
+                    (1, batch.num_graphs), device=batch.positions.device
+                ),
+                "force_contributions": torch.zeros(
+                    (1, batch.positions.shape[0], 3), device=batch.positions.device
+                ),
+            }
+
+    def native_loader(directory, **kwargs):
+        calls.append((directory, kwargs))
+        return RawCalculator(device=kwargs["device"])
+
+    monkeypatch.setattr(alchemi_module, "load_module_from_string", lambda path: native_loader)
+    config = _config()
+    config.update(
+        {
+            "alchemi_calculator": "custom.native_loader",
+            "alchemi_calculator_options": {"custom_option": 7},
+            "ase_calculator": "custom.ase_loader",
+        }
+    )
+    model = load_alchemi_calculator(
+        sampler_config=config,
+        ensemble_directory="models/0001",
+        model_mode="ground_state",
+        selected_state_value=None,
+        ML_config={},
+        properties_list={},
+        device=torch.device("cpu"),
+    )
+
+    assert calls[0][0] == "models/0001"
+    assert calls[0][1]["custom_option"] == 7
+    assert model.calculator_interface == "native"
+    assert model.calculator_loader == "custom.native_loader"
+    assert alchemi_calculator_status(config) == {
+        "interface": "native",
+        "loader": "custom.native_loader",
+    }
+
+
+def test_calculator_loader_uses_ase_fallback_and_requires_a_loader(monkeypatch):
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    calls = []
+
+    def ase_loader(directory, **kwargs):
+        calls.append((directory, kwargs))
+        return FixedCalculator(1.0, np.zeros((2, 3)))
+
+    monkeypatch.setattr(alchemi_module, "load_module_from_string", lambda path: ase_loader)
+    config = _config()
+    config.update(
+        {
+            "ase_calculator": "custom.ase_loader",
+            "ase_calculator_options": {"custom_option": 8},
+        }
+    )
+    model = load_alchemi_calculator(
+        sampler_config=config,
+        ensemble_directory="models/0002",
+        model_mode="ground_state",
+        selected_state_value=None,
+        ML_config={},
+        properties_list={},
+        device=torch.device("cpu"),
+    )
+
+    assert isinstance(model, ALFASEAlchemiModel)
+    assert calls == [
+        ("models/0002/", {"custom_option": 8, "device": "cpu"})
+    ]
+    assert alchemi_calculator_status(config)["interface"] == "ase_fallback"
+
+    with pytest.raises(ValueError, match="either alchemi_calculator"):
+        load_alchemi_calculator(
+            sampler_config=_config(),
+            ensemble_directory="models/0002",
+            model_mode="ground_state",
+            selected_state_value=None,
+            ML_config={},
+            properties_list={},
+            device=torch.device("cpu"),
+        )
+
+
 def test_installed_alchemi_cpu_dynamics_smoke():
     try:
         import torch
@@ -356,7 +759,7 @@ def test_installed_alchemi_cpu_dynamics_smoke():
     assert runner.diagnostics_for_graph(0) == {"Es": 0.0, "Fs": 0.0, "Fsmax": 0.0}
 
 
-def test_hippynn_adapter_converts_sample_std_and_selects_excited_state(monkeypatch):
+def test_hippynn_adapter_uses_raw_members_and_selects_excited_state(monkeypatch):
     try:
         import hippynn
         import torch
@@ -387,43 +790,38 @@ def test_hippynn_adapter_converts_sample_std_and_selects_excited_state(monkeypat
             batch_size, atom_count = coordinates.shape[:2]
             values = {}
             for node in self.outputs:
-                if node.label.endswith("energy_mean"):
+                if node.label.endswith("energy_all"):
                     state = int(node.label[0])
-                    values[node] = torch.full(
-                        (batch_size, 1), 2.0 + 2.0 * state, device=coordinates.device
-                    )
-                elif node.label.endswith("energy_std"):
-                    values[node] = torch.full(
-                        (batch_size, 1), np.sqrt(2.0), device=coordinates.device
-                    )
-                elif node.label.endswith("force_mean"):
-                    state = int(node.label[0])
-                    values[node] = torch.full(
-                        (batch_size, atom_count, 3),
-                        1.0 + 2.0 * state,
+                    center = 2.0 + 2.0 * state
+                    values[node] = torch.tensor(
+                        [[[center - 1.0], [center + 1.0]]] * batch_size,
                         device=coordinates.device,
                     )
-                else:
-                    values[node] = torch.full(
-                        (batch_size, atom_count, 3),
-                        np.sqrt(2.0),
+                elif node.label.endswith("force_all"):
+                    state = int(node.label[0])
+                    center = 1.0 + 2.0 * state
+                    low = torch.full(
+                        (batch_size, atom_count, 3), center - 1.0,
                         device=coordinates.device,
                     )
+                    high = torch.full(
+                        (batch_size, atom_count, 3), center + 1.0,
+                        device=coordinates.device,
+                    )
+                    values[node] = torch.stack([low, high], dim=1)
             return values
 
     monkeypatch.setattr(hippynn.graphs, "Predictor", Predictor)
     state_nodes = []
     for state in (0, 1):
         state_nodes.append(
-            {
-                "state": state,
-                "energy_mean_node": Node(f"{state}_energy_mean"),
-                "energy_std_node": Node(f"{state}_energy_std"),
-                "force_mean_node": Node(f"{state}_force_mean"),
-                "force_std_node": Node(f"{state}_force_std"),
-                "energy_model_count": 2,
-                "force_model_count": 2,
-            }
+                {
+                    "state": state,
+                    "energy_all_node": Node(f"{state}_energy_all"),
+                    "force_all_node": Node(f"{state}_force_all"),
+                    "energy_model_count": 2,
+                    "force_model_count": 2,
+                }
         )
     model = ALFHippynnAlchemiModel(
         ensemble_graph=Graph(),

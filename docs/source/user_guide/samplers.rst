@@ -48,8 +48,8 @@ Supported Sampler Tasks
      - Reaction-pathway active learning with reactant, transition-state, and
        product structures.
    * - ``alframework.samplers.alchemi_sampling.alchemi_sampling_task``
-     - Runs strict-full batched BAOAB dynamics with a HIPPYNN ensemble through
-       NVIDIA ALCHEMI and supports stop-on-uncertainty or continued sampling.
+     - Runs strict-full batched BAOAB dynamics with a native ALCHEMI calculator
+       or an existing ALF ASE calculator and supports stop or continued sampling.
      - GPU-resident, nonperiodic ground- or excited-state molecular dynamics.
 
 Common Configuration Fields
@@ -240,6 +240,8 @@ ranges and adds the following fields:
 
    {
      "model_mode": "ground_state",
+     "alchemi_calculator": "alframework.samplers.alchemi_sampling.load_hippynn_alchemi_model",
+     "alchemi_calculator_options": {},
      "uncertainty_policy": "stop",
      "return_top_n": 1,
      "friction_per_fs": 0.0019645,
@@ -251,6 +253,40 @@ ranges and adds the following fields:
        "random_seed": 42
      }
    }
+
+Calculator backends
+~~~~~~~~~~~~~~~~~~~
+
+The sampler is not tied to HIPPYNN. Calculator selection uses this precedence:
+
+#. If ``alchemi_calculator`` is set, ALF loads that native batched calculator.
+#. Otherwise, ALF loads the existing ``ase_calculator`` and
+   ``ase_calculator_options`` through a compatibility wrapper.
+#. If neither field is configured, the sampler fails before dynamics begins.
+
+A native loader receives the current model directory, device, ``model_mode``,
+selected state, ML configuration, property mapping, sampler configuration, and
+``alchemi_calculator_options``. It returns an ``ALFAlchemiCalculator``. Native
+calculator subclasses provide raw selected-state ensemble contributions with
+energy shape ``[models, batch]`` and force shape
+``[models, total_atoms, 3]``. ``ALFNativeEnsembleModel`` can combine compatible
+ALCHEMI ``BaseModelMixin`` members for model packages that already provide
+ALCHEMI wrappers.
+
+The ASE fallback evaluates each replica and calculator sequentially, including
+CPU/GPU synchronization, so it provides compatibility rather than accelerated
+batched inference. A list of ASE calculators supplies raw ensemble members. A
+single ordinary calculator is a one-member ensemble with zero ensemble
+deviation. A single uncertainty-aware calculator may instead expose
+``energy_stdev``, ``forces_stdev_mean``, and ``forces_stdev_max``; the existing
+NeuroChem uncertainty API is also recognized when
+``use_potential_specific_code`` is ``neurochem``.
+
+HIPPYNN's native loader consumes its raw ensemble ``.all`` outputs. The shared
+calculator layer computes the same population statistics as production ALF:
+``Es`` is the standard deviation of model energies, ``Fs`` is the mean absolute
+componentwise force deviation, and ``Fsmax`` is its maximum. This common
+reduction avoids model-library standard-deviation convention differences.
 
 ``stop`` is the compatibility mode. Each replica is frozen independently at
 its first valid uncertainty event, while other replicas in the GPU batch keep
@@ -270,11 +306,13 @@ remain there across model retraining, and use the latest model when they
 eventually fill. ``status.txt`` reports bucket counts and ages. The buffers are
 not checkpointed across a driver restart.
 
-The first ALCHEMI implementation supports nonperiodic, fixed-cell HIPPYNN
-models. Set ``end_dens``, ``amp_dens``, and ``per_dens`` to ``null``. Existing
+The first ALCHEMI implementation supports nonperiodic, fixed-cell models.
+HIPPYNN is the first fully validated native accelerated backend; other model
+families can use the native calculator contract or ASE fallback. Set
+``end_dens``, ``amp_dens``, and ``per_dens`` to ``null``. Existing
 ``MLMD_calculator_options.well_params`` spherical-well settings are supported.
-Periodic cells, density schedules, UDD bias, reactive sampling, and NeuroChem
-remain on their existing sampler tasks.
+Periodic cells, density schedules, UDD bias, and reactive sampling remain on
+their existing sampler tasks.
 
 Excited-state mode
 ~~~~~~~~~~~~~~~~~~
@@ -295,6 +333,9 @@ contract:
 State numbers must be contiguous from zero, and every sampled state requires a
 force property. Dynamics uses the selected state's ensemble-mean energy and
 force; uncertainty uses that state's population energy and force deviations.
+An excited-state ASE fallback calculator must expose the selected flattened
+``sE#`` and ``F#`` properties; unsupported calculators fail with an actionable
+missing-property error.
 Gap targets, gap scoring, GUDD, hysteresis, and Martinez--Levine gap seeking are
 not enabled by this sampler version.
 

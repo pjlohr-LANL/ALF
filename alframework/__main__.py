@@ -178,6 +178,22 @@ else:
     status['lifetime_failed_QM_tasks'] = 0
 
 status['sampler_batching'] = sampler_batch_buffer.status()
+if sampler_uses_batches(sampler_config):
+    if sampler_config.get('alchemi_calculator'):
+        status['sampler_calculator'] = {
+            'interface': 'native',
+            'loader': str(sampler_config['alchemi_calculator']),
+        }
+    elif sampler_config.get('ase_calculator'):
+        status['sampler_calculator'] = {
+            'interface': 'ase_fallback',
+            'loader': str(sampler_config['ase_calculator']),
+        }
+    else:
+        status['sampler_calculator'] = {
+            'interface': 'unconfigured',
+            'loader': '',
+        }
 with open(master_config['status_path'], "w") as outfile:
     json.dump(status, outfile, indent=2)
 
@@ -498,6 +514,8 @@ while True:
     if sampler_uses_batches(sampler_config):
         print("sampler strict-full buffer:")
         print(status['sampler_batching'])
+        print("sampler calculator:")
+        print(status['sampler_calculator'])
     print("QM status:")
     QM_task_queue.print_status()
     print("ML status:")

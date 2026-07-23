@@ -77,8 +77,8 @@ or module setup.
 ALCHEMI GPU dynamics
 ~~~~~~~~~~~~~~~~~~~~
 
-Install HIPPYNN, PyTorch, and the supported NVIDIA ALCHEMI release with the
-``gpu_dynamics`` extra:
+Install PyTorch, the supported NVIDIA ALCHEMI release, and HIPPYNN for ALF's
+reference native calculator with the ``gpu_dynamics`` extra:
 
 .. code-block:: bash
 
@@ -86,7 +86,10 @@ Install HIPPYNN, PyTorch, and the supported NVIDIA ALCHEMI release with the
 
 ALF currently targets ``nvalchemi-toolkit>=0.1.0,<0.2``. A CUDA-capable worker
 is required for production sampling. CPU execution is available only as an
-explicit debugging mode for small smoke tests.
+explicit debugging mode for small smoke tests. Other native model families use
+the same calculator interface but may require their own separately installed
+dependencies. Existing ALF ASE calculators can use the compatibility fallback
+without becoming native batched models.
 
 See :doc:`../user_guide/ml_interfaces`, :doc:`../user_guide/qm_interfaces`, and
 :doc:`../user_guide/builders` for backend-specific configuration patterns.

@@ -1,5 +1,7 @@
 {
   "model_mode": "ground_state",
+  "alchemi_calculator": "alframework.samplers.alchemi_sampling.load_hippynn_alchemi_model",
+  "alchemi_calculator_options": {},
   "uncertainty_policy": "stop",
   "return_top_n": 1,
   "dt": 0.25,
