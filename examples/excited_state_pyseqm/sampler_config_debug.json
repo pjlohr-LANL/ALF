@@ -1,0 +1,63 @@
+{
+  "model_mode": "excited_state",
+  "state_selection": {
+    "mode": "batch_cycle",
+    "states": [0, 1]
+  },
+  "alchemi_calculator": "alframework.samplers.alchemi_sampling.load_hippynn_alchemi_model",
+  "alchemi_calculator_options": {},
+  "uncertainty_policy": "stop",
+  "gap_diagnostics": {
+    "enabled": true
+  },
+  "gap_seeking": {
+    "enabled": false,
+    "mode": "levine_coe_martinez_switch",
+    "switch_policy": "stay_fixed",
+    "candidate_pairs": "adjacent",
+    "trigger_gap_threshold_eV": 0.05,
+    "sigma": 3.5,
+    "alpha_eV": 0.05
+  },
+  "topology_check": {
+    "enabled": true,
+    "reference_conformer_path": "fragment_library/water.xyz",
+    "reference_format": "auto",
+    "reference_charge": 0,
+    "bond_min_scale": 0.70,
+    "bond_max_scale": 1.35,
+    "connectivity_scale": 1.25
+  },
+  "return_top_n": 1,
+  "dt": 0.25,
+  "maxt": 0.05,
+  "Escut": 0.05,
+  "Fscut": 0.20,
+  "Ncheck": 5,
+  "min_time": 0.0,
+  "distcut": 0.65,
+  "srt_temp": [300.0, 300.0],
+  "end_temp": [300.0, 300.0],
+  "amp_temp": [0.0, 0.0],
+  "per_temp": [5.0, 5.0],
+  "end_dens": null,
+  "amp_dens": null,
+  "per_dens": null,
+  "translate_to_center": true,
+  "friction_per_fs": 0.0019645,
+  "MLMD_calculator_options": {
+    "well_params": {
+      "r_start": 3.0,
+      "force": 0.1,
+      "origin": [0.0, 0.0, 0.0],
+      "mass_weighted": true
+    }
+  },
+  "alchemi_baoab": {
+    "batch_size": 1,
+    "partial_policy": "full_only",
+    "strict_gpu": true,
+    "allow_cpu_debug": false,
+    "random_seed": 42
+  }
+}

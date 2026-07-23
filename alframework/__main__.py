@@ -126,7 +126,7 @@ def submit_sampler_batch(molecule_objects):
     feed = sampler_task_feed(molecule_objects, sampler_config)
     task_input = build_input_dict(
         sampler_task.func,
-        [feed, *all_configs, status],
+        [feed, {"ML_config": ML_config}, *all_configs, status],
         raise_on_fail=True,
     )
     task = sampler_task(**task_input)
@@ -256,7 +256,8 @@ if args.test_sampler:
             "sampler_config": sampler_config,
         }
     task_input = build_input_dict(sampler_task.func,
-                                  [sampler_feed, *all_configs, status],
+                                  [sampler_feed, {"ML_config": ML_config},
+                                   *all_configs, status],
                                   raise_on_fail=True)
     sampler_task_queue.add_task(sampler_task(**task_input))
     sampled_configuration = sampler_task_queue.task_list[0].result()

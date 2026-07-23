@@ -34,6 +34,9 @@ def simple_cfg_loader_task(moleculeid, builder_config, shake=0.05):
     Args:
         moleculeid (str): System unique identifier in the database.
         builder_config (dict): Dictionary containing the builder parameters.
+            Set ``pbc`` to ``False`` for nonperiodic molecular CFG inputs.
+            ASE's AtomEye CFG reader otherwise marks every loaded structure
+            periodic. Omitting this option preserves the existing behavior.
         shake (float): Amount of random pertubation added to each atom coordinate.
 
     Returns:
@@ -42,6 +45,8 @@ def simple_cfg_loader_task(moleculeid, builder_config, shake=0.05):
     cfg_list = glob.glob(builder_config['molecule_library_dir'] + '/*.cfg')
     cfg_choice = random.choice(cfg_list)
     ase_atoms = cfg.read_cfg(cfg_choice)
+    if 'pbc' in builder_config:
+        ase_atoms.set_pbc(builder_config['pbc'])
     ase_atoms.rattle(shake)
 
     molecule_object = MoleculesObject(ase_atoms, moleculeid)
