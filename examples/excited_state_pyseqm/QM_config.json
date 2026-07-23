@@ -1,0 +1,9 @@
+{
+  "method": "AM1",
+  "scf_eps": 1.0e-10,
+  "cis_tol": 1.0e-8,
+  "energy_offset_eV": 0.0,
+  "max_solve_time_seconds": 60,
+  "capture_pyseqm_logs": false,
+  "pyseqm_log_dir": "pyseqm_logs"
+}

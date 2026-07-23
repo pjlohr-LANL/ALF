@@ -22,11 +22,69 @@ Supported QM Packages
      - ``alframework.qm_interfaces.qchem_DFT_interface.qchem_dft_calculator_task``
    * - `ASE-supported calculators <https://docs.ase-lib.org/ase/calculators/calculators.html#supported-calculators>`__
      - ``alframework.qm_interfaces.ase_calculator_interface.ase_calculator_task``
+   * - `PySEQM <https://github.com/lanl/PYSEQM>`__
+     - ``alframework.qm_interfaces.pyseqm_interface.pyseqm_excited_state_task``
 
 When a QM engine already has a reliable ASE calculator, the generic ASE task is
 usually the easiest integration route. Write a small QM config that identifies
 the ASE calculator class, command, and calculator options, then let ASE handle
 input writing, execution, and result extraction.
+
+PySEQM Excited-State Labeling
+-----------------------------
+
+The PySEQM interface uses ALF's flattened state contract: ``sE0``, ``F0``,
+``sE1``, ``F1``, and so on. State energies must be contiguous from zero.
+Force entries may be omitted for energy-only datasets, although excited-state
+dynamics and force training require the corresponding ``F#`` properties.
+
+Select either the ordinary QM executor task or the GPU executor task:
+
+.. code-block:: json
+
+   {
+     "QM_task": "alframework.qm_interfaces.pyseqm_interface.pyseqm_excited_state_task"
+   }
+
+.. code-block:: json
+
+   {
+     "QM_task": "alframework.qm_interfaces.pyseqm_interface.pyseqm_excited_state_gpu_task"
+   }
+
+The shared QM configuration is:
+
+.. code-block:: json
+
+   {
+     "method": "AM1",
+     "scf_eps": 1.0e-10,
+     "cis_tol": 1.0e-8,
+     "energy_offset_eV": 0.0,
+     "max_solve_time_seconds": 60,
+     "capture_pyseqm_logs": false,
+     "pyseqm_log_dir": "pyseqm_logs"
+   }
+
+``energy_offset_eV`` is subtracted from every state energy. It belongs in the
+QM configuration; the older sampler-configuration location remains a fallback
+for compatibility with fork configurations. A positive
+``max_solve_time_seconds`` isolates the solve in a child process and marks the
+molecule non-converged if the limit is exceeded. Zero or ``null`` disables the
+timeout. Optional logs include the selected state, ALCHEMI candidate context,
+device, solver settings, elapsed time, and failure details.
+
+PySEQM requires atoms to be ordered by decreasing atomic number. The interface
+performs that stable ordering internally and restores every state force to the
+original ALF atom order before storing results. Malformed or non-finite backend
+outputs are rejected and returned as non-converged molecules with diagnostic
+metadata.
+
+This first integration intentionally submits one molecule per ALF QM task.
+PySEQM tensor evaluation still has a leading batch dimension of one, but there
+is no QM buffer or batching change in the main ALF driver. Periodic systems,
+gap properties, topology filtering, and pre-labeled bypasses are not supported
+by this interface version.
 
 .. note::
 
@@ -254,6 +312,7 @@ You can link from this guide directly to API pages:
 * :doc:`ASE calculator interface module <../api_documentation/alframework.qm_interfaces.ase_calculator_interface>`
 * :doc:`ORCA interface module <../api_documentation/alframework.qm_interfaces.orca5_interface>`
 * :doc:`QChem interface module <../api_documentation/alframework.qm_interfaces.qchem_DFT_interface>`
+* :doc:`PySEQM interface module <../api_documentation/alframework.qm_interfaces.pyseqm_interface>`
 * :doc:`Legacy VASP interface module <../api_documentation/alframework.qm_interfaces.vaspase_interface>`
 * :doc:`Parsl execution guide <parsl>`
 

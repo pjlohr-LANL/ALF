@@ -91,6 +91,19 @@ the same calculator interface but may require their own separately installed
 dependencies. Existing ALF ASE calculators can use the compatibility fallback
 without becoming native batched models.
 
+PySEQM excited-state labeling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+PySEQM is an optional QM backend and is not installed by ALF's base or
+``gpu_dynamics`` extras. Install the supported `LANL PYSEQM
+<https://github.com/lanl/PYSEQM>`__ source and PyTorch in the environment used
+by the selected QM or GPU executor. ALF imports both packages lazily, so other
+QM interfaces do not require them.
+
+The initial integration labels one nonperiodic molecule per Parsl task. CPU
+execution is supported for development and smoke tests; production GPU use
+requires a compatible PyTorch/CUDA installation on the worker.
+
 See :doc:`../user_guide/ml_interfaces`, :doc:`../user_guide/qm_interfaces`, and
 :doc:`../user_guide/builders` for backend-specific configuration patterns.
 
