@@ -19,7 +19,11 @@ from parsl import python_app
 
 from alframework.tools.excited_state_tools import derive_state_property_table
 from alframework.tools.molecules_class import MoleculesObject
-from alframework.tools.sampler_batching import sampler_batch_size, selected_state
+from alframework.tools.sampler_batching import (
+    sampler_batch_size,
+    selected_state,
+    validate_state_selection,
+)
 from alframework.tools.tools import annealing_schedule, load_module_from_string
 
 
@@ -182,6 +186,7 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
 def _validate_sampling_inputs(
     molecule_objects: list[MoleculesObject],
     sampler_config: dict[str, Any],
+    properties_list: dict[str, Any] | None = None,
 ) -> tuple[str, int | None]:
     if not isinstance(molecule_objects, list) or not molecule_objects:
         raise ValueError("molecule_objects must be a non-empty list.")
@@ -197,6 +202,7 @@ def _validate_sampling_inputs(
     mode = str(sampler_config.get("model_mode", "ground_state")).strip().lower()
     if mode not in {"ground_state", "excited_state"}:
         raise ValueError("model_mode must be 'ground_state' or 'excited_state'.")
+    validate_state_selection(sampler_config, properties_list)
     policy = str(sampler_config.get("uncertainty_policy", "stop")).strip().lower()
     if policy not in {"stop", "continue"}:
         raise ValueError("uncertainty_policy must be 'stop' or 'continue'.")
@@ -217,9 +223,20 @@ def _validate_sampling_inputs(
                 "Every molecule in an ALCHEMI batch must have identical atom order."
             )
         if mode == "excited_state":
-            states.add(selected_state(molecule))
+            states.add(selected_state(molecule, sampler_config))
     if len(states) > 1:
         raise ValueError("Every molecule in an excited-state batch must select the same state.")
+    if mode == "excited_state" and properties_list is not None and states:
+        available_states = {
+            int(row["state"])
+            for row in derive_state_property_table(properties_list)
+        }
+        unavailable_states = sorted(states - available_states)
+        if unavailable_states:
+            raise ValueError(
+                f"Selected states {unavailable_states} are not present in "
+                f"properties_list; available states are {sorted(available_states)}."
+            )
 
     for density_key in ("end_dens", "amp_dens", "per_dens"):
         if sampler_config.get(density_key) is not None:
@@ -432,6 +449,11 @@ def run_alchemi_sampling(
                 ),
                 "calculator_loader": str(
                     getattr(model, "calculator_loader", type(model).__name__)
+                ),
+                **(
+                    {"sampler_device": str(device)}
+                    if device is not None
+                    else {}
                 ),
             }
         )
@@ -1284,6 +1306,9 @@ def alchemi_sampling_task(
 ):
     """Parsl task for strict-full batched ALCHEMI sampling."""
 
+    mode, selected_state_value = _validate_sampling_inputs(
+        molecule_objects, sampler_config, properties_list
+    )
     gpu_count = max(1, int(gpus_per_node))
     worker_rank = int(os.environ.get("PARSL_WORKER_RANK", "0"))
     visible_device = worker_rank % gpu_count
@@ -1311,9 +1336,6 @@ def alchemi_sampling_task(
                 "alchemi_baoab.allow_cpu_debug=true only for local smoke tests."
             )
 
-    mode, selected_state_value = _validate_sampling_inputs(
-        molecule_objects, sampler_config
-    )
     model = load_alchemi_calculator(
         sampler_config=sampler_config,
         ensemble_directory=model_path.format(int(current_model_id)),
@@ -1323,9 +1345,18 @@ def alchemi_sampling_task(
         properties_list=properties_list,
         device=device,
     )
-    return run_alchemi_sampling(
+    outputs = run_alchemi_sampling(
         molecule_objects,
         sampler_config,
         model,
         device=device,
     )
+    for molecule in outputs:
+        molecule.update_metadata(
+            {
+                "sampler_device": str(device),
+                "sampler_worker_rank": int(worker_rank),
+                "sampler_visible_device": int(visible_device),
+            }
+        )
+    return outputs

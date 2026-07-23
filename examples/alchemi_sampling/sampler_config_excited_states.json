@@ -1,0 +1,40 @@
+{
+  "model_mode": "excited_state",
+  "state_selection": {
+    "mode": "batch_cycle",
+    "states": [0, 1, 2, 3]
+  },
+  "alchemi_calculator": "alframework.samplers.alchemi_sampling.load_hippynn_alchemi_model",
+  "alchemi_calculator_options": {},
+  "uncertainty_policy": "stop",
+  "return_top_n": 1,
+  "dt": 0.25,
+  "maxt": 1000.0,
+  "Escut": 20.0,
+  "Fscut": 0.3,
+  "Ncheck": 5,
+  "min_time": 0.0,
+  "distcut": 1.2,
+  "srt_temp": [200.0, 450.0],
+  "end_temp": [200.0, 450.0],
+  "amp_temp": [0.0, 50.0],
+  "per_temp": [5.0, 50.0],
+  "end_dens": null,
+  "amp_dens": null,
+  "per_dens": null,
+  "translate_to_center": true,
+  "friction_per_fs": 0.0019645,
+  "MLMD_calculator_options": {
+    "well_params": {
+      "r_start": 3.0,
+      "force": 0.1
+    }
+  },
+  "alchemi_baoab": {
+    "batch_size": 50,
+    "partial_policy": "full_only",
+    "strict_gpu": true,
+    "allow_cpu_debug": false,
+    "random_seed": 42
+  }
+}

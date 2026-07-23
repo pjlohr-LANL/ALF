@@ -333,9 +333,10 @@ the established ASE MLMD ``Langevin(..., friction=0.02)`` setting.
 Excited-state mode
 ~~~~~~~~~~~~~~~~~~
 
-Set ``model_mode`` to ``excited_state`` and attach ``selected_state`` metadata
-to each input molecule. The master ``properties_list`` uses a flat state
-contract:
+Set ``model_mode`` to ``excited_state``. A molecule can provide explicit
+``selected_state`` metadata, or the sampler can assign states before buffering
+with a fixed or batch-cycle policy. The master ``properties_list`` uses a flat
+state contract:
 
 .. code-block:: json
 
@@ -352,6 +353,51 @@ force; uncertainty uses that state's population energy and force deviations.
 An excited-state ASE fallback calculator must expose the selected flattened
 ``sE#`` and ``F#`` properties; unsupported calculators fail with an actionable
 missing-property error.
+
+For one surface, use a fixed policy:
+
+.. code-block:: json
+
+   {
+     "model_mode": "excited_state",
+     "state_selection": {
+       "mode": "fixed",
+       "state": 1
+     }
+   }
+
+To explore several surfaces in one ALF run, assign complete batch-sized blocks
+of molecule IDs to states:
+
+.. code-block:: json
+
+   {
+     "model_mode": "excited_state",
+     "state_selection": {
+       "mode": "batch_cycle",
+       "states": [0, 1, 2, 3]
+     },
+     "alchemi_baoab": {
+       "batch_size": 50,
+       "partial_policy": "full_only"
+     }
+   }
+
+The last integer in the molecule ID determines its block. With the configuration
+above, IDs 0--49 select state 0, IDs 50--99 select state 1, and so forth before
+the cycle repeats. IDs without an integer use a stable hash. Explicit
+``selected_state`` metadata overrides the policy; the legacy ``excited_state``
+metadata key is also accepted and normalized. Empty, duplicate, negative, or
+states absent from ``properties_list`` are rejected.
+
+Batch cycling assigns dynamics states, not hardware. Each complete
+state-specific batch is submitted as a normal Parsl task, and the sampler
+executor maps it to any available GPU. Candidate metadata records the selected
+state and actual sampler device/worker assignment. With
+``simple_cfg_loader_task``, keep ``maximum_builder_structures`` at ``1``, use
+``shake: 0.0`` for exact CFG reuse, and ensure the CFG library has compatible
+atomic-number ordering for strict batches.
+
 Gap targets, gap scoring, GUDD, hysteresis, and Martinez--Levine gap seeking are
 not enabled by this sampler version.
 

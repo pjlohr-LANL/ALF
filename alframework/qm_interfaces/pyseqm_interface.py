@@ -29,6 +29,66 @@ class PySEQMTimeoutError(TimeoutError):
     """Raised when a PySEQM solve exceeds its configured wall-time limit."""
 
 
+class PySEQMConvergenceError(RuntimeError):
+    """Raised when PySEQM reports one or more unconverged SCF solutions."""
+
+    def __init__(
+        self,
+        failed_indices: list[int] | tuple[int, ...],
+        message: str | None = None,
+    ) -> None:
+        self.failed_indices = tuple(int(index) for index in failed_indices)
+        if message is None:
+            message = (
+                "PySEQM SCF did not converge for batch indices "
+                f"{list(self.failed_indices)}."
+            )
+        super().__init__(message)
+
+
+def _require_scf_convergence(driver: Any, batch_size: int) -> None:
+    """Validate PySEQM's per-molecule SCF convergence result."""
+
+    rejected_indices = list(range(int(batch_size)))
+    raw_flags = getattr(driver, "notconverged", None)
+    if raw_flags is None:
+        raise PySEQMConvergenceError(
+            rejected_indices,
+            message=(
+                "PySEQM did not expose driver.notconverged after the SCF "
+                "solve; ALF cannot safely accept these labels."
+            ),
+        )
+    if hasattr(raw_flags, "detach"):
+        raw_flags = raw_flags.detach()
+    if hasattr(raw_flags, "cpu"):
+        raw_flags = raw_flags.cpu()
+    if hasattr(raw_flags, "numpy"):
+        raw_flags = raw_flags.numpy()
+    flags = np.asarray(raw_flags)
+    expected_shape = (int(batch_size),)
+    if flags.shape != expected_shape:
+        raise PySEQMConvergenceError(
+            rejected_indices,
+            message=(
+                "PySEQM driver.notconverged must provide one Boolean flag per "
+                f"molecule with shape {expected_shape}; received "
+                f"{flags.shape}."
+            ),
+        )
+    if not np.issubdtype(flags.dtype, np.bool_):
+        raise PySEQMConvergenceError(
+            rejected_indices,
+            message=(
+                "PySEQM driver.notconverged must contain Boolean values; "
+                f"received dtype {flags.dtype}."
+            ),
+        )
+    failed_indices = np.flatnonzero(flags).astype(int).tolist()
+    if failed_indices:
+        raise PySEQMConvergenceError(failed_indices)
+
+
 def _prepare_pyseqm_inputs(
     coordinates: np.ndarray,
     species: np.ndarray,
@@ -210,6 +270,7 @@ def run_pyseqm_batch(
         ).to(device)
         driver = Electronic_Structure(parameters).to(device)
         driver(molecule)
+        _require_scf_convergence(driver, molecule.nmol)
 
         all_energies = torch.empty(
             (molecule.nmol, n_states), dtype=torch.float64, device=device
@@ -311,13 +372,15 @@ def _pyseqm_child(
             {"ok": True, "energies": energies, "forces": forces}
         )
     except BaseException as exc:
-        result_queue.put(
-            {
-                "ok": False,
-                "error": repr(exc),
-                "traceback": traceback.format_exc(),
-            }
-        )
+        payload = {
+            "ok": False,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "traceback": traceback.format_exc(),
+        }
+        if isinstance(exc, PySEQMConvergenceError):
+            payload["failed_indices"] = list(exc.failed_indices)
+        result_queue.put(payload)
 
 
 def _stop_child_process(process: Any) -> None:
@@ -386,6 +449,11 @@ def _run_pyseqm_with_timeout(
         child_traceback = str(payload.get("traceback", "")).strip()
         if child_traceback:
             message = f"{message}\n{child_traceback}"
+        if payload.get("error_type") == "PySEQMConvergenceError":
+            raise PySEQMConvergenceError(
+                payload.get("failed_indices", []),
+                message=message,
+            )
         raise RuntimeError(message)
     return _validate_pyseqm_outputs(
         payload["energies"],
@@ -624,12 +692,21 @@ def label_excited_state_molecule(
             "qm_error_type": type(exc).__name__,
             "qm_elapsed_seconds": float(elapsed),
         }
+        if isinstance(exc, PySEQMConvergenceError):
+            error_metadata.update(
+                {
+                    "qm_scf_converged": False,
+                    "qm_scf_notconverged_indices": list(exc.failed_indices),
+                }
+            )
         if isinstance(exc, PySEQMTimeoutError):
             error_metadata["qm_timeout"] = True
         if timeout is not None:
             error_metadata["max_solve_time_seconds"] = float(timeout)
         if log_path is not None:
             error_metadata["pyseqm_log_path"] = str(log_path)
+        for property_key in dict(properties_list or {}):
+            molecule_object.get_results().pop(str(property_key), None)
         molecule_object.update_metadata(error_metadata)
         molecule_object.set_converged_flag(False)
         return molecule_object
@@ -657,6 +734,7 @@ def label_excited_state_molecule(
             "qm_backend": "pyseqm",
             "qm_device": str(device),
             "qm_elapsed_seconds": float(elapsed),
+            "qm_scf_converged": True,
             "energy_offset_eV": float(offset),
             "energy_offset_source": offset_source,
             "n_excited_states": len(state_table),

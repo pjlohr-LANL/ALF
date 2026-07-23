@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from ase import Atoms, units
 from ase.calculators.calculator import Calculator, all_changes
+from types import SimpleNamespace
 
 from alframework.samplers.ASE_ensemble_constructor import (
     MLMD_calculator,
@@ -15,6 +16,7 @@ from alframework.samplers.alchemi_sampling import (
     ALFNativeEnsembleModel,
     AlchemiDynamicsRunner,
     DEFAULT_FRICTION_PER_FS,
+    alchemi_sampling_task,
     alchemi_calculator_status,
     calculate_uncertainty,
     load_alchemi_calculator,
@@ -696,6 +698,119 @@ def test_excited_batches_require_a_common_selected_state():
             model,
             runner_factory=FakeRunner,
         )
+
+
+def test_batch_cycle_state_is_preserved_in_candidate_provenance():
+    config = _config(policy="stop", batch_size=2)
+    config["model_mode"] = "excited_state"
+    config["state_selection"] = {
+        "mode": "batch_cycle",
+        "states": [1, 0],
+    }
+    uncertain = {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}
+    model = FakeModel({0: [uncertain], 1: [uncertain]})
+
+    outputs = run_alchemi_sampling(
+        [_molecule("mol-0000000000"), _molecule("mol-0000000001")],
+        config,
+        model,
+        runner_factory=FakeRunner,
+    )
+
+    assert len(outputs) == 2
+    assert all(item.get_metadata()["selected_state"] == 1 for item in outputs)
+    assert all(
+        item.get_metadata()["selected_state_source"]
+        == "state_selection.batch_cycle"
+        for item in outputs
+    )
+
+
+def test_resolved_state_must_exist_in_properties():
+    config = _config(policy="stop", batch_size=1)
+    config["model_mode"] = "excited_state"
+    properties = {
+        "sE0": ["state_0_energy", "system", 1.0],
+        "F0": ["state_0_forces", "atomic", 1.0],
+        "sE1": ["state_1_energy", "system", 1.0],
+        "F1": ["state_1_forces", "atomic", 1.0],
+    }
+
+    with pytest.raises(ValueError, match=r"Selected states \[2\].*available states"):
+        alchemi_module._validate_sampling_inputs(
+            [_molecule("state-two", state=2)],
+            config,
+            properties,
+        )
+
+
+def test_task_gpu_assignment_is_independent_of_selected_state(monkeypatch):
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True,
+        device_count=lambda: 4,
+        set_device=lambda device: None,
+    )
+    fake_torch = SimpleNamespace(
+        cuda=fake_cuda,
+        device=lambda value: value,
+    )
+    monkeypatch.setattr(alchemi_module, "torch", fake_torch)
+    monkeypatch.setattr(alchemi_module, "ensure_alchemi_available", lambda: None)
+
+    loaded = []
+
+    def fake_load(**kwargs):
+        loaded.append(
+            (
+                int(kwargs["selected_state_value"]),
+                str(kwargs["device"]),
+            )
+        )
+        return SimpleNamespace()
+
+    def fake_run(molecule_objects, sampler_config, model, *, device):
+        del sampler_config, model, device
+        return [molecule_objects[0]]
+
+    monkeypatch.setattr(alchemi_module, "load_alchemi_calculator", fake_load)
+    monkeypatch.setattr(alchemi_module, "run_alchemi_sampling", fake_run)
+    properties = {
+        "sE0": ["state_0_energy", "system", 1.0],
+        "F0": ["state_0_forces", "atomic", 1.0],
+        "sE1": ["state_1_energy", "system", 1.0],
+        "F1": ["state_1_forces", "atomic", 1.0],
+    }
+    config = _config(policy="stop", batch_size=1)
+    config["model_mode"] = "excited_state"
+
+    monkeypatch.setenv("PARSL_WORKER_RANK", "3")
+    state_zero = alchemi_sampling_task.func(
+        molecule_objects=[_molecule("state-zero", state=0)],
+        sampler_config=config,
+        model_path="models/model-{:04d}",
+        current_model_id=0,
+        gpus_per_node=4,
+        ML_config={},
+        properties_list=properties,
+    )[0]
+    monkeypatch.setenv("PARSL_WORKER_RANK", "1")
+    state_one = alchemi_sampling_task.func(
+        molecule_objects=[_molecule("state-one", state=1)],
+        sampler_config=config,
+        model_path="models/model-{:04d}",
+        current_model_id=0,
+        gpus_per_node=4,
+        ML_config={},
+        properties_list=properties,
+    )[0]
+
+    assert loaded == [(0, "cuda:3"), (1, "cuda:1")]
+    assert state_zero.get_metadata()["sampler_device"] == "cuda:3"
+    assert state_one.get_metadata()["sampler_device"] == "cuda:1"
+    assert state_zero.get_metadata()["sampler_visible_device"] == 3
+    assert state_one.get_metadata()["sampler_visible_device"] == 1
+    assert state_zero.get_metadata()["selected_state"] == 0
+    assert state_one.get_metadata()["selected_state"] == 1
 
 
 def test_periodic_and_density_sampling_are_rejected():

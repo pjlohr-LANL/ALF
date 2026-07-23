@@ -35,6 +35,15 @@ PySEQM Excited-State Labeling
 
 The PySEQM interface uses ALF's flattened state contract: ``sE0``, ``F0``,
 ``sE1``, ``F1``, and so on. State energies must be contiguous from zero.
+
+PySEQM convergence is a hard acceptance condition. Immediately after the
+electronic-structure call, ALF requires one Boolean ``driver.notconverged``
+flag per input molecule. Any true flag raises
+``PySEQMConvergenceError`` before energies or forces are extracted. Missing or
+malformed flags are also rejected. The returned molecule is marked
+unconverged, stores no requested state labels, and records the error and failed
+batch indices in metadata. Successful labels record
+``qm_scf_converged: true``.
 Force entries may be omitted for energy-only datasets, although excited-state
 dynamics and force training require the corresponding ``F#`` properties.
 

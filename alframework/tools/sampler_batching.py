@@ -8,12 +8,18 @@ time.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 from alframework.tools.molecules_class import MoleculesObject
+
+
+_MOLECULE_ID_INTEGER_RE = re.compile(r"(\d+)(?!.*\d)")
+_MISSING = object()
 
 
 def sampler_uses_batches(sampler_config: dict[str, Any]) -> bool:
@@ -39,17 +45,185 @@ def sampler_batch_size(sampler_config: dict[str, Any]) -> int:
     return size
 
 
-def selected_state(molecule: MoleculesObject) -> int:
-    """Return the selected excited state stored on a molecule."""
+def _state_index(value: Any, *, name: str) -> int:
+    """Return one validated, nonnegative electronic-state index."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a nonnegative integer, not {value!r}.")
+    try:
+        state = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{name} must be a nonnegative integer; received {value!r}."
+        ) from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(
+            f"{name} must be a nonnegative integer; received {value!r}."
+        )
+    if state < 0:
+        raise ValueError(f"{name} must be nonnegative; received {state}.")
+    return state
+
+
+def _configured_state_selection(
+    sampler_config: dict[str, Any],
+) -> tuple[str, tuple[int, ...]] | None:
+    """Validate and normalize the optional sampler-level state policy."""
+
+    raw_selection = sampler_config.get("state_selection")
+    if raw_selection is None:
+        if "selected_state" not in sampler_config:
+            return None
+        state = _state_index(
+            sampler_config["selected_state"],
+            name="sampler_config.selected_state",
+        )
+        return "fixed", (state,)
+    if not isinstance(raw_selection, dict):
+        raise ValueError("state_selection must be a dictionary when provided.")
+
+    mode = str(raw_selection.get("mode", "")).strip().lower()
+    if mode == "fixed":
+        raw_state = raw_selection.get(
+            "state",
+            raw_selection.get(
+                "selected_state",
+                sampler_config.get("selected_state", _MISSING),
+            ),
+        )
+        if raw_state is _MISSING:
+            raise ValueError(
+                "state_selection.mode='fixed' requires state_selection.state."
+            )
+        return "fixed", (
+            _state_index(raw_state, name="state_selection.state"),
+        )
+
+    if mode == "batch_cycle":
+        raw_states = raw_selection.get("states")
+        if not isinstance(raw_states, (list, tuple)) or not raw_states:
+            raise ValueError(
+                "state_selection.mode='batch_cycle' requires a non-empty "
+                "state_selection.states list."
+            )
+        states = tuple(
+            _state_index(value, name=f"state_selection.states[{index}]")
+            for index, value in enumerate(raw_states)
+        )
+        if len(set(states)) != len(states):
+            raise ValueError(
+                "state_selection.states must not contain duplicate states."
+            )
+        return "batch_cycle", states
+
+    raise ValueError(
+        "state_selection.mode must be either 'fixed' or 'batch_cycle'."
+    )
+
+
+def validate_state_selection(
+    sampler_config: dict[str, Any],
+    properties_list: dict[str, Any] | None = None,
+) -> tuple[str, tuple[int, ...]] | None:
+    """Validate state selection and optionally check configured properties."""
+
+    mode = str(sampler_config.get("model_mode", "ground_state")).strip().lower()
+    if mode not in {"ground_state", "excited_state"}:
+        raise ValueError(
+            "model_mode must be either 'ground_state' or 'excited_state'."
+        )
+    selection = _configured_state_selection(sampler_config)
+    if mode == "ground_state":
+        return selection
+    if selection is None or properties_list is None:
+        return selection
+
+    from alframework.tools.excited_state_tools import derive_state_property_table
+
+    available = {
+        int(row["state"])
+        for row in derive_state_property_table(properties_list)
+    }
+    unavailable = sorted(set(selection[1]) - available)
+    if unavailable:
+        raise ValueError(
+            f"Configured selected states {unavailable} are not present in "
+            f"properties_list; available states are {sorted(available)}."
+        )
+    return selection
+
+
+def _molecule_sequence_index(molecule: MoleculesObject) -> int:
+    """Derive a stable nonnegative sequence index from an ALF molecule ID."""
+
+    molecule_id = str(molecule.get_moleculeid())
+    match = _MOLECULE_ID_INTEGER_RE.search(molecule_id)
+    if match is not None:
+        return int(match.group(1))
+    digest = hashlib.sha256(molecule_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+
+def selected_state(
+    molecule: MoleculesObject,
+    sampler_config: dict[str, Any] | None = None,
+) -> int:
+    """Resolve and record the selected excited state for one molecule."""
+
+    if not isinstance(molecule, MoleculesObject):
+        raise TypeError("selected_state requires a MoleculesObject instance.")
 
     metadata = molecule.get_metadata()
     if "selected_state" in metadata:
-        return int(metadata["selected_state"])
+        state = _state_index(
+            metadata["selected_state"], name="molecule metadata selected_state"
+        )
+        if "selected_state_source" not in metadata:
+            molecule.update_metadata(
+                {"selected_state_source": "metadata.selected_state"}
+            )
+        return state
     if "excited_state" in metadata:
-        return int(metadata["excited_state"])
+        state = _state_index(
+            metadata["excited_state"], name="molecule metadata excited_state"
+        )
+        molecule.update_metadata(
+            {
+                "selected_state": state,
+                "selected_state_source": "metadata.excited_state",
+            }
+        )
+        return state
+
+    selection = _configured_state_selection(dict(sampler_config or {}))
+    if selection is not None:
+        mode, states = selection
+        if mode == "fixed":
+            state = int(states[0])
+            selection_metadata = {
+                "selected_state": state,
+                "selected_state_source": "state_selection.fixed",
+            }
+        else:
+            sequence_index = _molecule_sequence_index(molecule)
+            batch_size = sampler_batch_size(dict(sampler_config or {}))
+            batch_ordinal = sequence_index // batch_size
+            cycle_index = batch_ordinal % len(states)
+            state = int(states[cycle_index])
+            selection_metadata = {
+                "selected_state": state,
+                "selected_state_source": "state_selection.batch_cycle",
+                "selected_state_sequence_index": int(sequence_index),
+                "selected_state_batch_ordinal": int(batch_ordinal),
+                "selected_state_cycle_index": int(cycle_index),
+            }
+        molecule.update_metadata(selection_metadata)
+        return state
+
     raise ValueError(
         "Excited-state ALCHEMI batching requires molecule metadata to contain "
-        "'selected_state'."
+        "'selected_state' or sampler_config.state_selection to define a "
+        "fixed or batch-cycle policy."
     )
 
 
@@ -73,7 +247,7 @@ def sampler_batch_key(
     if mode == "ground_state":
         state = None
     elif mode == "excited_state":
-        state = selected_state(molecule)
+        state = selected_state(molecule, sampler_config)
     else:
         raise ValueError(
             "model_mode must be either 'ground_state' or 'excited_state'."

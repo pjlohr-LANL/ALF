@@ -10,8 +10,10 @@ from ase import Atoms
 
 import alframework.qm_interfaces.pyseqm_interface as pyseqm_module
 from alframework.qm_interfaces.pyseqm_interface import (
+    PySEQMConvergenceError,
     PySEQMTimeoutError,
     _prepare_pyseqm_inputs,
+    _require_scf_convergence,
     _restore_pyseqm_force_order,
     _run_pyseqm_with_timeout,
     label_excited_state_molecule,
@@ -92,6 +94,42 @@ def test_pyseqm_input_sorting_and_force_order_restoration():
     )
 
 
+def test_pyseqm_scf_convergence_contract():
+    _require_scf_convergence(
+        SimpleNamespace(notconverged=np.asarray([False, False], dtype=bool)),
+        2,
+    )
+
+    with pytest.raises(PySEQMConvergenceError) as exc_info:
+        _require_scf_convergence(
+            SimpleNamespace(notconverged=np.asarray([False, True], dtype=bool)),
+            2,
+        )
+    assert exc_info.value.failed_indices == (1,)
+
+
+@pytest.mark.parametrize(
+    ("driver", "message"),
+    [
+        (SimpleNamespace(), "did not expose"),
+        (
+            SimpleNamespace(notconverged=np.asarray([[False]], dtype=bool)),
+            "shape",
+        ),
+        (
+            SimpleNamespace(notconverged=np.asarray([0], dtype=int)),
+            "Boolean",
+        ),
+    ],
+)
+def test_pyseqm_rejects_missing_or_malformed_scf_flags(
+    driver, message
+):
+    with pytest.raises(PySEQMConvergenceError, match=message) as exc_info:
+        _require_scf_convergence(driver, 1)
+    assert exc_info.value.failed_indices == (0,)
+
+
 def test_missing_pyseqm_dependency_has_actionable_error(monkeypatch):
     original_import = builtins.__import__
 
@@ -145,6 +183,7 @@ def test_single_molecule_labeling_maps_flattened_results_and_offset(monkeypatch)
     assert metadata["energy_offset_eV"] == -100.0
     assert metadata["energy_offset_source"] == "QM_config"
     assert metadata["n_excited_states"] == 2
+    assert metadata["qm_scf_converged"] is True
 
 
 def test_energy_only_contract_and_sampler_offset_fallback(monkeypatch):
@@ -316,6 +355,84 @@ def test_backend_failure_and_timeout_return_diagnostics(monkeypatch):
     assert timed_out.get_metadata()["max_solve_time_seconds"] == pytest.approx(
         0.01
     )
+
+
+def test_scf_failure_is_nonconverged_and_removes_state_labels(monkeypatch):
+    monkeypatch.setattr(pyseqm_module, "_pyseqm_device", lambda count: "cpu")
+
+    def fail_scf(*args, **kwargs):
+        raise PySEQMConvergenceError([0])
+
+    monkeypatch.setattr(pyseqm_module, "run_pyseqm_batch", fail_scf)
+    molecule = _molecule("scf-failure")
+    molecule.store_results({"sE0": -1.0, "F0": np.ones((3, 3)), "other": 7})
+
+    failed = label_excited_state_molecule(
+        molecule,
+        QM_config={"max_solve_time_seconds": 0},
+        properties_list=_properties(),
+    )
+
+    assert failed.check_convergence() is False
+    assert failed.get_results() == {"other": 7}
+    metadata = failed.get_metadata()
+    assert metadata["qm_error_type"] == "PySEQMConvergenceError"
+    assert metadata["qm_scf_converged"] is False
+    assert metadata["qm_scf_notconverged_indices"] == [0]
+
+
+def test_timeout_helper_preserves_scf_convergence_error(monkeypatch):
+    class ResultQueue:
+        def get(self, timeout=None):
+            del timeout
+            return {
+                "ok": False,
+                "error": "synthetic SCF failure",
+                "error_type": "PySEQMConvergenceError",
+                "failed_indices": [0],
+                "traceback": "",
+            }
+
+    class CompletedProcess:
+        def __init__(self, *, target, args):
+            del target, args
+            self.exitcode = 0
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            del timeout
+
+    class CompletedContext:
+        def Queue(self, maxsize=0):
+            del maxsize
+            return ResultQueue()
+
+        Process = CompletedProcess
+
+    monkeypatch.setattr(
+        pyseqm_module.multiprocessing,
+        "get_context",
+        lambda method: CompletedContext(),
+    )
+
+    with pytest.raises(PySEQMConvergenceError) as exc_info:
+        _run_pyseqm_with_timeout(
+            coordinates=np.zeros((1, 2, 3)),
+            species=np.ones((1, 2), dtype=int),
+            state_count=2,
+            method="AM1",
+            scf_eps=1.0e-10,
+            cis_tol=1.0e-8,
+            device="cpu",
+            log_path=None,
+            max_solve_time_seconds=1.0,
+        )
+    assert exc_info.value.failed_indices == (0,)
 
 
 def test_timeout_helper_terminates_a_hanging_child(monkeypatch):

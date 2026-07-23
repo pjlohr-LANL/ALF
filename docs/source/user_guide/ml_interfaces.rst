@@ -22,6 +22,8 @@ through its own training task and sampler loading path.
      - Associated training task
    * - HIPPYNN
      - ``alframework.ml_interfaces.hippynn_interface.train_HIPPYNN_ensemble_task``
+   * - Multi-state HIPPYNN
+     - ``alframework.ml_interfaces.excited_state_hippynn_interface.train_excited_state_HIPPYNN_ensemble_task``
    * - NeuroChem/ANI
      - ``alframework.ml_interfaces.neurochem_interface.train_ANI_model_task``
 
@@ -157,6 +159,68 @@ Important HIPPYNN configuration fields include:
 of ASE calculators. The generic MLMD sampler wraps that list with
 ``MLMD_calculator`` to compute mean predictions and ensemble uncertainties.
 
+Multi-State HIPPYNN Interface
+-----------------------------
+
+Excited-state workflows use a separate trainer so the existing ground-state
+HIPPYNN task and its configurations remain unchanged:
+
+.. code-block:: json
+
+   {
+     "ML_task": "alframework.ml_interfaces.excited_state_hippynn_interface.train_excited_state_HIPPYNN_ensemble_task",
+     "ML_config_path": "hippynn_config.json",
+     "properties_list": {
+       "sE0": ["state_0_energy", "system", 1.0],
+       "F0": ["state_0_forces", "atomic", 1.0],
+       "sE1": ["state_1_energy", "system", 1.0],
+       "F1": ["state_1_forces", "atomic", 1.0]
+     }
+   }
+
+The state keys must be contiguous from zero and every energy must have a force
+target. Each ensemble member builds one shared HipNN
+(``network_choice: 0``) or HipHopNN (``network_choice: 1``) trunk with one
+HIPPYNN energy head and force-gradient node for every state. The checkpoint
+nodes retain the HDF5 names configured in ``properties_list``. Consequently,
+the native ALCHEMI HIPPYNN loader can form each ``ensemble_<database-name>``
+node and select a sampling state without a second model adapter.
+
+The objective preserves the fork's multi-state weighting. For each state it
+adds ``energy_weight * (energy RMSE + energy MAE)`` and
+``force_weight * (force RMSE + force MAE) / sqrt(3N)``, then adds
+``l2_weight * L2`` once for the shared trunk.
+
+The trainer reads ALF HDF5 shards explicitly instead of asking HIPPYNN to
+auto-detect PyANI fields. It reads only coordinates, species, and configured
+state targets; supports molecules smaller than seven atoms; and rejects
+missing or nonfinite data. Every structure in a training run must have the
+same exact atomic-number sequence. ``n_atoms`` and
+``network_params.possible_species`` may be omitted and inferred, or supplied
+and validated.
+
+Current physical and workflow limits are intentional:
+
+* Training is nonperiodic, so ``cell_key`` must be null.
+* Forces and saved force gradients are required for every state.
+* A present ``gap_targets`` section must have ``enabled: false``.
+* PDF and PNG plots are optional; CSV export is rejected.
+* ``remove_existing=True`` and a separate ``h5_test_dir`` are rejected rather
+  than deleting or ignoring data.
+
+With ``device_string: "from_multiprocessing"``, spawned workers assign
+ensemble members across the GPUs available to ``alf_ML_executor``. Electronic
+states are not bound to GPUs: every member predicts every state. CPU mode uses
+one worker. Member ``i`` receives ``random_seed + i``. ALF receives the usual
+``(completed_model_flags, current_training_id)`` result and promotes a model
+generation only when all members train successfully and expose all configured
+state outputs.
+
+See ``examples/excited_state_pyseqm/hippynn_config.json`` for a complete
+configuration. State selection in the ALCHEMI sampler controls the dynamics
+surface; PySEQM labeling and every ensemble member still cover all configured
+states.
+
 .. _ml-interface-new-architecture-template:
 
 Adding New ML Architectures
@@ -256,6 +320,7 @@ You can link from this guide directly to API pages:
 
 * :doc:`ML interfaces package API <../api_documentation/alframework.ml_interfaces>`
 * :doc:`HIPPYNN interface module <../api_documentation/alframework.ml_interfaces.hippynn_interface>`
+* :doc:`Multi-state HIPPYNN interface module <../api_documentation/alframework.ml_interfaces.excited_state_hippynn_interface>`
 * :doc:`NeuroChem interface module <../api_documentation/alframework.ml_interfaces.neurochem_interface>`
 * :doc:`MLMD sampler guide <samplers>`
 * :doc:`Parsl execution guide <parsl>`

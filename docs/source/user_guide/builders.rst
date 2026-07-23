@@ -78,6 +78,11 @@ constraints in a cubic periodic box.
 
 Use ``simple_cfg_loader_task`` when useful initial structures already exist as
 ``.cfg`` files. This is a lightweight loader rather than a packing builder.
+It can also seed excited-state ALCHEMI runs: sampler-level ``state_selection``
+assigns the dynamics state after loading and before strict batching, so the
+builder itself remains model-agnostic. Keep ``maximum_builder_structures`` at
+``1`` for this single-output task and use a CFG library with compatible atomic
+ordering.
 
 Use ``load_reactive_task`` for reaction-path workflows. It loads one reactant,
 transition-state, and product triplet, chooses one structure as the current
