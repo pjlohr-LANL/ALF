@@ -1,29 +1,27 @@
 Excited-State PySEQM
 ====================
 
-The excited-state PySEQM example is a complete molecular active-learning
-workflow using ALF's standard CFG builder, the multi-state HIPPYNN trainer,
-batched ALCHEMI dynamics, and single-molecule PySEQM labeling. The example
-files are located in ``examples/excited_state_pyseqm``.
+The production-first example in ``examples/excited_state_pyseqm`` reproduces
+a six-state acetylacetone keto active-learning workload. It starts from one
+existing HDF5 shard, trains a shared-trunk HIPPYNN ensemble, replays labeled
+geometries, samples state-specific ALCHEMI batches, labels candidates with
+PySEQM, and retrains from accepted shards.
 
 Workflow
 --------
 
-Two startup modes are provided:
-
 .. code-block:: text
 
-   CFG -> PySEQM bootstrap -> HDF5 -> HIPPYNN -> ALCHEMI sampling
+   Existing six-state HDF5
+       -> HIPPYNN
+       -> HDF5 replay
+       -> batched ALCHEMI
+       -> screened PySEQM
+       -> new HDF5 and retraining
 
-.. code-block:: text
-
-   Existing HDF5 -> HIPPYNN
-   CFG -> ALCHEMI sampling -> PySEQM -> additional HDF5 shards
-
-The CFG file supplies only atomic identity, order, coordinates, and cell
-information. It is not the storage format for multiple electronic-state
-labels. PySEQM generates the flattened ``sE#`` and ``F#`` properties, and ALF
-stores those labels in HDF5 for training.
+The configured properties are ``sE0`` through ``sE5`` and ``F0`` through
+``F5``. Gap targets and gap-seeking features are disabled in the production
+acceptance profile.
 
 ALF Components
 --------------
@@ -35,7 +33,7 @@ ALF Components
    * - Stage
      - Task
    * - Builder
-     - ``alframework.builders.builders.simple_cfg_loader_task``
+     - ``alframework.builders.h5_replay_builder.h5_replay_builder_task``
    * - Sampler
      - ``alframework.samplers.alchemi_sampling.alchemi_sampling_task``
    * - QM
@@ -43,61 +41,46 @@ ALF Components
    * - ML
      - ``alframework.ml_interfaces.excited_state_hippynn_interface.train_excited_state_HIPPYNN_ensemble_task``
 
-ASE's CFG reader marks AtomEye CFG inputs periodic. The example therefore uses
-the loader's optional ``pbc: false`` override so its water molecule satisfies
-ALCHEMI's nonperiodic fixed-cell contract.
+The replay builder reads only shards below ``current_h5_id``. ALF stores each
+shard in stable atomic-number order; replay restores the fixed topology's
+canonical order before dynamics. Completed QM labels are screened by maximum
+force, minimum distance, and topology before storage.
 
 Dynamic Darwin Execution
 ------------------------
 
-The ALF main process runs on a head node. The example's Parsl configuration
-dynamically requests independent Slurm blocks:
+The driver uses independent, zero-initial-block Slurm providers:
 
-* HIPPYNN training on ``ml4chem`` through ``alf_ML_executor``.
-* ALCHEMI sampling on ``shared-gpu-ampere`` through
-  ``alf_sampler_executor``.
-* PySEQM labeling on separate ``shared-gpu-ampere`` allocations through
-  ``alf_QM_executor``.
+* HIPPYNN training on ``ml4chem``.
+* ALCHEMI sampling and replay on ``shared-gpu-ampere``.
+* PySEQM labeling on separate ``shared-gpu-ampere`` allocations.
 
-Every provider starts with zero blocks. Account, QoS, GPU directives,
-walltimes, block limits, CUDA setup, and environment activation are exposed as
-settings in ``parsl_configs.py`` for adjustment before a Darwin run.
+The supplied submission script runs the persistent driver on ``general``.
+Worker account, CUDA setup, environment activation, walltimes, and block
+limits remain configurable through ``ALF_DARWIN_*`` variables.
 
 Running the Example
 -------------------
 
-For a self-contained bootstrap:
+Copy only the compatible seed shard to ``h5store/data-0000.h5`` and verify its
+checksum as documented in the example README. Run the stage checks in order:
 
 .. code-block:: bash
 
    cd examples/excited_state_pyseqm
-   python -m alframework --master master_config.json
-
-To begin with existing labeled data, place compatible files at
-``h5store/data-0000.h5`` and run:
-
-.. code-block:: bash
-
-   python -m alframework --master master_config_existing_h5.json
-
-When the HDF5 store exists and no status file exists, ALF detects the data,
-skips bootstrap labeling, and trains the initial ensemble before sampling.
-The existing shards must match the configured state/gap database names and
-exact atomic-number ordering.
-
-Stage Checks
-------------
-
-The debug master uses one-replica sampling:
-
-.. code-block:: bash
-
+   source /projects/opt/centos8/x86_64/miniconda3/py312_24.11.1/etc/profile.d/conda.sh
+   conda activate /vast/home/pjlohr/.conda/envs/atomistic
+   export PYTHONPATH=/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF:${PYTHONPATH:-}
    python -m alframework --master master_config_debug.json --test_builder
    python -m alframework --master master_config_debug.json --test_qm
    python -m alframework --master master_config_debug.json --test_ml
    python -m alframework --master master_config_debug.json --test_sampler
 
-ML testing requires existing HDF5 data, and sampler testing requires an
-existing model. See the example README for the expected order, full
-configuration inventory, worker-environment settings, topology behavior, and
-restart guidance.
+Then submit the fresh production replica:
+
+.. code-block:: bash
+
+   sbatch submit_darwin.slurm
+
+The source production status and models are not imported. See the example
+README for checksums, acceptance criteria, output paths, and restart guidance.

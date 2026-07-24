@@ -2,57 +2,52 @@
   "model_mode": "excited_state",
   "state_selection": {
     "mode": "batch_cycle",
-    "states": [0, 1]
+    "states": [0, 1, 2, 3, 4, 5]
   },
   "alchemi_calculator": "alframework.samplers.alchemi_sampling.load_hippynn_alchemi_model",
   "alchemi_calculator_options": {},
   "uncertainty_policy": "stop",
   "gap_diagnostics": {
-    "enabled": true
+    "enabled": false
   },
   "gap_seeking": {
-    "enabled": false,
-    "mode": "levine_coe_martinez_switch",
-    "switch_policy": "stay_fixed",
-    "candidate_pairs": "adjacent",
-    "trigger_gap_threshold_eV": 0.05,
-    "sigma": 3.5,
-    "alpha_eV": 0.05
+    "enabled": false
   },
   "topology_check": {
     "enabled": true,
-    "reference_conformer_path": "fragment_library/water.xyz",
-    "reference_format": "auto",
+    "reference_conformer_path": "keto_form_coords.xyz",
+    "reference_format": "xyz",
     "reference_charge": 0,
-    "bond_min_scale": 0.70,
-    "bond_max_scale": 1.35,
+    "bond_min_scale": 0.85,
+    "bond_max_scale": 1.50,
     "connectivity_scale": 1.25
   },
-  "return_top_n": 1,
-  "dt": 0.25,
-  "maxt": 10.0,
-  "Escut": 0.05,
-  "Fscut": 0.20,
-  "Ncheck": 5,
-  "min_time": 0.005,
-  "distcut": 0.65,
-  "srt_temp": [250.0, 450.0],
-  "end_temp": [250.0, 600.0],
-  "amp_temp": [0.0, 50.0],
-  "per_temp": [5.0, 50.0],
+  "dataset_screening": {
+    "enabled": true,
+    "force": true,
+    "min_distance": true,
+    "topology": true
+  },
+  "return_top_n": 50,
+  "dt": 0.1,
+  "maxt": 2.0,
+  "Escut": 0.001,
+  "Fscut": 0.01,
+  "Ncheck": 10,
+  "min_time": 0.1,
+  "distcut": 0.7,
+  "min_distance_cutoff": 0.7,
+  "max_force_cutoff": 16.0,
+  "srt_temp": [300.0, 300.0],
+  "end_temp": [300.0, 300.0],
+  "amp_temp": [0.0, 0.0],
+  "per_temp": [1.0, 1.0],
   "end_dens": null,
   "amp_dens": null,
   "per_dens": null,
-  "translate_to_center": true,
-  "friction_per_fs": 0.0019645,
-  "MLMD_calculator_options": {
-    "well_params": {
-      "r_start": 3.0,
-      "force": 0.1,
-      "origin": [0.0, 0.0, 0.0],
-      "mass_weighted": true
-    }
-  },
+  "translate_to_center": false,
+  "friction_per_fs": 0.1,
+  "MLMD_calculator_options": {},
   "alchemi_baoab": {
     "batch_size": 50,
     "partial_policy": "full_only",

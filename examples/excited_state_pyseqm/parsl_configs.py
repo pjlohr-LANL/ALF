@@ -21,25 +21,26 @@ ML_PARTITION = "ml4chem"
 SAMPLER_PARTITION = "shared-gpu-ampere"
 QM_PARTITION = "shared-gpu-ampere"
 
-# Set these in the environment or replace the defaults for the real run.
-DARWIN_ACCOUNT = os.environ.get("ALF_DARWIN_ACCOUNT") or None
-ML_QOS = os.environ.get("ALF_DARWIN_ML_QOS") or None
+# Production-first Darwin defaults; environment variables remain authoritative.
+DARWIN_ACCOUNT = os.environ.get("ALF_DARWIN_ACCOUNT", "y2020-bf") or None
+ML_QOS = os.environ.get("ALF_DARWIN_ML_QOS", "long") or None
 SAMPLER_QOS = os.environ.get("ALF_DARWIN_SAMPLER_QOS") or None
 QM_QOS = os.environ.get("ALF_DARWIN_QM_QOS") or None
 
-# Darwin's exact GPU request directive can be changed without editing the
-# executor definitions, for example to "#SBATCH --gres=gpu:4".
+# These Darwin partitions consist of GPU nodes and normally allocate the full
+# node without an explicit GPU TRES request. A site-specific directive remains
+# available as an override.
 ML_SCHEDULER_OPTIONS = os.environ.get(
     "ALF_DARWIN_ML_SCHEDULER_OPTIONS",
-    "#SBATCH --gpus-per-node=4",
+    "",
 )
 SAMPLER_SCHEDULER_OPTIONS = os.environ.get(
     "ALF_DARWIN_SAMPLER_SCHEDULER_OPTIONS",
-    "#SBATCH --gpus-per-node=4",
+    "",
 )
 QM_SCHEDULER_OPTIONS = os.environ.get(
     "ALF_DARWIN_QM_SCHEDULER_OPTIONS",
-    "#SBATCH --gpus-per-node=4",
+    "",
 )
 
 ML_WALLTIME = os.environ.get("ALF_DARWIN_ML_WALLTIME", "16:00:00")
@@ -63,7 +64,11 @@ CUDA_MODULE_COMMAND = os.environ.get(
 # export ALF_DARWIN_ENV_ACTIVATION='source /path/to/conda.sh; conda activate /path/to/atomistic'
 ENV_ACTIVATION_COMMAND = os.environ.get(
     "ALF_DARWIN_ENV_ACTIVATION",
-    "",
+    (
+        "source /projects/opt/centos8/x86_64/miniconda3/"
+        "py312_24.11.1/etc/profile.d/conda.sh; "
+        "conda activate /vast/home/pjlohr/.conda/envs/atomistic"
+    ),
 )
 # Leave empty to use Slurm-local temporary storage. Set this to a shared or
 # node-local writable path if Darwin's worker environment does not provide
@@ -89,7 +94,7 @@ def _worker_init() -> str:
         'export WARP_CACHE_PATH="$ALF_WORKER_CACHE_ROOT/warp"',
         'export MPLCONFIGDIR="$ALF_WORKER_CACHE_ROOT/matplotlib"',
         'mkdir -p "$WARP_CACHE_PATH" "$MPLCONFIGDIR"',
-        "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+        "export PYTORCH_ALLOC_CONF=expandable_segments:True",
     ]
     return "; ".join(command for command in commands if command)
 
@@ -106,10 +111,17 @@ def _executor(
     walltime: str,
     max_blocks: int,
     max_workers_per_node: int,
+    available_accelerators: int | None = None,
 ) -> HighThroughputExecutor:
+    accelerator_options = (
+        {}
+        if available_accelerators is None
+        else {"available_accelerators": available_accelerators}
+    )
     return HighThroughputExecutor(
         label=label,
         max_workers_per_node=max_workers_per_node,
+        **accelerator_options,
         cores_per_worker=1.0,
         cpu_affinity="none",
         prefetch_capacity=0,
@@ -149,6 +161,7 @@ config_darwin = Config(
             walltime=SAMPLER_WALLTIME,
             max_blocks=SAMPLER_MAX_BLOCKS,
             max_workers_per_node=4,
+            available_accelerators=4,
         ),
         _executor(
             label="alf_QM_executor",
@@ -158,6 +171,7 @@ config_darwin = Config(
             walltime=QM_WALLTIME,
             max_blocks=QM_MAX_BLOCKS,
             max_workers_per_node=4,
+            available_accelerators=4,
         ),
     ]
 )
@@ -182,6 +196,7 @@ config_darwin_debug = Config(
             walltime="01:00:00",
             max_blocks=1,
             max_workers_per_node=4,
+            available_accelerators=4,
         ),
         _executor(
             label="alf_QM_executor",
@@ -191,6 +206,7 @@ config_darwin_debug = Config(
             walltime="01:00:00",
             max_blocks=1,
             max_workers_per_node=4,
+            available_accelerators=4,
         ),
     ]
 )

@@ -134,7 +134,12 @@ def store_current_data(h5path, system_data, properties):
         # Ensure system converged before saving
         if system.check_convergence():
             saved_number += 1
-            atom_index = np.argsort(cur_atoms.get_atomic_numbers())
+            # Preserve the input order within each element so fixed-topology
+            # replay can invert ALF's atomic-number storage order exactly.
+            atom_index = np.argsort(
+                cur_atoms.get_atomic_numbers(),
+                kind="stable",
+            )
             # If there is already a molecule with the same formula, append
             if molkey in data_dict:
                 data_dict[molkey]["_id"].append(cur_moliculeid)

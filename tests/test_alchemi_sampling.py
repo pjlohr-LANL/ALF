@@ -1044,6 +1044,43 @@ def test_stop_mode_freezes_each_replica_at_its_first_uncertainty():
     assert DEFAULT_FRICTION_PER_FS == pytest.approx(0.02 * units.fs)
 
 
+def test_maximum_mean_force_screen_rejects_before_candidate_return():
+    model = FakeModel(
+        {
+            0: [
+                {
+                    "Es": 2.0,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "Fmeanmax": 20.0,
+                }
+            ],
+            1: [
+                {
+                    "Es": 2.0,
+                    "Fs": 0.0,
+                    "Fsmax": 0.0,
+                    "Fmeanmax": 1.0,
+                }
+            ],
+        }
+    )
+    config = _config(policy="stop")
+    config["max_force_cutoff"] = 16.0
+
+    outputs = run_alchemi_sampling(
+        [_molecule("rejected"), _molecule("accepted")],
+        config,
+        model,
+        runner_factory=FakeRunner,
+    )
+
+    assert [item.get_metadata()["parent_molecule_id"] for item in outputs] == [
+        "accepted"
+    ]
+    assert outputs[0].get_metadata()["Fmeanmax"] == pytest.approx(1.0)
+
+
 def test_topology_gate_freezes_initial_invalid_replica_before_dynamics(
     monkeypatch,
 ):

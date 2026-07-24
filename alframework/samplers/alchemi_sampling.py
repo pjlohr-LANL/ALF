@@ -552,6 +552,12 @@ def _validate_sampling_inputs(
                 "ALCHEMI sampling does not yet support density or cell schedules; "
                 f"set {density_key} to null."
             )
+    if "max_force_cutoff" in sampler_config:
+        max_force_cutoff = float(sampler_config["max_force_cutoff"])
+        if not np.isfinite(max_force_cutoff) or max_force_cutoff <= 0:
+            raise ValueError(
+                "max_force_cutoff must be finite and positive when provided."
+            )
     return mode, (next(iter(states)) if states else None)
 
 
@@ -603,7 +609,7 @@ def _candidate_record(
                 ),
             }
         )
-    return {
+    record = {
         "parent_molecule_id": molecule.get_moleculeid(),
         "batch_index": int(batch_index),
         "step": int(step),
@@ -628,6 +634,9 @@ def _candidate_record(
         **_gap_candidate_metadata(diagnostics),
         **temperature_parameters,
     }
+    if "Fmeanmax" in diagnostics:
+        record["Fmeanmax"] = float(diagnostics["Fmeanmax"])
+    return record
 
 
 def run_alchemi_sampling(
@@ -859,11 +868,20 @@ def run_alchemi_sampling(
                 Fscut=float(sampler_config["Fscut"]),
             )
             distance = _minimum_distance(atoms_list[index])
-            if time_ps < min_time:
-                continue
             if distance < float(sampler_config.get("distcut", 1.2)):
                 active[index] = False
                 runner.freeze_graph(index)
+                continue
+            if (
+                sampler_config.get("max_force_cutoff") is not None
+                and diagnostics.get("Fmeanmax") is not None
+                and float(diagnostics["Fmeanmax"])
+                > float(sampler_config["max_force_cutoff"])
+            ):
+                active[index] = False
+                runner.freeze_graph(index)
+                continue
+            if time_ps < min_time:
                 continue
             if not flags["uncertain"]:
                 continue
@@ -1419,6 +1437,10 @@ if _ALCHEMI_IMPORT_ERROR is None:
             if well_energy is not None:
                 selected_energy = selected_energy + well_energy
                 selected_forces = selected_forces + well_forces
+            diagnostics["Fmeanmax"] = torch.amax(
+                torch.linalg.vector_norm(selected_forces, dim=2),
+                dim=1,
+            )
             self.last_diagnostics = {
                 key: value.detach() if hasattr(value, "detach") else value
                 for key, value in diagnostics.items()

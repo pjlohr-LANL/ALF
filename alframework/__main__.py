@@ -30,6 +30,8 @@ from alframework.tools.tools import load_module_from_string
 from alframework.tools.tools import build_input_dict
 from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.dataset_screening import print_dataset_screening_summary
+from alframework.tools.dataset_screening import screen_and_store_dataset
 from alframework.tools.sampler_batching import SamplerBatchBuffer
 from alframework.tools.sampler_batching import configured_sampler_calculator_status
 from alframework.tools.sampler_batching import flatten_molecule_output
@@ -220,7 +222,8 @@ testing = False
 if args.test_builder or args.test_sampler or args.test_qm:
     task_input = build_input_dict(builder_task.func,
                                   [{"moleculeid": 'test_builder', "moleculeids": ['test_builder'],
-                                    "builder_config": builder_config}, *all_configs, status],
+                                    "builder_config": builder_config,
+                                    "sampler_config": sampler_config}, *all_configs, status],
                                   raise_on_fail=True)
 
     builder_task_queue.add_task(builder_task(**task_input))
@@ -269,6 +272,32 @@ if args.test_sampler:
     assert isinstance(test_configuration, MoleculesObject), 'test_configuration must be a MoleculesObject instance'
     print("Sampler testing returned:")
     print(test_configuration)
+    sampler_metadata = test_configuration.get_metadata()
+    print("Sampler metadata:")
+    print(json.dumps(sampler_metadata, indent=2))
+    backend_options = dict(sampler_config.get("alchemi_baoab", {}))
+    if (
+        bool(backend_options.get("strict_gpu", False))
+        and not bool(backend_options.get("allow_cpu_debug", False))
+    ):
+        assert str(sampler_metadata.get("sampler_device", "")).startswith(
+            "cuda:"
+        ), "Strict-GPU sampler testing must return CUDA device metadata."
+    if sampler_config.get("model_mode") == "excited_state":
+        state_selection = dict(sampler_config.get("state_selection", {}))
+        configured_states = (
+            {state_selection.get("state")}
+            if state_selection.get("mode") == "fixed"
+            else set(state_selection.get("states", []))
+        )
+        assert sampler_metadata.get("selected_state") in configured_states, (
+            "Excited-state sampler testing must return configured "
+            "selected_state metadata."
+        )
+    if bool(sampler_config.get("topology_check", {}).get("enabled", False)):
+        assert sampler_metadata.get("topology_valid") is True, (
+            "Topology-enabled sampler testing must return topology_valid=true."
+        )
     testing = True
 
 #def ase_calculator_task(input_system,configuration_list,directory,command,properties=['energy','forces']):
@@ -352,7 +381,8 @@ if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
                                ]
                 task_input = build_input_dict(builder_task.func,
                                               [{"moleculeid": 'mol-boot-{:010d}'.format(status['current_molecule_id']),
-                                                "moleculeids": moleculeids, "builder_config": builder_config},
+                                                "moleculeids": moleculeids, "builder_config": builder_config,
+                                                "sampler_config": sampler_config},
                                                *all_configs, status],
                                               raise_on_fail=True)
                 builder_task_queue.add_task(builder_task(**task_input))
@@ -391,10 +421,29 @@ if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
 
     print("Saving Bootstrap and training model")
     results_list, failed = QM_task_queue.get_task_results()
-    status['lifetime_failed_QM_tasks'] = status['lifetime_failed_QM_tasks'] + failed    
-    store_current_data(master_config['h5_path'].format(status['current_h5_id']),
-                       results_list,
-                       master_config['properties_list'])
+    status['lifetime_failed_QM_tasks'] = status['lifetime_failed_QM_tasks'] + failed
+    results_list = [
+        molecule
+        for task_output in results_list
+        for molecule in flatten_molecule_output(task_output)
+    ]
+    stored, results_list, screening_summary = screen_and_store_dataset(
+        master_config['h5_path'].format(status['current_h5_id']),
+        results_list,
+        master_config['properties_list'],
+        sampler_config,
+        master_directory=master_config.get('master_directory'),
+    )
+    status['last_dataset_screening'] = screening_summary
+    print_dataset_screening_summary(screening_summary)
+    if not stored:
+        print(
+            "All bootstrap QM results were rejected by dataset screening; "
+            "no HDF5 shard or model will be created."
+        )
+        with open(master_config['status_path'], "w") as outfile:
+            json.dump(status, outfile, indent=2)
+        exit()
     status['current_h5_id'] = status['current_h5_id'] + 1
     
 if status['current_model_id'] < 0:
@@ -485,7 +534,8 @@ while True:
                            range(status['current_molecule_id'], status['current_molecule_id']+master_config.get('maximum_builder_structures',1))]
             task_input = build_input_dict(builder_task.func,
                                           [{"moleculeid": 'mol-{:04d}-{:010d}'.format(status['current_model_id'], status['current_molecule_id']),
-                                            "moleculeids": moleculeids, "builder_config": builder_config},
+                                            "moleculeids": moleculeids, "builder_config": builder_config,
+                                            "sampler_config": sampler_config},
                                            *all_configs, status],
                                           raise_on_fail=True)
             builder_task_queue.add_task(builder_task(**task_input))
@@ -525,14 +575,35 @@ while True:
                     QM_task_queue.add_task(qm_task(**task_input))
 
     # Train more models
-    if (QM_task_queue.get_completed_number() > master_config['save_h5_threshold']) and (ML_task_queue.get_number() < 1):
+    if (QM_task_queue.get_completed_number() >= master_config['save_h5_threshold']) and (ML_task_queue.get_number() < 1):
         #print(QM_task_queue.task_list[0].result())
     	  #store_current_data(h5path, system_data, properties):
         results_list, failed = QM_task_queue.get_task_results()
         status['lifetime_failed_QM_tasks'] = status['lifetime_failed_QM_tasks'] + failed
+        results_list = [
+            molecule
+            for task_output in results_list
+            for molecule in flatten_molecule_output(task_output)
+        ]
+        stored, results_list, screening_summary = screen_and_store_dataset(
+            master_config['h5_path'].format(status['current_h5_id']),
+            results_list,
+            master_config['properties_list'],
+            sampler_config,
+            master_directory=master_config.get('master_directory'),
+        )
+        status['last_dataset_screening'] = screening_summary
+        print_dataset_screening_summary(screening_summary)
+        if not stored:
+            print(
+                "All completed QM results were rejected by dataset screening; "
+                "skipping HDF5 save and ML training."
+            )
+            with open(master_config['status_path'], "w") as outfile:
+                json.dump(status, outfile, indent=2)
+            continue
         #with open('temp-{:04d}.pkl'.format(status['current_h5_id']),'wb') as pickle_file:
         #    pickle.dump(results_list,pickle_file)
-        store_current_data(master_config['h5_path'].format(status['current_h5_id']), results_list, master_config['properties_list'])
 #        with open('data-bk-{:04d}.pickle'.format(status['current_h5_id']),'wb') as pkbk: 
 #            pickle.dump(results_list,pkbk)
         status['current_h5_id'] = status['current_h5_id'] + 1

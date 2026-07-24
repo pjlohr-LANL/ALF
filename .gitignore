@@ -54,3 +54,16 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+
+# Excited-state PySEQM production run artifacts
+examples/excited_state_pyseqm/h5store/
+examples/excited_state_pyseqm/models/
+examples/excited_state_pyseqm/models_debug/
+examples/excited_state_pyseqm/models_failed_launch_*/
+examples/excited_state_pyseqm/status*.txt
+examples/excited_state_pyseqm/qm_test.h5
+examples/excited_state_pyseqm/pyseqm_scratch*/
+examples/excited_state_pyseqm/pyseqm_logs/
+examples/excited_state_pyseqm/sampling/
+examples/excited_state_pyseqm/ALF_6STATE_KETO_*.log
+examples/excited_state_pyseqm/ALF_6STATE_KETO_*.err

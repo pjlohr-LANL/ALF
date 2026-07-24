@@ -1,209 +1,143 @@
-# Excited-state PySEQM active learning
+# Six-state keto PySEQM production replica
 
-This example connects ALF's standard CFG loader, multi-state HIPPYNN trainer,
-batched ALCHEMI sampler, and convergence-safe PySEQM interface into one
-head-node active-learning process. Parsl dynamically requests separate Darwin
-Slurm allocations for training, sampling, and QM labeling.
-
-Two startup modes are included:
+This directory is a fresh, independent reproduction of the Darwin workload
+in:
 
 ```text
-CFG -> PySEQM bootstrap -> HDF5 -> HIPPYNN -> ALCHEMI sampling
+/vast/home/pjlohr/github/ALF/production/6_states_EF_300_2_nodes_topology
 ```
+
+It uses this branch's streamlined HDF5 replay builder, six-state HIPPYNN
+trainer, batched ALCHEMI sampler, convergence-safe PySEQM interface, and
+independently scaling Parsl executors. The active source run is never used for
+status, models, or output.
+
+## Workflow
 
 ```text
-Existing HDF5 -> HIPPYNN
-CFG -> ALCHEMI sampling -> PySEQM -> additional HDF5 shards
+copied data-0000.h5
+  -> four-member six-state HIPPYNN ensemble
+  -> deterministic HDF5 geometry replay
+  -> state-specific ALCHEMI batches
+  -> screened PySEQM labels
+  -> additional HDF5 shards and retraining
 ```
 
-The included water system and two electronic states make this an integration
-example. The thresholds, network size, data volume, and trajectory length are
-starting values, not a scientifically converged water model.
+The flattened property contract is `sE0` through `sE5` and `F0` through
+`F5`. Gap targets, UDD, gap diagnostics, and gap seeking are intentionally
+disabled for this first production-compatible run.
 
-## What CFG contributes
+## Seed data and topology
 
-`simple_cfg_loader_task` reads atomic identity, order, coordinates, and cell
-data from `fragment_library/water.cfg`. ASE's AtomEye CFG reader always marks
-CFG structures periodic, so both builder configurations explicitly set
-`"pbc": false` after loading.
-
-CFG auxiliary arrays are not used as multi-state labels. Energies and forces
-enter ALF through PySEQM or through HDF5 datasets selected by
-`properties_list`:
-
-```json
-{
-  "sE0": ["state_0_energy", "system", 1.0],
-  "F0": ["state_0_forces", "atomic", 1.0],
-  "sE1": ["state_1_energy", "system", 1.0],
-  "F1": ["state_1_forces", "atomic", 1.0],
-  "dE01": ["gap_01", "system", 1.0]
-}
-```
-
-PySEQM labels both states and derives `dE01 = sE1 - sE0`. The HIPPYNN trainer
-uses one shared trunk with state-specific energy/force heads and a derived gap
-loss.
-
-## Files
-
-| File | Purpose |
-| --- | --- |
-| `master_config.json` | Self-contained PySEQM bootstrap workflow |
-| `master_config_existing_h5.json` | Start from existing labeled HDF5 shards |
-| `master_config_debug.json` | Batch-size-one stage checks |
-| `builder_config_bootstrap.json` | CFG loading with a small geometry shake |
-| `builder_config_existing_h5.json` | Exact CFG reuse with `shake: 0.0` |
-| `sampler_config.json` | Two-state strict batches of 50 |
-| `sampler_config_debug.json` | One-replica debug sampler |
-| `QM_config.json` | Single-molecule PySEQM settings |
-| `hippynn_config.json` | Multi-state HIPPYNN settings |
-| `parsl_configs.py` | Dynamically scaling Darwin Slurm executors |
-
-The XYZ file is the fixed-topology reference. It has the same `O, H, H` atom
-order as the CFG file.
-
-## Darwin resource setup
-
-`parsl_configs.config_darwin` defines three independent executor pools:
-
-| ALF stage | Executor | Darwin partition | Workers per node |
-| --- | --- | --- | --- |
-| HIPPYNN training | `alf_ML_executor` | `ml4chem` | 1 |
-| ALCHEMI sampling and CFG loading | `alf_sampler_executor` | `shared-gpu-ampere` | 4 |
-| PySEQM labeling | `alf_QM_executor` | `shared-gpu-ampere` | 4 |
-
-All providers use `init_blocks=0` and `min_blocks=0`. The main ALF process can
-therefore remain on a head node while Parsl requests allocations only when a
-queue contains work. Sampling and QM use separate allocations even though
-they target the same partition.
-
-Before a real run, review the constants at the top of `parsl_configs.py` or
-set the corresponding environment variables:
+Only the first source shard belongs in this fresh run:
 
 ```bash
-export ALF_DARWIN_ACCOUNT="your_account"
-export ALF_DARWIN_ENV_ACTIVATION='source /path/to/conda.sh; conda activate /path/to/atomistic'
-export ALF_DARWIN_ML_SCHEDULER_OPTIONS='#SBATCH --gpus-per-node=4'
-export ALF_DARWIN_SAMPLER_SCHEDULER_OPTIONS='#SBATCH --gpus-per-node=4'
-export ALF_DARWIN_QM_SCHEDULER_OPTIONS='#SBATCH --gpus-per-node=4'
-# Optional; otherwise each allocation uses SLURM_TMPDIR or TMPDIR.
-export ALF_DARWIN_CACHE_ROOT='/path/to/writable/node-local/cache'
+mkdir -p h5store
+cp --reflink=auto \
+  /vast/home/pjlohr/github/ALF/production/6_states_EF_300_2_nodes_topology/h5store_5k_3node_6state_E_F_topology/data-0000.h5 \
+  h5store/data-0000.h5
+sha256sum \
+  /vast/home/pjlohr/github/ALF/production/6_states_EF_300_2_nodes_topology/h5store_5k_3node_6state_E_F_topology/data-0000.h5 \
+  h5store/data-0000.h5
 ```
 
-Account, QoS, walltime, block limits, CUDA module command, and GPU request
-syntax are deliberately configurable. Worker initialization creates writable
-Warp and Matplotlib caches in Slurm or process-local temporary storage.
-
-From the repository root, install the ALCHEMI and topology extras, and install
-LANL PySEQM in the same worker environment:
-
-```bash
-python -m pip install -e ".[gpu_dynamics,topology]"
-```
-
-## Mode 1: bootstrap from CFG
-
-Run from this directory:
-
-```bash
-cd examples/excited_state_pyseqm
-python -m alframework --master master_config.json
-```
-
-With no existing `status_bootstrap.txt` or bootstrap HDF5 shards, ALF:
-
-1. Loads and perturbs water CFG geometries.
-2. Queues 500 single-molecule PySEQM calculations.
-3. Writes `h5store_bootstrap/data-0000.h5`.
-4. Trains `models_bootstrap/model-0000`.
-5. Starts strict two-state ALCHEMI sampling.
-6. Labels uncertain candidates and retrains after the configured threshold.
-
-The small shake applies only to the bootstrap and sampler starting geometry.
-It does not import or invent labels.
-
-## Mode 2: start from existing HDF5
-
-Place compatible shards at:
+Both hashes must be:
 
 ```text
-h5store/data-0000.h5
-h5store/data-0001.h5
-...
+f47183504f50b191bb4dbee5ef1df13c2b83e76771d7fe30aaa9f774b83a9714
 ```
 
-Do not create `status.txt` for the first launch. Then run:
+The copied shard contains 4,990 structures of one 15-atom keto composition.
+ALF HDF5 stores atoms in stable H/C/O order. The replay builder restores the
+canonical O/O/C/... order from `topology_atom_ids`, or infers the same mapping
+for later ALF-written shards. This makes sampler inputs match
+`keto_form_coords.xyz` while every training shard keeps one storage order.
 
-```bash
-python -m alframework --master master_config_existing_h5.json
-```
-
-ALF discovers the first unused HDF5 index. Because labeled data already
-exists, it skips the PySEQM bootstrap stage, trains the initial model from the
-shards, and uses exact CFG geometries (`shake: 0.0`) as sampling seeds.
-
-Existing shards must contain finite coordinates, an identical atomic-number
-sequence, and the configured database names:
+The topology reference hash must be:
 
 ```text
-state_0_energy
-state_0_forces
-state_1_energy
-state_1_forces
-gap_01
+254d4cd1674cd353606d12c6b4185d1f9b5e29d323500c9d292f2c66c37d211a
 ```
 
-The gap values must equal `state_1_energy - state_0_energy`, and all three
-system properties must use compatible scaling.
+## Production settings
+
+- Four HIPPYNN members predict energies and forces for all six states.
+- Replay submits 50 structures at a time.
+- ALCHEMI uses strict batches of 50 and cycles through states 0–5.
+- At most 100 sampler replicas are active, matching two full batches.
+- PySEQM labels one molecule per task and uses the production AM1 energy
+  offset.
+- Candidates and completed labels are screened at `0.7 Å`, `16 eV/Å`, and
+  against the fixed keto topology.
+- After 2,000 completed QM tasks, accepted labels are screened and stored; an
+  all-rejected batch creates no shard and does not advance training.
+
+`master_config_existing_h5.json` is retained as a compatibility alias of
+`master_config.json`.
+
+## Darwin resources
+
+`parsl_configs.py` requests independent allocations only when work is queued:
+
+| Stage | Executor | Partition | Workers/node | Maximum blocks |
+| --- | --- | --- | ---: | ---: |
+| Training | `alf_ML_executor` | `ml4chem` | 1 | 1 |
+| Sampling/replay | `alf_sampler_executor` | `shared-gpu-ampere` | 4 | 2 |
+| PySEQM | `alf_QM_executor` | `shared-gpu-ampere` | 4 | 2 |
+
+The production defaults are account `y2020-bf`, CUDA `12.2.2`, and:
+
+```text
+/vast/home/pjlohr/.conda/envs/atomistic
+```
+
+All remain overridable through the `ALF_DARWIN_*` environment variables.
 
 ## Stage checks
 
-The debug master selects the short Darwin executor configuration and the
-batch-size-one sampler required by `--test_sampler`:
+Run from this directory, in order:
 
 ```bash
+source /projects/opt/centos8/x86_64/miniconda3/py312_24.11.1/etc/profile.d/conda.sh
+conda activate /vast/home/pjlohr/.conda/envs/atomistic
+export PYTHONPATH=/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF:${PYTHONPATH:-}
+
 python -m alframework --master master_config_debug.json --test_builder
 python -m alframework --master master_config_debug.json --test_qm
-```
-
-`--test_ml` requires an HDF5 shard, and `--test_sampler` requires a completed
-model. Run them after the bootstrap has produced the corresponding artifacts:
-
-```bash
 python -m alframework --master master_config_debug.json --test_ml
 python -m alframework --master master_config_debug.json --test_sampler
 ```
 
-The test commands use the same bootstrap HDF5 and model paths as
-`master_config.json`.
+The debug trainer uses two members and two epochs. Its models and status are
+isolated under `models_debug/` and `status_debug.txt`. The builder result must
+match the 15-atom reference order; QM must return six finite energies and six
+`(15, 3)` force arrays; the sampler must report CUDA execution and selected
+state metadata.
 
-## Sampling behavior
+## Production launch and restart
 
-The production sampler forms full batches of 50. Consecutive molecule-ID
-blocks alternate between state 0 and state 1, so `parallel_samplers: 200` can
-fill four state-specific batches. Parsl assigns those tasks to arbitrary
-sampler GPUs; electronic state is not tied to GPU number.
+After all stage checks pass:
 
-The baseline uses production-compatible stop-on-uncertainty, temperature
-scheduling, friction, and spherical-well behavior. Gap diagnostics are
-recorded, while LCM gap seeking is configured but disabled. After the direct
-dynamics workflow is validated, set `gap_seeking.enabled` to `true` to test
-the per-replica stay-fixed LCM path.
+```bash
+sbatch submit_darwin.slurm
+```
 
-Topology is checked before dynamics and at every uncertainty synchronization.
-The water-specific `distcut` is below the reference O-H bond length. Invalid
-topologies and close-contact frames are discarded before they can consume
-candidate or QM slots.
+With `h5store/data-0000.h5` present and no `status.txt`, ALF discovers HDF5
+index 1, skips bootstrap QM, and trains `models/model-0000`. The same command
+resumes from `status.txt`; do not mix debug and production artifacts or copy
+the source production status into this directory.
 
-PySEQM remains one molecule per Parsl task. SCF nonconvergence, malformed
-convergence flags, timeouts, and nonfinite results mark the molecule
-unconverged and prevent partial labels from entering HDF5.
+Darwin's `long` QoS permits a two-day driver allocation. If the driver reaches
+that limit, resubmit the same script; ALF resumes from the isolated status,
+HDF5, and model paths.
 
-## Run outputs and restarts
+The first acceptance milestone is:
 
-Generated HDF5 stores, model directories, status files, PySEQM scratch, logs,
-and Parsl `runinfo` directories are run artifacts and should not be committed.
-ALF resumes from the configured status file. To intentionally start a new run,
-use new output paths or archive the previous artifacts rather than mixing
-independent histories.
+1. Four complete members in `model-0000`.
+2. Sampling on every state 0–5.
+3. Screened PySEQM candidates.
+4. `h5store/data-0001.h5`.
+5. Start of `model-0001`.
+
+Generated HDF5 shards, models, status, PySEQM scratch/logs, sampling outputs,
+and Parsl run information are ignored by Git.

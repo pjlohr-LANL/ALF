@@ -205,8 +205,8 @@ Related Examples
      - ``alframework.builders.builders.simple_cfg_loader_task``
      - Loads pre-generated ``.cfg`` structures.
    * - ``examples/excited_state_pyseqm``
-     - ``alframework.builders.builders.simple_cfg_loader_task``
-     - Seeds multi-state ALCHEMI sampling; labels come from PySEQM or HDF5.
+     - ``alframework.builders.h5_replay_builder.h5_replay_builder_task``
+     - Deterministically replays HDF5 geometries in fixed-topology order.
    * - ``examples/reactive_sampling``
      - ``alframework.builders.reactive_builder.load_reactive_task``
      - Loads reactant, transition-state, and product structures.
