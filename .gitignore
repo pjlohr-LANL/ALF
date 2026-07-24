@@ -79,3 +79,6 @@ examples/excited_state_gpu4pyscf/gpu4pyscf_scratch*/
 examples/excited_state_gpu4pyscf/sampling/
 examples/excited_state_gpu4pyscf/ALF_GPU4PYSCF_KETO_*.log
 examples/excited_state_gpu4pyscf/ALF_GPU4PYSCF_KETO_*.err
+
+# General local debug outputs
+debug/
