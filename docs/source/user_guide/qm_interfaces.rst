@@ -24,6 +24,8 @@ Supported QM Packages
      - ``alframework.qm_interfaces.ase_calculator_interface.ase_calculator_task``
    * - `PySEQM <https://github.com/lanl/PYSEQM>`__
      - ``alframework.qm_interfaces.pyseqm_interface.pyseqm_excited_state_task``
+   * - `GPU4PySCF <https://github.com/pyscf/gpu4pyscf>`__
+     - ``alframework.qm_interfaces.gpu4pyscf_interface.gpu4pyscf_excited_state_task``
 
 When a QM engine already has a reliable ASE calculator, the generic ASE task is
 usually the easiest integration route. Write a small QM config that identifies
@@ -107,6 +109,74 @@ PySEQM tensor evaluation still has a leading batch dimension of one, but there
 is no QM buffer or batching change in the main ALF driver. Periodic systems,
 topology filtering, and pre-labeled bypasses are not supported by this
 interface version.
+
+GPU4PySCF Excited-State Labeling
+--------------------------------
+
+The dedicated GPU4PySCF task produces ground- and excited-state energies and
+forces through the same flattened property contract:
+
+.. code-block:: json
+
+   {
+     "QM_task": "alframework.qm_interfaces.gpu4pyscf_interface.gpu4pyscf_excited_state_task"
+   }
+
+The validated default calculation is a neutral-singlet, density-fitted
+CAM-B3LYP/6-31G* RKS calculation with grid level 3 followed by TDA with five
+excited roots:
+
+.. code-block:: json
+
+   {
+     "xc": "cam-b3lyp",
+     "basis": "6-31g*",
+     "charge": 0,
+     "multiplicity": 1,
+     "density_fit": true,
+     "auxbasis": null,
+     "grids_level": 3,
+     "nroots": 5,
+     "scf_conv_tol": 1.0e-10,
+     "scf_max_cycle": 100,
+     "tda_conv_tol": 1.0e-8,
+     "tda_max_cycle": 100,
+     "num_threads": 8,
+     "max_memory_mb": null,
+     "verbosity": 0,
+     "energy_offset_eV": 0.0
+   }
+
+With ``nroots: 5``, ``properties_list`` must contain every ``sE#`` and ``F#``
+from state zero through state five. The task stores total state energies in eV
+and forces in eV/Angstrom. Explicit ``dE#`` properties are derived after the
+common energy offset is applied, so the offset cancels.
+
+SCF and every requested TDA root must expose valid Boolean convergence flags.
+The interface rejects the entire molecule on any convergence, gradient,
+shape, or finiteness failure and never stores partial labels. Successful and
+failed calculations record the backend, selected CUDA device, convergence
+status, and elapsed time. Successful calculations also record the calculation
+settings and dependency versions.
+
+GPU selection follows ALF's Parsl worker-rank convention. The task requires a
+real CUDA device, has no CPU fallback, and does not bind electronic states to
+particular GPUs. It submits one molecule per ordinary QM task and relies on
+Parsl/Slurm walltime rather than a child-process timeout.
+
+Install the GPU4PySCF package matching the worker CUDA runtime separately, for
+example ``gpu4pyscf-cuda12x`` on the supplied Darwin CUDA 12 profile. Imports
+remain lazy so ordinary ALF installations do not require GPU4PySCF. The task
+calls GPU4PySCF directly because its standard ASE adapter does not expose
+ALF's multi-state ``sE#``/``F#`` properties.
+
+Only singlet RKS/TDA is supported in this slice. Roots are energy ordered at
+each geometry. Dipoles, transition dipoles, NACVs, full TDDFT, state tracking,
+PBC, and QM batching are not included.
+
+See :doc:`../examples/excited_state_gpu4pyscf` for separate CFG-bootstrap,
+existing-HDF5, and Darwin validation configurations. The GPU4PySCF and PySEQM
+examples intentionally use independent data and output directories.
 
 .. note::
 
@@ -335,6 +405,7 @@ You can link from this guide directly to API pages:
 * :doc:`ORCA interface module <../api_documentation/alframework.qm_interfaces.orca5_interface>`
 * :doc:`QChem interface module <../api_documentation/alframework.qm_interfaces.qchem_DFT_interface>`
 * :doc:`PySEQM interface module <../api_documentation/alframework.qm_interfaces.pyseqm_interface>`
+* :doc:`GPU4PySCF interface module <../api_documentation/alframework.qm_interfaces.gpu4pyscf_interface>`
 * :doc:`Legacy VASP interface module <../api_documentation/alframework.qm_interfaces.vaspase_interface>`
 * :doc:`Parsl execution guide <parsl>`
 

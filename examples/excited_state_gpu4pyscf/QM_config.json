@@ -1,0 +1,18 @@
+{
+  "xc": "cam-b3lyp",
+  "basis": "6-31g*",
+  "charge": 0,
+  "multiplicity": 1,
+  "density_fit": true,
+  "auxbasis": null,
+  "grids_level": 3,
+  "nroots": 5,
+  "scf_conv_tol": 1.0e-10,
+  "scf_max_cycle": 100,
+  "tda_conv_tol": 1.0e-8,
+  "tda_max_cycle": 100,
+  "num_threads": 8,
+  "max_memory_mb": null,
+  "verbosity": 0,
+  "energy_offset_eV": 0.0
+}

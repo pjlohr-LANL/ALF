@@ -49,6 +49,7 @@ pieces to a concrete run.
 
    examples/simple_water
    examples/excited_state_pyseqm
+   examples/excited_state_gpu4pyscf
    examples/seeded_active_learning
    examples/fine_tuning
    examples/molten_salt
