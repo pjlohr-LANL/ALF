@@ -137,6 +137,8 @@ def test_masters_use_the_validated_six_surface_contract(master_filename):
     assert options["density_fit"] is True
     assert options["grids_level"] == 3
     assert options["nroots"] == 5
+    assert options["tda_conv_tol"] == pytest.approx(1.0e-6)
+    assert options["tda_max_cycle"] == 300
     assert [row["state"] for row in state_table] == list(range(6))
     assert gap_table == []
 
@@ -399,3 +401,18 @@ def test_darwin_qm_executor_runs_one_molecule_per_gpu(monkeypatch):
     )
     assert "/gpu4pyscf/source" in module.GPU4PYSCF_WORKER_INIT
     assert "CUPY_CACHE_DIR" in module.GPU4PYSCF_WORKER_INIT
+
+
+def test_headnode_launcher_uses_validated_darwin_runtime():
+    launcher = (
+        EXAMPLE_DIR / "launch_headnode.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "/vast/home/pjlohr/.conda/envs/alf_env" in launcher
+    assert "PYTHONNOUSERSITE=1" in launcher
+    assert launcher.count("#SBATCH --constraint=gpu_count:4") == 2
+    assert 'MASTER_CONFIG="${ALF_GPU4PYSCF_MASTER:-master_config.json}"' in (
+        launcher
+    )
+    assert '-m alframework --master "${MASTER_CONFIG}"' in launcher
+    assert "\nsbatch " not in launcher

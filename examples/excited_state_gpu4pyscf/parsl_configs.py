@@ -71,7 +71,7 @@ ATOMISTIC_ENV_ACTIVATION = os.environ.get(
     (
         "source /projects/opt/centos8/x86_64/miniconda3/"
         "py312_24.11.1/etc/profile.d/conda.sh; "
-        "conda activate /vast/home/pjlohr/.conda/envs/atomistic"
+        "conda activate /vast/home/pjlohr/.conda/envs/alf_env"
     ),
 )
 GPU4PYSCF_ENV_ACTIVATION = os.environ.get(
@@ -103,6 +103,7 @@ def _worker_init(
     commands = [
         CUDA_MODULE_COMMAND,
         environment_activation,
+        "export PYTHONNOUSERSITE=1",
         f'export PYTHONPATH="{pythonpath_prefix}:${{PYTHONPATH:-}}"',
         (
             f'export ALF_WORKER_CACHE_ROOT="{cache_root}"'

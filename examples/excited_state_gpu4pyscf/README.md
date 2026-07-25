@@ -26,6 +26,7 @@ The validated settings in `QM_config.json` are:
 - density-fitted RKS
 - grid level 3
 - TDA with five excited roots
+- TDA convergence tolerance `1.0e-6` and at most 300 cycles
 - eight CPU threads per GPU worker
 
 The task requires SCF and every requested root to converge before it stores
@@ -89,7 +90,10 @@ The master `gpus_per_node` remains four because ALF also passes it to the
 four-GPU sampler and trainer. GPU4PySCF selects the worker's visible local
 device; it does not use four GPUs for one molecule.
 
-Set these variables before launching on Darwin:
+The checked-in launchers default to account `y2020-bf`, CUDA `12.2.2`, the
+four-GPU-node constraint, and the self-contained environment at
+`/vast/home/pjlohr/.conda/envs/alf_env`. The settings remain configurable
+through these environment variables:
 
 ```bash
 export ALF_DARWIN_ACCOUNT="..."
@@ -98,8 +102,8 @@ export ALF_DARWIN_GPU4PYSCF_SCHEDULER_OPTIONS="..."
 export ALF_DARWIN_GPU4PYSCF_WALLTIME="12:00:00"
 export ALF_DARWIN_GPU4PYSCF_MAX_BLOCKS="2"
 export ALF_DARWIN_GPU4PYSCF_CORES_PER_WORKER="8"
-export ALF_DARWIN_ENV_ACTIVATION="source .../conda.sh; conda activate .../atomistic"
-export ALF_DARWIN_GPU4PYSCF_ENV_ACTIVATION="source .../conda.sh; conda activate .../gpu4pyscf-alf"
+export ALF_DARWIN_ENV_ACTIVATION="source .../conda.sh; conda activate .../alf_env"
+export ALF_DARWIN_GPU4PYSCF_ENV_ACTIVATION="${ALF_DARWIN_ENV_ACTIVATION}"
 ```
 
 If GPU4PySCF is used from a source checkout, also set:
@@ -141,15 +145,41 @@ same method, basis, charge, and grid. Then submit several molecules and verify
 from worker metadata/logs that different tasks use different A100s while all
 S0-S5 results for a molecule share one device.
 
-## Production launch
+## Production launch from a head node
 
-After filling in the site settings in the environment or submission wrapper:
+Start the ALF driver directly in a persistent `tmux` session. The driver stays
+on the head node; the three Parsl executors dynamically submit all training,
+sampling, and QM compute work to Slurm.
+
+```bash
+tmux new -s alf_gpu4pyscf
+cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/examples/excited_state_gpu4pyscf
+bash launch_headnode.sh
+```
+
+Detach without stopping the driver with `Ctrl-b d`. Reattach later with:
+
+```bash
+tmux attach -t alf_gpu4pyscf
+```
+
+If the driver exits and must be restarted, reattach to the session (or create
+another one), return to this directory, and run `bash launch_headnode.sh`
+again. ALF resumes from `status.txt`; use the same master configuration for
+the restart.
+
+For a fresh run, verify that `status.txt`, `h5store/data-*.h5`, and
+`models/model-*` do not exist before launching. The default
+`master_config.json` generates 50 GPU4PySCF bootstrap labels. Set
+`ALF_GPU4PYSCF_MASTER=master_config_existing_h5.json` only when starting from
+a compatible GPU4PySCF shard.
+
+To keep the driver itself in a persistent `general`-partition allocation
+instead, submit the alternate wrapper:
 
 ```bash
 sbatch submit_darwin.slurm
 ```
 
-Set `ALF_GPU4PYSCF_MASTER=master_config_existing_h5.json` when starting from a
-compatible shard. Reuse the same master and isolated status path when
-restarting. Generated data, models, caches, scratch files, logs, sampling
-outputs, and Parsl run information are ignored by Git.
+Generated data, models, caches, scratch files, logs, sampling outputs, and
+Parsl run information are ignored by Git.

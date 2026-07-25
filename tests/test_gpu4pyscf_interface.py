@@ -445,7 +445,7 @@ def test_backend_constructs_rks_tda_and_uses_one_based_gradients(
     assert calls["gradient_states"] == [1, 2]
     assert calls["tda"].nstates == 2
     assert calls["tda"].conv_tol == pytest.approx(1.0e-8)
-    assert calls["tda"].max_cycle == 100
+    assert calls["tda"].max_cycle == 200
     np.testing.assert_allclose(energies, [-4.0, -3.8, -3.6])
     np.testing.assert_allclose(forces[0], -np.ones((3, 3)))
     np.testing.assert_allclose(forces[1], -np.full((3, 3), 4.0))

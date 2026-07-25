@@ -38,7 +38,7 @@ DEFAULT_GPU4PYSCF_CONFIG = {
     "scf_conv_tol": 1.0e-10,
     "scf_max_cycle": 100,
     "tda_conv_tol": 1.0e-8,
-    "tda_max_cycle": 100,
+    "tda_max_cycle": 200,
     "num_threads": 8,
     "max_memory_mb": None,
     "verbosity": 0,
