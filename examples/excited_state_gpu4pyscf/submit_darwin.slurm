@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=general
+#SBATCH --partition=ml4chem
 #SBATCH --account=y2020-bf
 #SBATCH --qos=long
 #SBATCH --time=2-00:00:00

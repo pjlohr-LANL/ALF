@@ -2,9 +2,10 @@
 
 This example labels keto acetylacetone with GPU4PySCF and trains the same
 six-surface HIPPYNN/ALCHEMI workflow used by the excited-state PySEQM example.
-The examples are intentionally independent: they do not share QM
-configurations, HDF5 shards, models, status files, scratch directories, or
-worker environments.
+The GPU4PySCF bootstrap reads geometries from the PySEQM example, but it does
+not reuse any PySEQM labels. The examples have independent QM configurations,
+output HDF5 shards, models, status files, scratch directories, and worker
+environments.
 
 ## Electronic-structure contract
 
@@ -28,6 +29,8 @@ The validated settings in `QM_config.json` are:
 - TDA with five excited roots
 - TDA convergence tolerance `1.0e-6` and at most 300 cycles
 - eight CPU threads per GPU worker
+- energy offset `-9405.0 eV`, so stored energies are
+  `E_raw - (-9405.0 eV)`
 
 The task requires SCF and every requested root to converge before it stores
 any label. Transition dipoles, NACVs, state tracking, full TDDFT, PBC, CPU
@@ -35,22 +38,26 @@ fallback, and QM batching are not part of this example.
 
 ## Startup modes
 
-### Self-contained bootstrap
+### Exhaustive geometry-relabel bootstrap
 
 `master_config.json` follows:
 
 ```text
-keto CFG
-  -> 50 serially generated GPU4PySCF labels
+4,990 geometries from ../excited_state_pyseqm/h5store/data-0000.h5
+  -> discard all PySEQM labels
+  -> 4,990 independent GPU4PySCF labeling attempts
   -> data-0000.h5
   -> six-state HIPPYNN
   -> state-cycled ALCHEMI
   -> additional GPU4PySCF labels and retraining
 ```
 
-The CFG loader applies a `0.03 Å` coordinate shake so the bootstrap structures
-are distinct. Fifty structures are enough to exercise the complete workflow,
-but they are not a scientifically converged production training set.
+The local replay builder reads source frames `0` through `4989` sequentially
+in batches of at most 50. It reads geometry, species, topology atom IDs, and
+source identifiers only; it never returns the source `sE*` or `F*` datasets.
+GPU4PySCF stores only converged, finite, topology-valid results in this
+example's own `h5store/data-0000.h5`, so the final training count can be below
+4,990 if any labeling attempts are rejected.
 
 ### Existing GPU4PySCF HDF5
 
@@ -97,9 +104,11 @@ through these environment variables:
 
 ```bash
 export ALF_DARWIN_ACCOUNT="..."
+export ALF_DARWIN_SAMPLER_QOS="..."
+export ALF_DARWIN_SAMPLER_WALLTIME="12:00:00"
 export ALF_DARWIN_GPU4PYSCF_QOS="..."
 export ALF_DARWIN_GPU4PYSCF_SCHEDULER_OPTIONS="..."
-export ALF_DARWIN_GPU4PYSCF_WALLTIME="12:00:00"
+export ALF_DARWIN_GPU4PYSCF_WALLTIME="08:00:00"
 export ALF_DARWIN_GPU4PYSCF_MAX_BLOCKS="2"
 export ALF_DARWIN_GPU4PYSCF_CORES_PER_WORKER="8"
 export ALF_DARWIN_ENV_ACTIVATION="source .../conda.sh; conda activate .../alf_env"
@@ -145,41 +154,111 @@ same method, basis, charge, and grid. Then submit several molecules and verify
 from worker metadata/logs that different tasks use different A100s while all
 S0-S5 results for a molecule share one device.
 
-## Production launch from a head node
+## Production driver on Darwin
 
-Start the ALF driver directly in a persistent `tmux` session. The driver stays
-on the head node; the three Parsl executors dynamically submit all training,
-sampling, and QM compute work to Slurm.
+The preferred production launch is the persistent Slurm wrapper:
 
 ```bash
+cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/examples/excited_state_gpu4pyscf
+sbatch submit_darwin.slurm
+```
+
+It requests one CPU-only driver task on `ml4chem` with account `y2020-bf`,
+`qos=long`, and a two-day walltime. The driver allocation does not request a
+GPU. Parsl independently requests the training, sampling, and QM allocations
+described above, so those workers retain their separate partitions,
+constraints, and walltimes.
+
+For an interactive alternative, run the same driver in `tmux` on a Darwin
+frontend:
+
+```bash
+hostname
 tmux new -s alf_gpu4pyscf
 cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/examples/excited_state_gpu4pyscf
 bash launch_headnode.sh
 ```
 
-Detach without stopping the driver with `Ctrl-b d`. Reattach later with:
+Detach without stopping the driver with `Ctrl-b d`. Darwin has multiple
+frontend nodes, and each frontend has its own local tmux server. Record the
+hostname printed above. To find and reattach the session, reconnect to that
+exact frontend, not merely whichever frontend a new login selects:
 
 ```bash
+ssh darwin-fe1
+hostname
+tmux ls
 tmux attach -t alf_gpu4pyscf
 ```
 
-If the driver exits and must be restarted, reattach to the session (or create
-another one), return to this directory, and run `bash launch_headnode.sh`
-again. ALF resumes from `status.txt`; use the same master configuration for
-the restart.
+Replace `darwin-fe1` with the frontend recorded when the session was created.
+A session on `darwin-fe1` is not visible to `tmux ls` on another frontend.
 
-For a fresh run, verify that `status.txt`, `h5store/data-*.h5`, and
-`models/model-*` do not exist before launching. The default
-`master_config.json` generates 50 GPU4PySCF bootstrap labels. Set
-`ALF_GPU4PYSCF_MASTER=master_config_existing_h5.json` only when starting from
-a compatible GPU4PySCF shard.
+### Restart after a driver crash
 
-To keep the driver itself in a persistent `general`-partition allocation
-instead, submit the alternate wrapper:
+Only one ALF driver may control an example directory. Before restarting,
+confirm that the old driver is gone and identify any Parsl allocations it
+left behind:
+
+```bash
+squeue -u "$USER" \
+  -o "%.18i %.16P %.40j %.8T %.10M %.20R"
+```
+
+Cancel only the explicit job IDs belonging to orphaned `parsl.alf_*`
+allocations from the failed driver. Never use a user-wide cancellation:
+
+```bash
+scancel JOBID1 JOBID2
+```
+
+Live builder, sampler, QM, and ML queues exist only in the driver process and
+are not reconstructed from `runinfo`. Results from sampling or QM tasks that
+were still in flight are therefore lost when the driver crashes. Preserve
+`status.txt`, every HDF5 shard, promoted models, the failed `runinfo/NNN`,
+and its scheduler logs; these are restart evidence and scientific state, not
+cleanup targets.
+
+Validate the persisted checkpoint before resubmitting:
+
+```bash
+cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/examples/excited_state_gpu4pyscf
+python -m json.tool status.txt >/dev/null
+python - <<'PY'
+import glob
+import json
+
+with open("status.txt", encoding="utf-8") as handle:
+    status = json.load(handle)
+print(json.dumps(status, indent=2))
+print("HDF5 shards:", sorted(glob.glob("h5store/data-*.h5")))
+print("model paths:", sorted(glob.glob("models/model-*")))
+PY
+```
+
+`current_h5_id` must identify the next shard to be written, and
+`current_model_id` must identify the newest fully promoted four-member model.
+`current_training_id` is advanced when training is submitted, not when it
+finishes. Consequently, a crash during model training requires manual
+inspection of the status IDs and the possibly partial `models/model-NNNN`
+directory before restart. Do not delete, renumber, or treat that directory as
+promoted without reconciling it.
+
+Once the checkpoint and directories agree, restart with the same master
+configuration:
 
 ```bash
 sbatch submit_darwin.slurm
 ```
+
+The new driver creates the next `runinfo` directory and resumes from
+`status.txt`. Do not simultaneously run `launch_headnode.sh` in tmux.
+
+For a genuinely fresh run, in contrast, `status.txt`, output
+`h5store/data-*.h5`, and `models/model-*` must not exist. The default
+`master_config.json` exhaustively relabels the 4,990 source geometries.
+Set `ALF_GPU4PYSCF_MASTER=master_config_existing_h5.json` only when starting
+from a compatible, already labeled GPU4PySCF shard.
 
 Generated data, models, caches, scratch files, logs, sampling outputs, and
 Parsl run information are ignored by Git.

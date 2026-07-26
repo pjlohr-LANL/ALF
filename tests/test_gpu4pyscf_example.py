@@ -141,6 +141,7 @@ def test_masters_use_the_validated_six_surface_contract(master_filename):
     assert options["nroots"] == 5
     assert options["tda_conv_tol"] == pytest.approx(1.0e-6)
     assert options["tda_max_cycle"] == 300
+    assert options["energy_offset_eV"] == pytest.approx(-9405.0)
     assert [row["state"] for row in state_table] == list(range(6))
     assert gap_table == []
 
@@ -480,3 +481,46 @@ def test_headnode_launcher_uses_validated_darwin_runtime():
     )
     assert '-m alframework --master "${MASTER_CONFIG}"' in launcher
     assert "\nsbatch " not in launcher
+
+
+def test_persistent_driver_uses_ml4chem_for_two_days_without_a_gpu():
+    submission = (
+        EXAMPLE_DIR / "submit_darwin.slurm"
+    ).read_text(encoding="utf-8")
+
+    assert "#SBATCH --partition=ml4chem" in submission
+    assert "#SBATCH --account=y2020-bf" in submission
+    assert "#SBATCH --qos=long" in submission
+    assert "#SBATCH --time=2-00:00:00" in submission
+    assert "#SBATCH --ntasks=1" in submission
+    assert "#SBATCH --gres" not in submission
+    assert "#SBATCH --gpus" not in submission
+
+
+def test_readme_documents_current_darwin_launch_and_recovery_contract():
+    readme = (EXAMPLE_DIR / "README.md").read_text(encoding="utf-8")
+    master = _read_json("master_config.json")
+    builder = _read_json("builder_config_bootstrap.json")
+    qm = _read_json("QM_config.json")
+
+    assert "each frontend has its own local tmux server" in readme
+    assert "ssh darwin-fe1" in readme
+    assert "tmux attach -t alf_gpu4pyscf" in readme
+    assert "CPU-only driver task on `ml4chem`" in readme
+    assert "`qos=long`" in readme
+    assert "two-day walltime" in readme
+    assert "sbatch submit_darwin.slurm" in readme
+    assert "Cancel only the explicit job IDs" in readme
+    assert "Never use a user-wide cancellation" in readme
+    assert (
+        "Preserve\n`status.txt`, every HDF5 shard, promoted models"
+        in readme
+    )
+    assert "queues exist only in the driver process" in readme
+    assert "a crash during model training requires manual" in readme
+    assert "current_training_id" in readme
+    assert f"{master['bootstrap_set']:,}" in readme
+    assert builder["bootstrap_h5_path"].format(0) in readme
+    assert f"`{qm['energy_offset_eV']} eV`" in readme
+    assert "50 serially generated GPU4PySCF labels" not in readme
+    assert "persistent `general`-partition allocation" not in readme
