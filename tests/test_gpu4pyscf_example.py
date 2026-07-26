@@ -1,7 +1,9 @@
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 from ase.io import read
@@ -149,12 +151,14 @@ def test_startup_modes_and_output_histories_are_independent():
     debug = _read_json("master_config_debug.json")
 
     assert bootstrap["builder_task"] == (
-        "alframework.builders.builders.simple_cfg_loader_task"
+        "alframework.builders.h5_replay_builder."
+        "h5_replay_builder_local_task"
     )
     assert bootstrap["builder_config_path"] == (
         "builder_config_bootstrap.json"
     )
-    assert bootstrap["bootstrap_set"] == 50
+    assert bootstrap["bootstrap_set"] == 4990
+    assert bootstrap["maximum_builder_structures"] == 50
     assert bootstrap["save_h5_threshold"] == 50
     assert existing["builder_task"] == (
         "alframework.builders.h5_replay_builder."
@@ -164,7 +168,7 @@ def test_startup_modes_and_output_histories_are_independent():
         "builder_config_existing_h5.json"
     )
     assert debug["builder_task"] == bootstrap["builder_task"]
-    assert debug["builder_config_path"] == "builder_config_debug.json"
+    assert debug["builder_config_path"] == bootstrap["builder_config_path"]
     assert bootstrap["h5_path"] == existing["h5_path"]
     assert debug["h5_path"] == "h5store_debug/data-{:04d}.h5"
     assert debug["model_path"] == "models_debug/model-{:04d}"
@@ -172,9 +176,16 @@ def test_startup_modes_and_output_histories_are_independent():
     assert bootstrap["target_queued_QM"] == 6
     assert debug["target_queued_QM"] == 4
 
-    for filename in MASTER_FILENAMES:
-        encoded = json.dumps(_read_json(filename)).lower()
-        assert "pyseqm" not in encoded
+    bootstrap_builder = _read_json("builder_config_bootstrap.json")
+    assert bootstrap_builder == {
+        "source_priority": "h5_only",
+        "selection_seed": 42,
+        "bootstrap_h5_path": (
+            "../excited_state_pyseqm/h5store/data-{:04d}.h5"
+        ),
+        "bootstrap_h5_count": 1,
+        "bootstrap_selection_mode": "sequential",
+    }
     assert not (
         PYSEQM_EXAMPLE_DIR / "QM_config_gpu4pyscf.json"
     ).exists()
@@ -214,16 +225,10 @@ def test_cfg_and_reference_preserve_keto_order_and_topology():
     )
 
 
-def test_cfg_builders_use_shaken_bootstrap_and_exact_debug_geometry(
+def test_bootstrap_replay_uses_source_geometry_without_pyseqm_labels(
     monkeypatch,
 ):
-    bootstrap = _read_json("builder_config_bootstrap.json")
-    debug = _read_json("builder_config_debug.json")
-    assert bootstrap["shake"] == pytest.approx(0.03)
-    assert debug["shake"] == pytest.approx(0.0)
-    assert bootstrap["pbc"] is debug["pbc"] is False
-
-    master, builder, _, _, _ = _load_example_configs(
+    master, builder, sampler, _, _ = _load_example_configs(
         monkeypatch,
         "master_config_debug.json",
     )
@@ -231,21 +236,57 @@ def test_cfg_builders_use_shaken_bootstrap_and_exact_debug_geometry(
     task_input = build_input_dict(
         task.func,
         [
-            {"moleculeid": "gpu4pyscf-debug", "builder_config": builder},
+            {
+                "moleculeid": "mol-boot-0000000000",
+                "builder_config": builder,
+                "sampler_config": sampler,
+            },
+            master,
             builder,
+            sampler,
+            {"current_h5_id": 0},
         ],
         raise_on_fail=True,
     )
     molecule = task.func(**task_input)
     atoms = molecule.get_atoms()
-    reference = read(EXAMPLE_DIR / "keto_form_coords.xyz")
+    source_path = (
+        PYSEQM_EXAMPLE_DIR / "h5store" / "data-0000.h5"
+    )
+    with h5py.File(source_path, "r") as handle:
+        group = handle["C05_H08_O02"]
+        reorder = np.argsort(
+            np.asarray(group["topology_atom_ids"][0]),
+            kind="stable",
+        )
+        expected_positions = np.asarray(group["coordinates"][0])[reorder]
 
     assert isinstance(molecule, MoleculesObject)
     assert not np.any(atoms.get_pbc())
-    np.testing.assert_array_equal(
-        atoms.get_atomic_numbers(),
-        reference.get_atomic_numbers(),
+    np.testing.assert_allclose(atoms.get_positions(), expected_positions)
+    assert molecule.get_results() == {}
+    assert molecule.get_metadata()["replay_source_id"]
+    assert molecule.get_metadata()["replay_global_frame_index"] == 0
+    assert molecule.get_metadata()["replay_external_bootstrap"] is True
+
+
+def test_pyseqm_source_shard_is_read_only_geometry_input():
+    source = PYSEQM_EXAMPLE_DIR / "h5store" / "data-0000.h5"
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    assert digest == (
+        "f47183504f50b191bb4dbee5ef1df13c2"
+        "b83e76771d7fe30aaa9f774b83a9714"
     )
+    with h5py.File(source, "r") as handle:
+        group = handle["C05_H08_O02"]
+        assert group["coordinates"].shape == (4990, 15, 3)
+        assert group["topology_atom_ids"].shape == (4990, 15)
+        assert all(
+            name in group
+            for state in range(6)
+            for name in (f"sE{state}", f"F{state}")
+        )
 
 
 @pytest.mark.parametrize("master_filename", MASTER_FILENAMES)
@@ -363,13 +404,16 @@ def test_darwin_qm_executor_runs_one_molecule_per_gpu(monkeypatch):
     }
 
     assert set(executors) == {
+        "alf_builder_executor",
         "alf_ML_executor",
         "alf_sampler_executor",
         "alf_QM_executor",
     }
+    builder = executors["alf_builder_executor"]
     ml = executors["alf_ML_executor"]
     sampler = executors["alf_sampler_executor"]
     qm = executors["alf_QM_executor"]
+    assert builder.max_threads == 4
     assert ml.provider.partition == "ml4chem"
     assert sampler.provider.partition == "shared-gpu-ampere"
     assert qm.provider.partition == "shared-gpu-ampere"
@@ -386,11 +430,17 @@ def test_darwin_qm_executor_runs_one_molecule_per_gpu(monkeypatch):
     assert all(
         executor.provider.init_blocks == 0
         and executor.provider.min_blocks == 0
-        for executor in executors.values()
+        for label, executor in executors.items()
+        if label != "alf_builder_executor"
     )
     assert ml.provider.max_blocks == 1
     assert sampler.provider.max_blocks == 2
     assert qm.provider.max_blocks == 2
+    assert sampler.provider.qos == "long"
+    assert sampler.provider.walltime == "12:00:00"
+    assert qm.provider.qos == "long"
+    assert qm.provider.walltime == "08:00:00"
+    assert qm.drain_period == 28200
     assert debug_executors["alf_QM_executor"].provider.max_blocks == 1
     assert "atomistic-test-environment" in module.ATOMISTIC_WORKER_INIT
     assert "gpu4pyscf-test-environment" not in (
@@ -401,6 +451,12 @@ def test_darwin_qm_executor_runs_one_molecule_per_gpu(monkeypatch):
     )
     assert "/gpu4pyscf/source" in module.GPU4PYSCF_WORKER_INIT
     assert "CUPY_CACHE_DIR" in module.GPU4PYSCF_WORKER_INIT
+    assert (
+        load_module_from_string(
+            _read_json("master_config.json")["builder_task"]
+        ).executors
+        == ["alf_builder_executor"]
+    )
 
 
 def test_headnode_launcher_uses_validated_darwin_runtime():
@@ -411,6 +467,14 @@ def test_headnode_launcher_uses_validated_darwin_runtime():
     assert "/vast/home/pjlohr/.conda/envs/alf_env" in launcher
     assert "PYTHONNOUSERSITE=1" in launcher
     assert launcher.count("#SBATCH --constraint=gpu_count:4") == 2
+    assert "ALF_DARWIN_SAMPLER_QOS" in launcher
+    assert "ALF_DARWIN_SAMPLER_WALLTIME" in launcher
+    assert "12:00:00" in launcher
+    assert "ALF_DARWIN_GPU4PYSCF_QOS" in launcher
+    assert "ALF_DARWIN_GPU4PYSCF_WALLTIME" in launcher
+    assert "08:00:00" in launcher
+    assert "ALF_DARWIN_GPU4PYSCF_DRAIN_PERIOD" in launcher
+    assert "28200" in launcher
     assert 'MASTER_CONFIG="${ALF_GPU4PYSCF_MASTER:-master_config.json}"' in (
         launcher
     )

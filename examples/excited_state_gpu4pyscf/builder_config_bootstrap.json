@@ -1,5 +1,7 @@
 {
-  "molecule_library_dir": "fragment_library/",
-  "shake": 0.03,
-  "pbc": false
+  "source_priority": "h5_only",
+  "selection_seed": 42,
+  "bootstrap_h5_path": "../excited_state_pyseqm/h5store/data-{:04d}.h5",
+  "bootstrap_h5_count": 1,
+  "bootstrap_selection_mode": "sequential"
 }

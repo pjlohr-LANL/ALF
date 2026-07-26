@@ -9,6 +9,8 @@ from ase.io import write
 from alframework.builders.h5_replay_builder import (
     build_h5_replay_manifest,
     build_h5_replay_structures,
+    h5_replay_builder_local_task,
+    select_h5_replay_indices,
 )
 
 
@@ -157,3 +159,98 @@ def test_h5_replay_rejects_unsupported_source_priority(tmp_path):
             current_h5_id=1,
             master_directory=str(tmp_path),
         )
+
+
+def test_sequential_selection_covers_4990_frames_once_in_50_batches():
+    selected = []
+    batch_lengths = []
+    for start in range(0, 5000, 50):
+        batch = select_h5_replay_indices(
+            [
+                f"mol-boot-{index:010d}"
+                for index in range(start, start + 50)
+            ],
+            current_h5_id=1,
+            frame_count=4990,
+            selection_seed=42,
+            selection_mode="sequential",
+        )
+        batch_lengths.append(len(batch))
+        selected.extend(index for _, index in batch)
+
+    assert batch_lengths[:-1] == [50] * 99
+    assert batch_lengths[-1] == 40
+    assert selected == list(range(4990))
+
+
+def test_external_bootstrap_uses_only_source_geometry_and_then_switches(
+    tmp_path,
+):
+    source = tmp_path / "source" / "data-0000.h5"
+    output = tmp_path / "output" / "data-0000.h5"
+    _write_shard(source)
+    _write_shard(output, frame_offset=10.0)
+    with h5py.File(source, "a") as handle:
+        group = handle["C01_H02_O01"]
+        group.create_dataset("sE0", data=[-100.0, -99.0])
+        group.create_dataset("F0", data=np.ones((2, 4, 3)))
+        group.create_dataset("_id", data=[b"source-0", b"source-1"])
+
+    config = {
+        "source_priority": "h5_only",
+        "selection_seed": 17,
+        "bootstrap_h5_path": "source/data-{:04d}.h5",
+        "bootstrap_h5_count": 1,
+        "bootstrap_selection_mode": "sequential",
+    }
+    common = {
+        "builder_config": config,
+        "sampler_config": _topology_config(tmp_path),
+        "h5_path": str(tmp_path / "output" / "data-{:04d}.h5"),
+        "master_directory": str(tmp_path),
+    }
+    bootstrap = build_h5_replay_structures(
+        moleculeids=[
+            "mol-boot-0000000000",
+            "mol-boot-0000000001",
+            "mol-boot-0000000002",
+        ],
+        current_h5_id=0,
+        **common,
+    )
+
+    assert len(bootstrap) == 2
+    assert [
+        molecule.get_metadata()["replay_global_frame_index"]
+        for molecule in bootstrap
+    ] == [0, 1]
+    assert [
+        molecule.get_metadata()["replay_source_id"]
+        for molecule in bootstrap
+    ] == ["source-0", "source-1"]
+    assert all(
+        molecule.get_metadata()["replay_external_bootstrap"] is True
+        for molecule in bootstrap
+    )
+    assert all(molecule.get_results() == {} for molecule in bootstrap)
+    assert all(
+        Path(molecule.get_metadata()["replay_source_path"]) == source
+        for molecule in bootstrap
+    )
+
+    ordinary = build_h5_replay_structures(
+        moleculeids=["mol-0000-0000000000"],
+        current_h5_id=1,
+        **common,
+    )[0]
+    assert Path(ordinary.get_metadata()["replay_source_path"]) == output
+    assert ordinary.get_metadata()["replay_external_bootstrap"] is False
+    assert ordinary.get_metadata()["replay_selection_mode"] == (
+        "deterministic_hash"
+    )
+
+
+def test_local_h5_replay_entry_point_targets_builder_executor():
+    assert h5_replay_builder_local_task.executors == [
+        "alf_builder_executor"
+    ]

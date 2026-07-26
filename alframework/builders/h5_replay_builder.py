@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from alframework.tools.molecules_class import MoleculesObject
 
 
 _TOPOLOGY_ATOM_IDS_KEY = "topology_atom_ids"
+_SOURCE_ID_KEY = "_id"
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,70 @@ def _replay_global_index(
     )
 
 
+def select_h5_replay_indices(
+    moleculeids: list[str],
+    *,
+    current_h5_id: int,
+    frame_count: int,
+    selection_seed: int,
+    selection_mode: str = "deterministic_hash",
+) -> list[tuple[str, int]]:
+    """Map molecule IDs to replay-frame indices.
+
+    ``deterministic_hash`` preserves the ordinary replay behavior. The
+    ``sequential`` mode is intended for exhaustive bootstrap labeling: the
+    trailing integer in each bootstrap molecule ID is used as the global
+    frame index, and IDs beyond the source manifest are omitted rather than
+    wrapped.
+    """
+
+    ids = [str(value) for value in moleculeids]
+    if not ids:
+        raise ValueError("HDF5 replay requires at least one molecule ID.")
+    if int(frame_count) < 1:
+        raise ValueError("HDF5 replay requires at least one source frame.")
+
+    mode = str(selection_mode).strip().lower()
+    if mode not in {"deterministic_hash", "sequential"}:
+        raise ValueError(
+            "HDF5 replay selection_mode must be 'deterministic_hash' or "
+            f"'sequential'; received {selection_mode!r}."
+        )
+
+    selected: list[tuple[str, int]] = []
+    for molecule_id in ids:
+        if mode == "deterministic_hash":
+            global_index = _replay_global_index(
+                molecule_id,
+                current_h5_id=int(current_h5_id),
+                frame_count=int(frame_count),
+                selection_seed=int(selection_seed),
+            )
+        else:
+            match = re.search(r"(\d+)$", molecule_id)
+            if match is None:
+                # Keep one-off --test_builder calls useful while production
+                # bootstrap IDs remain exact sequential indices.
+                global_index = _replay_global_index(
+                    molecule_id,
+                    current_h5_id=int(current_h5_id),
+                    frame_count=int(frame_count),
+                    selection_seed=int(selection_seed),
+                )
+            else:
+                global_index = int(match.group(1))
+            if global_index >= int(frame_count):
+                continue
+        selected.append((molecule_id, int(global_index)))
+
+    if not selected:
+        raise IndexError(
+            "Sequential HDF5 replay exhausted its source frames; requested "
+            f"molecule IDs begin beyond the {int(frame_count)}-frame manifest."
+        )
+    return selected
+
+
 def _canonical_reorder(
     *,
     stored_numbers: np.ndarray,
@@ -206,13 +272,49 @@ def _load_replay_frame(
             positions=positions[reorder],
             pbc=False,
         )
-    return atoms, {
+        source_id = None
+        if _SOURCE_ID_KEY in group:
+            raw_source_id = group[_SOURCE_ID_KEY][int(frame_index)]
+            source_id = (
+                raw_source_id.decode("utf-8")
+                if isinstance(raw_source_id, bytes)
+                else str(raw_source_id)
+            )
+    metadata = {
         "replay_source_kind": "h5",
         "replay_source_path": str(entry.shard_path),
         "replay_group_path": str(entry.group_path),
         "replay_frame_index": int(frame_index),
         "replay_canonicalized_to_topology": bool(canonicalized),
     }
+    if source_id is not None:
+        metadata["replay_source_id"] = source_id
+    return atoms, metadata
+
+
+def _bootstrap_source(
+    *,
+    builder_config: dict[str, Any],
+    h5_path: str,
+    current_h5_id: int,
+    master_directory: str | None,
+) -> tuple[str, int, str]:
+    """Resolve ordinary replay or an external sequential bootstrap source."""
+
+    bootstrap_pattern = builder_config.get("bootstrap_h5_path")
+    if int(current_h5_id) != 0 or bootstrap_pattern is None:
+        return str(h5_path), int(current_h5_id), "deterministic_hash"
+
+    source_count = int(builder_config.get("bootstrap_h5_count", 1))
+    if source_count < 1:
+        raise ValueError("builder_config.bootstrap_h5_count must be positive.")
+    source_pattern = Path(str(bootstrap_pattern)).expanduser()
+    if not source_pattern.is_absolute() and master_directory is not None:
+        source_pattern = Path(str(master_directory)) / source_pattern
+    selection_mode = str(
+        builder_config.get("bootstrap_selection_mode", "sequential")
+    )
+    return str(source_pattern), source_count, selection_mode
 
 
 def build_h5_replay_structures(
@@ -239,17 +341,27 @@ def build_h5_replay_structures(
             "builder_config.source_priority='h5_only'."
         )
     selection_seed = int(config.get("selection_seed", 42))
-    manifest = build_h5_replay_manifest(h5_path, int(current_h5_id))
+    source_h5_path, source_h5_count, selection_mode = _bootstrap_source(
+        builder_config=config,
+        h5_path=str(h5_path),
+        current_h5_id=int(current_h5_id),
+        master_directory=master_directory,
+    )
+    manifest = build_h5_replay_manifest(
+        source_h5_path,
+        int(source_h5_count),
+    )
     frame_count = int(manifest[-1].stop)
 
     outputs: list[MoleculesObject] = []
-    for molecule_id in ids:
-        global_index = _replay_global_index(
-            molecule_id,
-            current_h5_id=int(current_h5_id),
-            frame_count=frame_count,
-            selection_seed=selection_seed,
-        )
+    selected_indices = select_h5_replay_indices(
+        ids,
+        current_h5_id=int(source_h5_count),
+        frame_count=frame_count,
+        selection_seed=selection_seed,
+        selection_mode=selection_mode,
+    )
+    for molecule_id, global_index in selected_indices:
         entry = next(
             item
             for item in manifest
@@ -263,6 +375,11 @@ def build_h5_replay_structures(
             master_directory=master_directory,
         )
         metadata["replay_global_frame_index"] = int(global_index)
+        metadata["replay_selection_mode"] = str(selection_mode)
+        metadata["replay_external_bootstrap"] = bool(
+            int(current_h5_id) == 0
+            and config.get("bootstrap_h5_path") is not None
+        )
         molecule = MoleculesObject(atoms, molecule_id)
         molecule.update_metadata(metadata)
         outputs.append(molecule)
@@ -281,6 +398,50 @@ def h5_replay_builder_task(
 ):
     """Parsl entry point for fixed-topology HDF5 geometry replay."""
 
+    return _run_h5_replay_builder(
+        moleculeid=moleculeid,
+        moleculeids=moleculeids,
+        builder_config=builder_config,
+        sampler_config=sampler_config,
+        h5_path=h5_path,
+        current_h5_id=current_h5_id,
+        master_directory=master_directory,
+    )
+
+
+@python_app(executors=["alf_builder_executor"])
+def h5_replay_builder_local_task(
+    moleculeid=None,
+    moleculeids=None,
+    builder_config=None,
+    sampler_config=None,
+    h5_path=None,
+    current_h5_id=0,
+    master_directory=None,
+):
+    """Replay HDF5 geometries on a lightweight local builder executor."""
+
+    return _run_h5_replay_builder(
+        moleculeid=moleculeid,
+        moleculeids=moleculeids,
+        builder_config=builder_config,
+        sampler_config=sampler_config,
+        h5_path=h5_path,
+        current_h5_id=current_h5_id,
+        master_directory=master_directory,
+    )
+
+
+def _run_h5_replay_builder(
+    *,
+    moleculeid,
+    moleculeids,
+    builder_config,
+    sampler_config,
+    h5_path,
+    current_h5_id,
+    master_directory,
+):
     ids = (
         [str(moleculeid)]
         if moleculeids is None

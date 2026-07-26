@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 from parsl.config import Config
-from parsl.executors import HighThroughputExecutor
+from parsl.executors import HighThroughputExecutor, ThreadPoolExecutor
 from parsl.launchers import SingleNodeLauncher
 from parsl.providers import SlurmProvider
 
@@ -23,8 +23,8 @@ QM_PARTITION = "shared-gpu-ampere"
 
 DARWIN_ACCOUNT = os.environ.get("ALF_DARWIN_ACCOUNT", "y2020-bf") or None
 ML_QOS = os.environ.get("ALF_DARWIN_ML_QOS", "long") or None
-SAMPLER_QOS = os.environ.get("ALF_DARWIN_SAMPLER_QOS") or None
-QM_QOS = os.environ.get("ALF_DARWIN_GPU4PYSCF_QOS") or None
+SAMPLER_QOS = os.environ.get("ALF_DARWIN_SAMPLER_QOS", "long") or None
+QM_QOS = os.environ.get("ALF_DARWIN_GPU4PYSCF_QOS", "long") or None
 
 ML_SCHEDULER_OPTIONS = os.environ.get(
     "ALF_DARWIN_ML_SCHEDULER_OPTIONS",
@@ -44,11 +44,14 @@ QM_SCHEDULER_OPTIONS = os.environ.get(
 ML_WALLTIME = os.environ.get("ALF_DARWIN_ML_WALLTIME", "16:00:00")
 SAMPLER_WALLTIME = os.environ.get(
     "ALF_DARWIN_SAMPLER_WALLTIME",
-    "04:00:00",
+    "12:00:00",
 )
 QM_WALLTIME = os.environ.get(
     "ALF_DARWIN_GPU4PYSCF_WALLTIME",
-    "12:00:00",
+    "08:00:00",
+)
+QM_DRAIN_PERIOD = int(
+    os.environ.get("ALF_DARWIN_GPU4PYSCF_DRAIN_PERIOD", "28200")
 )
 
 ML_MAX_BLOCKS = int(os.environ.get("ALF_DARWIN_ML_MAX_BLOCKS", "1"))
@@ -149,6 +152,7 @@ def _executor(
     worker_init: str,
     cores_per_worker: float = 1.0,
     available_accelerators: int | None = None,
+    drain_period: int | None = None,
 ) -> HighThroughputExecutor:
     accelerator_options = (
         {}
@@ -162,6 +166,7 @@ def _executor(
         cores_per_worker=cores_per_worker,
         cpu_affinity="none",
         prefetch_capacity=0,
+        drain_period=drain_period,
         provider=SlurmProvider(
             partition=partition,
             account=DARWIN_ACCOUNT,
@@ -182,6 +187,10 @@ def _executor(
 def _darwin_config(*, debug: bool) -> Config:
     return Config(
         executors=[
+            ThreadPoolExecutor(
+                label="alf_builder_executor",
+                max_threads=4,
+            ),
             _executor(
                 label="alf_ML_executor",
                 partition=ML_PARTITION,
@@ -213,6 +222,7 @@ def _darwin_config(*, debug: bool) -> Config:
                 max_workers_per_node=4,
                 available_accelerators=4,
                 cores_per_worker=QM_CORES_PER_WORKER,
+                drain_period=QM_DRAIN_PERIOD,
                 worker_init=GPU4PYSCF_WORKER_INIT,
             ),
         ]
