@@ -93,26 +93,17 @@ The production defaults are account `y2020-bf`, CUDA `12.2.2`, and:
 
 All remain overridable through the `ALF_DARWIN_*` environment variables.
 
-## Stage checks
+## Configuration check
 
-Run from this directory, in order:
+Run the focused example tests from the repository root:
 
 ```bash
 source /projects/opt/centos8/x86_64/miniconda3/py312_24.11.1/etc/profile.d/conda.sh
 conda activate /vast/home/pjlohr/.conda/envs/atomistic
 export PYTHONPATH=/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF:${PYTHONPATH:-}
-
-python -m alframework --master master_config_debug.json --test_builder
-python -m alframework --master master_config_debug.json --test_qm
-python -m alframework --master master_config_debug.json --test_ml
-python -m alframework --master master_config_debug.json --test_sampler
+cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF
+python -m pytest -q tests/test_excited_state_example.py
 ```
-
-The debug trainer uses two members and two epochs. Its models and status are
-isolated under `models_debug/` and `status_debug.txt`. The builder result must
-match the 15-atom reference order; QM must return six finite energies and six
-`(15, 3)` force arrays; the sampler must report CUDA execution and selected
-state metadata.
 
 ## Production launch and restart
 
@@ -124,8 +115,8 @@ sbatch submit_darwin.slurm
 
 With `h5store/data-0000.h5` present and no `status.txt`, ALF discovers HDF5
 index 1, skips bootstrap QM, and trains `models/model-0000`. The same command
-resumes from `status.txt`; do not mix debug and production artifacts or copy
-the source production status into this directory.
+resumes from `status.txt`; do not copy the source production status into this
+directory.
 
 Darwin's `long` QoS permits a two-day driver allocation. If the driver reaches
 that limit, resubmit the same script; ALF resumes from the isolated status,

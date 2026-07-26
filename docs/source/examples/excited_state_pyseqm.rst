@@ -63,18 +63,16 @@ Running the Example
 -------------------
 
 Copy only the compatible seed shard to ``h5store/data-0000.h5`` and verify its
-checksum as documented in the example README. Run the stage checks in order:
+checksum as documented in the example README. Validate the configuration from
+the repository root:
 
 .. code-block:: bash
 
-   cd examples/excited_state_pyseqm
    source /projects/opt/centos8/x86_64/miniconda3/py312_24.11.1/etc/profile.d/conda.sh
    conda activate /vast/home/pjlohr/.conda/envs/atomistic
    export PYTHONPATH=/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF:${PYTHONPATH:-}
-   python -m alframework --master master_config_debug.json --test_builder
-   python -m alframework --master master_config_debug.json --test_qm
-   python -m alframework --master master_config_debug.json --test_ml
-   python -m alframework --master master_config_debug.json --test_sampler
+   cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF
+   python -m pytest -q tests/test_excited_state_example.py
 
 Then submit the fresh production replica:
 

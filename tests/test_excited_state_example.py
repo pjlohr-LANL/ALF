@@ -30,7 +30,6 @@ EXAMPLE_DIR = (
 MASTER_FILENAMES = (
     "master_config.json",
     "master_config_existing_h5.json",
-    "master_config_debug.json",
 )
 EXPECTED_PROPERTIES = {
     key: [key, kind, 1.0]
@@ -107,10 +106,9 @@ def test_master_configs_use_complete_six_state_contract(master_filename):
     assert master["gpus_per_node"] == 4
 
 
-def test_production_and_debug_histories_are_isolated():
+def test_production_and_compatibility_configs_match():
     production = _read_json("master_config.json")
     compatibility = _read_json("master_config_existing_h5.json")
-    debug = _read_json("master_config_debug.json")
 
     assert compatibility == production
     assert production["status_path"] == "status.txt"
@@ -119,45 +117,38 @@ def test_production_and_debug_histories_are_isolated():
     assert production["parallel_samplers"] == 100
     assert production["target_queued_QM"] == 6
     assert production["save_h5_threshold"] == 2000
-    assert debug["status_path"] == "status_debug.txt"
-    assert debug["model_path"] == "models_debug/model-{:04d}"
-    assert debug["ML_config_path"] == "hippynn_config_debug.json"
-    assert debug["maximum_builder_structures"] == 1
 
 
-def test_production_and_debug_sampler_settings():
+def test_production_sampler_settings():
     production = _read_json("sampler_config.json")
-    debug = _read_json("sampler_config_debug.json")
 
-    for sampler in (production, debug):
-        assert sampler["model_mode"] == "excited_state"
-        assert sampler["state_selection"] == {
-            "mode": "batch_cycle",
-            "states": [0, 1, 2, 3, 4, 5],
-        }
-        assert sampler["uncertainty_policy"] == "stop"
-        assert sampler["gap_diagnostics"]["enabled"] is False
-        assert sampler["gap_seeking"]["enabled"] is False
-        assert sampler["dataset_screening"] == {
-            "enabled": True,
-            "force": True,
-            "min_distance": True,
-            "topology": True,
-        }
-        assert sampler["distcut"] == pytest.approx(0.7)
-        assert sampler["min_distance_cutoff"] == pytest.approx(0.7)
-        assert sampler["max_force_cutoff"] == pytest.approx(16.0)
-        assert sampler["friction_per_fs"] == pytest.approx(0.1)
-        assert sampler["topology_check"]["reference_conformer_path"] == (
-            "keto_form_coords.xyz"
-        )
+    assert production["model_mode"] == "excited_state"
+    assert production["state_selection"] == {
+        "mode": "batch_cycle",
+        "states": [0, 1, 2, 3, 4, 5],
+    }
+    assert production["uncertainty_policy"] == "stop"
+    assert production["gap_diagnostics"]["enabled"] is False
+    assert production["gap_seeking"]["enabled"] is False
+    assert production["dataset_screening"] == {
+        "enabled": True,
+        "force": True,
+        "min_distance": True,
+        "topology": True,
+    }
+    assert production["distcut"] == pytest.approx(0.7)
+    assert production["min_distance_cutoff"] == pytest.approx(0.7)
+    assert production["max_force_cutoff"] == pytest.approx(16.0)
+    assert production["friction_per_fs"] == pytest.approx(0.1)
+    assert production["topology_check"]["reference_conformer_path"] == (
+        "keto_form_coords.xyz"
+    )
 
     assert production["alchemi_baoab"]["batch_size"] == 50
     assert production["dt"] == pytest.approx(0.1)
     assert production["maxt"] == pytest.approx(2.0)
     assert production["Escut"] == pytest.approx(0.001)
     assert production["Fscut"] == pytest.approx(0.01)
-    assert debug["alchemi_baoab"]["batch_size"] == 1
 
 
 def test_training_schema_has_six_states_and_no_gap_targets():
