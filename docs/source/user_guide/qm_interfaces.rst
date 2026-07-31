@@ -174,9 +174,10 @@ Only singlet RKS/TDA is supported in this slice. Roots are energy ordered at
 each geometry. Dipoles, transition dipoles, NACVs, full TDDFT, state tracking,
 PBC, and QM batching are not included.
 
-See :doc:`../examples/excited_state_gpu4pyscf` for separate CFG-bootstrap,
-existing-HDF5, and Darwin validation configurations. The GPU4PySCF and PySEQM
-examples intentionally use independent data and output directories.
+See :doc:`../examples/excited_state_gpu4pyscf` for a seeded HDF5 workflow,
+generic state-count configuration, input preparation, and Darwin execution.
+GPU4PySCF seed labels must match the configured method and must not be reused
+from a method-incompatible workflow merely because their dataset names match.
 
 .. note::
 

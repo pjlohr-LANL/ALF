@@ -70,16 +70,13 @@ examples/excited_state_pyseqm/ALF_6STATE_KETO_*.err
 
 # Excited-state GPU4PySCF example run artifacts
 examples/excited_state_gpu4pyscf/h5store/
-examples/excited_state_gpu4pyscf/h5store_debug/
 examples/excited_state_gpu4pyscf/models/
-examples/excited_state_gpu4pyscf/models_debug/
 examples/excited_state_gpu4pyscf/status*.txt
 examples/excited_state_gpu4pyscf/qm_test.h5
 examples/excited_state_gpu4pyscf/gpu4pyscf_scratch*/
 examples/excited_state_gpu4pyscf/sampling/
 examples/excited_state_gpu4pyscf/ALF_GPU4PYSCF_KETO_*.log
 examples/excited_state_gpu4pyscf/ALF_GPU4PYSCF_KETO_*.err
-examples/excited_state_gpu4pyscf/GPU4PYSCF_QM_TEST_*.err
 
 # General local debug outputs
 debug/

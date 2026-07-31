@@ -1,83 +1,134 @@
-Excited-State GPU4PySCF
-=======================
+Seeded Excited-State GPU4PySCF
+==============================
 
-The standalone ``examples/excited_state_gpu4pyscf`` workflow labels keto
-acetylacetone with density-fitted CAM-B3LYP/6-31G* RKS and five-root TDA. It
-uses the flattened six-surface contract ``sE0/F0`` through ``sE5/F5``.
+The example in ``examples/excited_state_gpu4pyscf`` starts from a labeled
+HDF5 shard, trains an excited-state HIPPYNN ensemble, samples new structures
+with ALCHEMI, labels them with GPU4PySCF, and retrains from accepted data.
 
-This example is independent of :doc:`excited_state_pyseqm`. In particular,
-the two workflows must not share HDF5 labels because they use different
-electronic-structure methods.
+The checked-in configuration uses keto acetylacetone and five excited roots,
+but the workflow supports other state counts. For ``nroots = N``, each QM
+calculation returns ``N + 1`` surfaces numbered ``0`` through ``N``.
 
-Execution Model
----------------
-
-GPU4PySCF labeling is single-molecule and nonbatched:
+Workflow
+--------
 
 .. code-block:: text
 
-   one MoleculesObject
-       -> one Parsl QM task
-       -> one A100
-       -> S0-S5 energies and forces
+   User-provided data-0000.h5
+       -> initial HIPPYNN ensemble
+       -> deterministic HDF5 replay
+       -> state-selected ALCHEMI sampling
+       -> GPU4PySCF labels
+       -> screened HDF5 shard
+       -> retraining
 
-All states for a molecule are evaluated on the same GPU. On a four-A100 node,
-Parsl can run four independent molecule tasks concurrently. State number is
-never used to choose a GPU.
+GPU4PySCF labeling is nonbatched. One Parsl task evaluates the ground state
+and every requested excited root for one molecule on one GPU. Multiple GPUs
+increase the number of molecules evaluated concurrently; they do not divide
+one molecule's states among devices.
 
-Startup Modes
+Seed Contract
 -------------
 
-The self-contained master follows:
+Place the user-supplied seed at ``h5store/data-0000.h5``. For ``nroots = N``,
+each molecular HDF5 group must contain:
 
-.. code-block:: text
+* ``coordinates`` with shape ``[structures, atoms, 3]`` in Angstrom;
+* one consistent ``species`` sequence;
+* finite energies ``sE0`` through ``sEN`` in eV; and
+* finite forces ``F0`` through ``FN`` with shape
+  ``[structures, atoms, 3]`` in eV/Angstrom.
 
-   keto CFG
-       -> GPU4PySCF bootstrap
-       -> ALF HDF5
-       -> multi-state HIPPYNN
-       -> state-cycled ALCHEMI
-       -> GPU4PySCF labels and retraining
+Atoms must use ALF's stable atomic-number storage order or provide valid
+``topology_atom_ids``. The seed and future GPU4PySCF labels must use the same
+molecule, electronic-structure method, state ordering, units, and common
+energy offset. Record the seed's provenance and checksum outside the HDF5;
+legacy ALF files do not provide sufficient method provenance automatically.
 
-Use ``master_config_existing_h5.json`` to start from a compatible
-GPU4PySCF-labeled shard instead. The existing shard must contain finite
-``sE0/F0`` through ``sE5/F5`` arrays for the configured 15-atom ordering.
-Legacy ALF HDF5 does not carry enough method provenance to detect a manually
-copied PySEQM shard, so operators must verify imported data explicitly.
+State Count
+-----------
 
-Darwin Resources
+Four settings must agree when changing the number of states:
+
+#. Set ``QM_config.json:nroots`` to ``N``.
+#. Define every ``sE0/F0`` through ``sEN/FN`` pair in
+   ``master_config.json:properties_list``.
+#. Provide those datasets in every seed group.
+#. Configure the desired states from ``0`` through ``N`` under
+   ``sampler_config.json:state_selection``.
+
+The HIPPYNN trainer derives its state heads from ``properties_list``. The
+current GPU4PySCF interface requires at least one excited root and supports
+singlet RKS/TDA calculations.
+
+Preparing Another Molecule
+--------------------------
+
+Replace the topology-reference XYZ, then update its path and charge in the
+sampler configuration. Match ``hippynn_config.json:n_atoms`` and
+``network_params.possible_species`` to the seed, review network distance
+cutoffs and sampling parameters, and set all QM method and convergence
+options consistently with the seed. Also review topology, distance, and force
+screening thresholds. The workflow expects one fixed atom count and one exact
+atomic-number sequence.
+
+Darwin Execution
 ----------------
 
-The supplied Parsl profile keeps training, sampling, and labeling on
-independent dynamic Slurm providers:
+The supplied Parsl profile dynamically requests independent resources for
+HIPPYNN training, ALCHEMI sampling, and GPU4PySCF labeling. The QM executor
+uses one worker per GPU. Account, QoS, CUDA setup, environment paths,
+walltimes, block limits, scheduler directives, and cache roots are
+configurable through ``ALF_DARWIN_*`` variables.
 
-* HIPPYNN training on ``ml4chem``.
-* ALCHEMI sampling on ``shared-gpu-ampere``.
-* GPU4PySCF labeling on separate ``shared-gpu-ampere`` allocations.
-
-The QM executor exposes four workers and four accelerators per A100 node.
-Each worker receives one accelerator and calculates every requested state for
-one molecule. Account, QoS, GPU directives, walltime, block limits, worker
-environments, source paths, and cache roots are configurable with the
-``ALF_DARWIN_*`` variables described in the example README.
-
-Darwin Validation
------------------
-
-First run the exact CFG geometry through the focused QM check:
+After preparing the environment and seed, run the component tests from the
+repository root and a replay check from the example directory:
 
 .. code-block:: bash
 
+   python -m pytest -q \
+     tests/test_gpu4pyscf_interface.py \
+     tests/test_h5_replay_builder.py \
+     tests/test_excited_state_hippynn_interface.py
+
    cd examples/excited_state_gpu4pyscf
-   export PYTHONPATH=/path/to/ALF:${PYTHONPATH:-}
-   python -m alframework --master master_config_debug.json --test_builder
-   python -m alframework --master master_config_debug.json --test_qm
+   python -m alframework --master master_config.json --test_builder
+   python -m alframework --master master_config.json --test_qm
 
-Compare the resulting S0-S5 energies and forces with the five-root
-``dataset_workflow`` GPU4PySCF backend using identical method, basis, charge,
-and grid settings. Then submit several structures and confirm from metadata
-and worker logs that each molecule stays on one GPU while different molecules
-can use different A100s.
+For a fresh production run, ``h5store/data-0000.h5`` must exist while an old
+``status.txt`` and old models must not. The recommended launch submits a
+persistent CPU-only driver through Slurm:
 
-See ``examples/excited_state_gpu4pyscf/README.md`` for installation,
-bootstrap, existing-HDF5, scheduler, restart, and acceptance details.
+.. code-block:: bash
+
+   sbatch submit_darwin.slurm
+
+The driver allocation requests no GPU. Parsl independently submits the
+training, sampling, and GPU4PySCF worker allocations.
+
+Alternatively, run the headnode driver in a persistent ``tmux`` session:
+
+.. code-block:: bash
+
+   hostname
+   tmux new -s alf_gpu4pyscf
+   cd /absolute/path/to/ALF/examples/excited_state_gpu4pyscf
+   bash launch_headnode.sh
+
+Detach with ``Ctrl-b d`` and reconnect to the same recorded frontend before
+running ``tmux attach -t alf_gpu4pyscf``. Darwin frontends have separate local
+tmux servers. GNU ``screen`` is also supported: start with
+``screen -S alf_gpu4pyscf``, detach with ``Ctrl-a d``, and reattach on the same
+frontend with ``screen -r alf_gpu4pyscf``.
+
+The interactive process runs only the ALF driver; Parsl still sends all
+worker calculations to Slurm. Never run the Slurm driver and a tmux/screen
+driver against the same directory simultaneously.
+
+ALF discovers the seed, trains ``models/model-0000``, and then enters the
+sampling, labeling, storage, and retraining loop. Resubmitting the same command
+resumes from ``status.txt``. Only one driver may control a run directory.
+
+See ``examples/excited_state_gpu4pyscf/README.md`` for the complete seed
+schema, generic adaptation checklist, environment setup, expected outputs,
+monitoring, and recovery instructions.

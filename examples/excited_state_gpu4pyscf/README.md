@@ -1,264 +1,348 @@
-# Six-state keto GPU4PySCF active learning
+# Seeded excited-state GPU4PySCF active learning
 
-This example labels keto acetylacetone with GPU4PySCF and trains the same
-six-surface HIPPYNN/ALCHEMI workflow used by the excited-state PySEQM example.
-The GPU4PySCF bootstrap reads geometries from the PySEQM example, but it does
-not reuse any PySEQM labels. The examples have independent QM configurations,
-output HDF5 shards, models, status files, scratch directories, and worker
-environments.
+This example starts from an existing, labeled HDF5 dataset. ALF trains an
+excited-state HIPPYNN ensemble from that seed, samples new structures with
+ALCHEMI, labels them with GPU4PySCF, and retrains as new HDF5 shards are
+accepted.
 
-## Electronic-structure contract
+The checked-in files provide a concrete keto acetylacetone calculation with
+five excited roots. The workflow is not limited to six total states: if
+`nroots` is `N`, GPU4PySCF returns the ground state plus `N` excited states,
+numbered `0` through `N`.
 
-Every nonbatched QM Parsl task receives one molecule and one A100. That task
-runs one density-fitted RKS/TDA calculation and returns:
-
-```text
-sE0, F0, sE1, F1, ..., sE5, F5
-```
-
-All six surfaces remain on the same worker and GPU. Electronic states are not
-assigned to different GPUs. When four A100s are available, Parsl may run four
-different molecules concurrently, one molecule per GPU.
-
-The validated settings in `QM_config.json` are:
-
-- CAM-B3LYP/6-31G*
-- neutral singlet
-- density-fitted RKS
-- grid level 3
-- TDA with five excited roots
-- TDA convergence tolerance `1.0e-6` and at most 300 cycles
-- eight CPU threads per GPU worker
-- energy offset `-9405.0 eV`, so stored energies are
-  `E_raw - (-9405.0 eV)`
-
-The task requires SCF and every requested root to converge before it stores
-any label. Transition dipoles, NACVs, state tracking, full TDDFT, PBC, CPU
-fallback, and QM batching are not part of this example.
-
-## Startup modes
-
-### Exhaustive geometry-relabel bootstrap
-
-`master_config.json` follows:
+## Workflow
 
 ```text
-4,990 geometries from ../excited_state_pyseqm/h5store/data-0000.h5
-  -> discard all PySEQM labels
-  -> 4,990 independent GPU4PySCF labeling attempts
-  -> data-0000.h5
-  -> six-state HIPPYNN
-  -> state-cycled ALCHEMI
-  -> additional GPU4PySCF labels and retraining
+user-provided h5store/data-0000.h5
+  -> initial HIPPYNN ensemble in models/model-0000
+  -> deterministic replay of seed geometries
+  -> state-selected ALCHEMI sampling
+  -> one GPU4PySCF calculation per molecule and GPU
+  -> screened labels in h5store/data-0001.h5
+  -> models/model-0001
+  -> repeat
 ```
 
-The local replay builder reads source frames `0` through `4989` sequentially
-in batches of at most 50. It reads geometry, species, topology atom IDs, and
-source identifiers only; it never returns the source `sE*` or `F*` datasets.
-GPU4PySCF stores only converged, finite, topology-valid results in this
-example's own `h5store/data-0000.h5`, so the final training count can be below
-4,990 if any labeling attempts are rejected.
+Every GPU4PySCF task calculates all requested states for one molecule on one
+GPU. States are not distributed across GPUs. On a four-GPU node, Parsl can
+run four molecules concurrently.
 
-### Existing GPU4PySCF HDF5
+## Checked-in calculation
 
-Place a compatible shard at `h5store/data-0000.h5` and use:
+The supplied files use:
+
+- keto acetylacetone with 15 atoms and no periodic boundary conditions;
+- density-fitted CAM-B3LYP/6-31G* RKS;
+- neutral singlet charge and multiplicity;
+- grid level 3;
+- `nroots: 5`, giving states 0 through 5;
+- energies `sE0` through `sE5` and forces `F0` through `F5`;
+- an energy offset of `-9405.0 eV`, meaning stored energies are
+  `E_raw - (-9405.0 eV)`; and
+- four HIPPYNN ensemble members.
+
+SCF and every requested TDA root must converge before a molecule is accepted.
+The interface does not store partial state results. Full TDDFT, state
+tracking, transition properties, NACVs, periodic systems, CPU fallback, and
+multi-molecule QM batches are outside this example.
+
+## Before you begin
+
+You need:
+
+1. An ALF environment containing the normal ALF, HIPPYNN, ALCHEMI, ASE,
+   Parsl, NumPy, and HDF5 dependencies.
+2. A GPU4PySCF installation compatible with the CUDA runtime on the QM
+   workers. For the supplied CUDA 12 profile, this is typically a
+   `gpu4pyscf-cuda12x` distribution.
+3. Access to Darwin Slurm partitions, or a replacement `parsl_configs.py`
+   for your machine.
+4. A labeled seed HDF5 that matches the molecule, electronic-structure
+   method, state count, units, and energy offset configured here.
+
+Do not use a seed labeled with a different QM method merely because its
+dataset names match. Legacy ALF HDF5 does not record enough method provenance
+to detect that mistake automatically.
+
+## Prepare the seed HDF5
+
+From this directory, copy your seed into the first ALF shard:
 
 ```bash
-python -m alframework --master master_config_existing_h5.json
+mkdir -p h5store
+cp /path/to/your/gpu4pyscf_seed.h5 h5store/data-0000.h5
+sha256sum h5store/data-0000.h5
 ```
 
-With no status file, ALF detects the shard, skips bootstrap labeling, and
-trains the first model. The shard must contain finite `sE0/F0` through
-`sE5/F5` labels using the configured database names, scales, 15-atom
-composition, and stable atomic ordering.
+Record the source path, checksum, electronic-structure settings, and any data
+conversion used to create the file in your run notes. This example does not
+provide or prescribe a universal seed checksum.
 
-Do not copy the AM1 PySEQM seed shard from `excited_state_pyseqm`. The legacy
-ALF HDF5 schema does not record enough electronic-structure provenance to
-detect a manually copied, method-incompatible shard. Keeping the two example
-directories separate prevents accidental automatic reuse, but operators must
-verify the provenance of imported HDF5 data.
+### Required HDF5 data
 
-## Darwin execution
+For `nroots: N`, every molecular group in the seed must contain:
+
+| Dataset | Required shape | Units or meaning |
+| --- | --- | --- |
+| `coordinates` | `[structures, atoms, 3]` | Angstrom |
+| `species` | `[atoms]` or `[structures, atoms]` | Symbols or positive atomic numbers |
+| `sE0` ... `sEN` | `[structures]` | eV after the configured common offset |
+| `F0` ... `FN` | `[structures, atoms, 3]` | eV/Angstrom |
+| `_id` | `[structures]` | Optional source identifiers |
+| `topology_atom_ids` | `[atoms]` or `[structures, atoms]` | Optional canonical atom-index mapping |
+
+All required arrays must be finite and have the same number of structures.
+Every structure must have the same atom count and atomic-number sequence.
+ALF-written files store atoms in stable atomic-number order. A foreign seed
+must either use that order or provide valid `topology_atom_ids` so replay can
+restore the order in the topology reference.
+
+The configured 10% validation and 10% test splits require at least ten usable
+structures after filtering. A practical seed should be substantially larger
+and representative of the intended sampling region.
+
+You can inspect dataset names, shapes, data types, and finiteness without
+starting a GPU job:
+
+```bash
+python - <<'PY'
+import h5py
+import numpy as np
+
+path = "h5store/data-0000.h5"
+with h5py.File(path, "r") as handle:
+    def report(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            finite = "n/a"
+            if np.issubdtype(obj.dtype, np.number):
+                finite = bool(np.isfinite(obj[...]).all())
+            print(name, obj.shape, obj.dtype, "finite:", finite)
+    handle.visititems(report)
+PY
+```
+
+Before launch, confirm that the seed energies use the same offset convention
+as `QM_config.json`. New GPU4PySCF labels and existing seed labels must be on
+one consistent energy scale.
+
+## Choose the number of states
+
+The state count is controlled by several files that must agree. To use `N`
+excited roots:
+
+1. Set `QM_config.json:nroots` to `N`. The current interface requires
+   `N >= 1` and produces `N + 1` total surfaces.
+2. In `master_config.json:properties_list`, define every contiguous pair
+   `sE0/F0` through `sEN/FN`. Energies use scope `system`; forces use scope
+   `atomic`.
+3. Supply the same `sE0/F0` through `sEN/FN` datasets in every seed group.
+4. Set `sampler_config.json:state_selection.states` to the states that should
+   drive sampling. To cycle over every surface, use `0` through `N`.
+
+The excited-state HIPPYNN trainer constructs its output heads from
+`properties_list`; there is no separate `n_states` setting in
+`hippynn_config.json`.
+
+## Adapt the example to another molecule
+
+Change all coupled inputs before reusing the workflow:
+
+- Replace `keto_form_coords.xyz` with an ASE-readable reference geometry in
+  the canonical atom order. Update `reference_conformer_path` and
+  `reference_charge` in `sampler_config.json` if its name or charge changes.
+- Set `hippynn_config.json:n_atoms` to the fixed atom count. Update
+  `network_params.possible_species`; it must start with padding species `0`
+  and include every atomic number in the seed.
+- Review HIPPYNN distance cutoffs and sampling temperature/time parameters for
+  the new chemistry.
+- Set the QM functional, basis, charge, multiplicity, roots, convergence
+  controls, and energy offset in `QM_config.json`. This interface supports
+  singlet RKS/TDA only.
+- Update topology, minimum-distance, and maximum-force screening thresholds
+  in `sampler_config.json`.
+- Ensure the seed atom ordering, labels, units, and provenance match all of
+  those choices.
+
+This is a fixed-composition workflow: do not combine groups with different
+atom counts or atomic-number sequences in one run.
+
+## Configure Darwin
 
 `parsl_configs.py` creates independent, dynamically scaling executors:
 
-| Stage | Partition | Workers/node | GPUs per worker | Maximum blocks |
+| Stage | Partition | Workers/node | GPUs/worker | Maximum blocks |
 | --- | --- | ---: | ---: | ---: |
 | HIPPYNN training | `ml4chem` | 1 | ensemble-managed | 1 |
 | ALCHEMI sampling | `shared-gpu-ampere` | 4 | 1 | 2 |
-| GPU4PySCF QM | `shared-gpu-ampere` | 4 | 1 | 2 |
+| GPU4PySCF labeling | `shared-gpu-ampere` | 4 | 1 | 2 |
 
-The QM executor advertises four accelerators, so Parsl pins each worker to one
-A100. `target_queued_QM: 6` keeps the four workers occupied while allowing a
-small queue. Each QM task still calculates all six surfaces for only one
-molecule.
-
-The master `gpus_per_node` remains four because ALF also passes it to the
-four-GPU sampler and trainer. GPU4PySCF selects the worker's visible local
-device; it does not use four GPUs for one molecule.
-
-The checked-in launchers default to account `y2020-bf`, CUDA `12.2.2`, the
-four-GPU-node constraint, and the self-contained environment at
-`/vast/home/pjlohr/.conda/envs/alf_env`. The settings remain configurable
-through these environment variables:
+The checked-in defaults use account `y2020-bf`, CUDA `12.2.2`, the four-GPU
+node constraint, and `/vast/home/pjlohr/.conda/envs/alf_env`. At minimum,
+review the paths and account in `submit_darwin.slurm` and set environment
+overrides before submitting:
 
 ```bash
-export ALF_DARWIN_ACCOUNT="..."
-export ALF_DARWIN_SAMPLER_QOS="..."
-export ALF_DARWIN_SAMPLER_WALLTIME="12:00:00"
-export ALF_DARWIN_GPU4PYSCF_QOS="..."
-export ALF_DARWIN_GPU4PYSCF_SCHEDULER_OPTIONS="..."
-export ALF_DARWIN_GPU4PYSCF_WALLTIME="08:00:00"
-export ALF_DARWIN_GPU4PYSCF_MAX_BLOCKS="2"
-export ALF_DARWIN_GPU4PYSCF_CORES_PER_WORKER="8"
-export ALF_DARWIN_ENV_ACTIVATION="source .../conda.sh; conda activate .../alf_env"
-export ALF_DARWIN_GPU4PYSCF_ENV_ACTIVATION="${ALF_DARWIN_ENV_ACTIVATION}"
+export ALF_GPU4PYSCF_EXAMPLE_DIR=/absolute/path/to/ALF/examples/excited_state_gpu4pyscf
+export ALF_REPOSITORY_ROOT=/absolute/path/to/ALF
+export ALF_DRIVER_CONDA_ENV=/absolute/path/to/your/alf/environment
+export ALF_DARWIN_ACCOUNT=your_account
 ```
 
-If GPU4PySCF is used from a source checkout, also set:
+Additional `ALF_DARWIN_*` variables control QoS, scheduler directives,
+walltimes, block limits, worker environments, and cache roots. If GPU4PySCF
+is imported from a source checkout, set:
 
 ```bash
-export ALF_DARWIN_GPU4PYSCF_PYTHONPATH="/path/containing/gpu4pyscf"
+export ALF_DARWIN_GPU4PYSCF_PYTHONPATH=/path/containing/gpu4pyscf
 ```
 
-Install the distribution matching Darwin's CUDA runtime in the QM worker
-environment, for example `gpu4pyscf-cuda12x`. The worker environment must
-also contain ALF's ordinary runtime dependencies.
+For another cluster, replace `parsl_configs.py` and the Slurm wrapper with
+site-appropriate executors and launch settings while retaining the executor
+labels used by the master tasks.
 
-## Stage checks
+## Check the setup
 
-Start with the exact, unshaken CFG geometry:
+Run the component tests from the repository root:
 
 ```bash
-cd examples/excited_state_gpu4pyscf
-export PYTHONPATH=/path/to/ALF:${PYTHONPATH:-}
-
-python -m alframework --master master_config_debug.json --test_builder
-python -m alframework --master master_config_debug.json --test_qm
+export PYTHONPATH=/absolute/path/to/ALF:${PYTHONPATH:-}
+python -m pytest -q \
+  tests/test_gpu4pyscf_interface.py \
+  tests/test_h5_replay_builder.py \
+  tests/test_excited_state_hippynn_interface.py
 ```
 
-The QM result must contain six finite energies and six finite `(15, 3)` force
-arrays. Its metadata must report `qm_backend: gpu4pyscf`, one selected CUDA
-device, successful SCF/TDA convergence, and five excited roots.
-
-Training and sampling checks require a compatible HDF5 shard/model:
+After placing the seed, check replay from the example directory:
 
 ```bash
-python -m alframework --master master_config_debug.json --test_ml
-python -m alframework --master master_config_debug.json --test_sampler
+python -m alframework --master master_config.json --test_builder
 ```
 
-For Darwin acceptance, compare one `--test_qm` geometry against
-`dataset_workflow/scripts/07_gpu4pyscf_backend.py` using five roots and the
-same method, basis, charge, and grid. Then submit several molecules and verify
-from worker metadata/logs that different tasks use different A100s while all
-S0-S5 results for a molecule share one device.
-
-## Production driver on Darwin
-
-The preferred production launch is the persistent Slurm wrapper:
+Then run one real GPU4PySCF label through the configured Darwin executors:
 
 ```bash
-cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/examples/excited_state_gpu4pyscf
+python -m alframework --master master_config.json --test_qm
+```
+
+The QM check writes `qm_test.h5`. Confirm that all configured `sEi` and `Fi`
+arrays are present, finite, and have the expected shapes. Compare at least one
+geometry with an independent calculation using identical QM settings before
+committing significant compute time.
+
+The ALF test modes also create or update `status.txt`. A status created by
+these checks in this clean directory is safe to continue from; never copy a
+status file from another run.
+
+`--test_ml` performs actual ensemble training rather than a quick syntax
+check. The normal seeded launch performs that training as its first stage.
+
+## Start the run
+
+For a fresh run, the directory must contain:
+
+```text
+h5store/data-0000.h5
+```
+
+It must not contain an old `status.txt` or `models/model-*`. Choose exactly
+one of the following driver launch methods.
+
+### Slurm driver (recommended)
+
+Submit the persistent CPU-only ALF driver:
+
+```bash
 sbatch submit_darwin.slurm
 ```
 
-It requests one CPU-only driver task on `ml4chem` with account `y2020-bf`,
-`qos=long`, and a two-day walltime. The driver allocation does not request a
-GPU. Parsl independently requests the training, sampling, and QM allocations
-described above, so those workers retain their separate partitions,
-constraints, and walltimes.
+The wrapper requests one driver task on `ml4chem` and writes
+`ALF_GPU4PYSCF_KETO_JOBID.log` and `.err`. The driver allocation does not
+request a GPU. Parsl independently submits the training, sampling, and QM
+worker allocations configured in `parsl_configs.py`. The driver continues
+after you disconnect from Darwin.
 
-For an interactive alternative, run the same driver in `tmux` on a Darwin
-frontend:
+### Headnode driver in tmux or screen
+
+As an interactive alternative, run `launch_headnode.sh` inside a persistent
+terminal session on a Darwin frontend. With `tmux`:
 
 ```bash
 hostname
 tmux new -s alf_gpu4pyscf
-cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/examples/excited_state_gpu4pyscf
+cd /absolute/path/to/ALF/examples/excited_state_gpu4pyscf
 bash launch_headnode.sh
 ```
 
-Detach without stopping the driver with `Ctrl-b d`. Darwin has multiple
-frontend nodes, and each frontend has its own local tmux server. Record the
-hostname printed above. To find and reattach the session, reconnect to that
-exact frontend, not merely whichever frontend a new login selects:
+Detach without stopping ALF with `Ctrl-b d`. Record the hostname printed
+before starting the session. Each Darwin frontend has its own local tmux
+server, so reconnect to that exact frontend before reattaching:
 
 ```bash
 ssh darwin-fe1
-hostname
 tmux ls
 tmux attach -t alf_gpu4pyscf
 ```
 
-Replace `darwin-fe1` with the frontend recorded when the session was created.
-A session on `darwin-fe1` is not visible to `tmux ls` on another frontend.
+Replace `darwin-fe1` with the recorded hostname. A session created on one
+frontend will not appear in `tmux ls` on another frontend.
 
-### Restart after a driver crash
-
-Only one ALF driver may control an example directory. Before restarting,
-confirm that the old driver is gone and identify any Parsl allocations it
-left behind:
+GNU `screen` can be used instead:
 
 ```bash
-squeue -u "$USER" \
-  -o "%.18i %.16P %.40j %.8T %.10M %.20R"
+hostname
+screen -S alf_gpu4pyscf
+cd /absolute/path/to/ALF/examples/excited_state_gpu4pyscf
+bash launch_headnode.sh
 ```
 
-Cancel only the explicit job IDs belonging to orphaned `parsl.alf_*`
-allocations from the failed driver. Never use a user-wide cancellation:
+Detach with `Ctrl-a d`. After reconnecting to the same frontend, use
+`screen -ls` and `screen -r alf_gpu4pyscf` to reattach.
+
+In both interactive cases, the headnode process is only the ALF driver;
+training, sampling, and GPU4PySCF calculations are still submitted to Slurm
+by Parsl. Do not also submit `submit_darwin.slurm` for the same run directory.
+
+The driver discovers that HDF5 index 0 already exists, sets the next HDF5 id
+to 1, and skips QM bootstrap labeling. It first trains
+`models/model-0000`, then begins replay, sampling, GPU4PySCF labeling, and
+retraining. With the checked-in `save_h5_threshold: 50`, the first accepted
+batch is written to `h5store/data-0001.h5` before `model-0001` is trained.
+
+The first useful acceptance milestones are:
+
+1. Every member of `models/model-0000` completes.
+2. Sampling visits the configured state list.
+3. QM worker metadata reports the GPU4PySCF backend and one CUDA device per
+   molecule.
+4. Screening accepts candidates into `h5store/data-0001.h5`.
+5. Training begins for `models/model-0001`.
+
+## Monitor and restart
+
+Use Slurm to identify the driver and its independent Parsl allocations:
 
 ```bash
-scancel JOBID1 JOBID2
+squeue -u "$USER" -o "%.18i %.16P %.40j %.8T %.10M %.20R"
 ```
 
-Live builder, sampler, QM, and ML queues exist only in the driver process and
-are not reconstructed from `runinfo`. Results from sampling or QM tasks that
-were still in flight are therefore lost when the driver crashes. Preserve
-`status.txt`, every HDF5 shard, promoted models, the failed `runinfo/NNN`,
-and its scheduler logs; these are restart evidence and scientific state, not
-cleanup targets.
-
-Validate the persisted checkpoint before resubmitting:
-
-```bash
-cd /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/examples/excited_state_gpu4pyscf
-python -m json.tool status.txt >/dev/null
-python - <<'PY'
-import glob
-import json
-
-with open("status.txt", encoding="utf-8") as handle:
-    status = json.load(handle)
-print(json.dumps(status, indent=2))
-print("HDF5 shards:", sorted(glob.glob("h5store/data-*.h5")))
-print("model paths:", sorted(glob.glob("models/model-*")))
-PY
-```
-
-`current_h5_id` must identify the next shard to be written, and
-`current_model_id` must identify the newest fully promoted four-member model.
-`current_training_id` is advanced when training is submitted, not when it
-finishes. Consequently, a crash during model training requires manual
-inspection of the status IDs and the possibly partial `models/model-NNNN`
-directory before restart. Do not delete, renumber, or treat that directory as
-promoted without reconciling it.
-
-Once the checkpoint and directories agree, restart with the same master
-configuration:
+Only one ALF driver may control this directory. If the driver stops, preserve
+`status.txt`, every HDF5 shard, completed models, and `runinfo`. Cancel only
+explicit orphaned Parsl job IDs from that driver, inspect the persisted state,
+and resubmit the same command:
 
 ```bash
 sbatch submit_darwin.slurm
 ```
 
-The new driver creates the next `runinfo` directory and resumes from
-`status.txt`. Do not simultaneously run `launch_headnode.sh` in tmux.
+If the driver was launched in `tmux` or `screen`, restart it with
+`bash launch_headnode.sh` inside a new persistent session instead. Do not use
+both launch methods simultaneously.
 
-For a genuinely fresh run, in contrast, `status.txt`, output
-`h5store/data-*.h5`, and `models/model-*` must not exist. The default
-`master_config.json` exhaustively relabels the 4,990 source geometries.
-Set `ALF_GPU4PYSCF_MASTER=master_config_existing_h5.json` only when starting
-from a compatible, already labeled GPU4PySCF shard.
+ALF reads `status.txt` and resumes. Live queues from a failed driver are not
+reconstructed, so sampling or QM tasks still in flight at failure time must be
+submitted again by the resumed workflow.
 
-Generated data, models, caches, scratch files, logs, sampling outputs, and
-Parsl run information are ignored by Git.
+For a genuinely new scientific run, use a separate clean directory containing
+only its own `h5store/data-0000.h5`. Never mix seeds, later shards, models, or
+status files from runs with different molecules, state contracts, methods, or
+energy offsets.

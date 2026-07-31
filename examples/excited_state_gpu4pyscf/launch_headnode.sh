@@ -11,7 +11,6 @@ REPOSITORY_ROOT="${ALF_REPOSITORY_ROOT:-/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF}
 CONDA_SH="${ALF_CONDA_SH:-/projects/opt/centos8/x86_64/miniconda3/py312_24.11.1/etc/profile.d/conda.sh}"
 CONDA_ENV="${ALF_DRIVER_CONDA_ENV:-/vast/home/pjlohr/.conda/envs/alf_env}"
 PYTHON_BIN="${ALF_DRIVER_PYTHON:-${CONDA_ENV}/bin/python}"
-MASTER_CONFIG="${ALF_GPU4PYSCF_MASTER:-master_config.json}"
 
 export ALF_DARWIN_ACCOUNT="${ALF_DARWIN_ACCOUNT:-y2020-bf}"
 export ALF_DARWIN_ML_QOS="${ALF_DARWIN_ML_QOS:-long}"
@@ -34,15 +33,15 @@ source "${CONDA_SH}"
 conda activate "${CONDA_ENV}"
 cd "${EXAMPLE_DIR}"
 
-echo "Starting six-state keto GPU4PySCF ALF workflow"
+echo "Starting seeded excited-state GPU4PySCF ALF workflow"
 echo "Driver host: $(hostname)"
 echo "Start time: $(date --iso-8601=seconds)"
 echo "Python: ${PYTHON_BIN}"
-echo "Master: ${EXAMPLE_DIR}/${MASTER_CONFIG}"
+echo "Master: ${EXAMPLE_DIR}/master_config.json"
 echo "Sampling constraint: ${ALF_DARWIN_SAMPLER_SCHEDULER_OPTIONS}"
 echo "Sampling QoS/walltime: ${ALF_DARWIN_SAMPLER_QOS} ${ALF_DARWIN_SAMPLER_WALLTIME}"
 echo "QM constraint: ${ALF_DARWIN_GPU4PYSCF_SCHEDULER_OPTIONS}"
 echo "QM QoS/walltime: ${ALF_DARWIN_GPU4PYSCF_QOS} ${ALF_DARWIN_GPU4PYSCF_WALLTIME}"
 echo "QM drain period: ${ALF_DARWIN_GPU4PYSCF_DRAIN_PERIOD} seconds"
 
-exec "${PYTHON_BIN}" -u -m alframework --master "${MASTER_CONFIG}"
+exec "${PYTHON_BIN}" -u -m alframework --master master_config.json
