@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,104 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+_BOOTSTRAP_ID_PATTERN = re.compile(r"^mol-boot-(\d{10})$")
+
+
+def _decode_h5_ids(values) -> list[str]:
+    return [
+        value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        for value in np.asarray(values).reshape(-1).tolist()
+    ]
+
+
+def _validate_h5_shards(
+    shard_paths: list[Path],
+    required_h5_keys: set[str],
+) -> list[str]:
+    bootstrap_ids: list[str] = []
+    for shard_index, shard_path in enumerate(shard_paths):
+        with h5py.File(shard_path, "r") as shard:
+            for group_name, group in shard.items():
+                if "coordinates" not in group or "species" not in group:
+                    continue
+                missing = sorted(required_h5_keys.difference(group.keys()))
+                if missing:
+                    raise ValueError(
+                        f"HDF5 shard {shard_path.name}, group {group_name!r}, lacks required "
+                        f"six-state datasets: {missing}."
+                    )
+                coordinates_shape = tuple(group["coordinates"].shape)
+                topology_ids_shape = tuple(group[H5_TOPOLOGY_ATOM_IDS_KEY].shape)
+                if topology_ids_shape != coordinates_shape[:2]:
+                    raise ValueError(
+                        f"HDF5 shard {shard_path.name} topology ID shape {topology_ids_shape} "
+                        f"disagrees with coordinates {coordinates_shape}."
+                    )
+                if shard_index == 0:
+                    if "_id" not in group:
+                        raise ValueError(
+                            f"Bootstrap HDF5 shard {shard_path.name}, group {group_name!r}, "
+                            "lacks molecule IDs."
+                        )
+                    group_ids = _decode_h5_ids(group["_id"][()])
+                    if len(group_ids) != int(coordinates_shape[0]):
+                        raise ValueError(
+                            f"Bootstrap HDF5 shard {shard_path.name} has {len(group_ids)} molecule IDs "
+                            f"for {coordinates_shape[0]} coordinate frames."
+                        )
+                    bootstrap_ids.extend(group_ids)
+    return bootstrap_ids
+
+
+def _validate_bootstrap_frame_count(
+    bootstrap_ids: list[str],
+    *,
+    expected_frames: int,
+    runtime_labeled: bool,
+) -> dict[str, Any]:
+    accepted_frames = len(bootstrap_ids)
+    if expected_frames <= 0:
+        raise ValueError("bootstrap_set must be positive.")
+
+    if not runtime_labeled:
+        if accepted_frames != expected_frames:
+            raise ValueError(
+                f"Expected {expected_frames} pre-labeled HDF5 seed frames, found {accepted_frames}."
+            )
+        return {
+            "bootstrap_labeling_mode": "prelabeled",
+            "requested_bootstrap_frames": int(expected_frames),
+            "accepted_bootstrap_frames": int(accepted_frames),
+            "rejected_bootstrap_frames": 0,
+        }
+
+    if accepted_frames == 0 or accepted_frames > expected_frames:
+        raise ValueError(
+            f"Runtime-labeled HDF5 seed must contain between 1 and {expected_frames} frames, "
+            f"found {accepted_frames}."
+        )
+    if len(set(bootstrap_ids)) != accepted_frames:
+        raise ValueError("Runtime-labeled HDF5 seed contains duplicate molecule IDs.")
+
+    invalid_ids = []
+    for molecule_id in bootstrap_ids:
+        match = _BOOTSTRAP_ID_PATTERN.fullmatch(molecule_id)
+        if match is None or int(match.group(1)) >= expected_frames:
+            invalid_ids.append(molecule_id)
+    if invalid_ids:
+        raise ValueError(
+            "Runtime-labeled HDF5 seed contains invalid or out-of-range bootstrap IDs: "
+            f"{invalid_ids[:10]}."
+        )
+
+    return {
+        "bootstrap_labeling_mode": "runtime_labeled",
+        "requested_bootstrap_frames": int(expected_frames),
+        "accepted_bootstrap_frames": int(accepted_frames),
+        "rejected_bootstrap_frames": int(expected_frames - accepted_frames),
+    }
 
 
 def _validate_frames(
@@ -198,24 +297,7 @@ def run_preflight(
         H5_TOPOLOGY_ATOM_IDS_KEY,
         *(str(spec[0]) for spec in master_config["properties_list"].values()),
     }
-    for shard_path in all_shards:
-        with h5py.File(shard_path, "r") as shard:
-            for group_name, group in shard.items():
-                if "coordinates" not in group or "species" not in group:
-                    continue
-                missing = sorted(required_h5_keys.difference(group.keys()))
-                if missing:
-                    raise ValueError(
-                        f"HDF5 shard {shard_path.name}, group {group_name!r}, lacks required "
-                        f"six-state datasets: {missing}."
-                    )
-                coordinates_shape = tuple(group["coordinates"].shape)
-                topology_ids_shape = tuple(group[H5_TOPOLOGY_ATOM_IDS_KEY].shape)
-                if topology_ids_shape != coordinates_shape[:2]:
-                    raise ValueError(
-                        f"HDF5 shard {shard_path.name} topology ID shape {topology_ids_shape} "
-                        f"disagrees with coordinates {coordinates_shape}."
-                    )
+    bootstrap_ids = _validate_h5_shards(all_shards, required_h5_keys)
 
     h5_frames = 0
     h5_topology_failures = 0
@@ -312,10 +394,20 @@ def run_preflight(
             f"Replay source minimum distance {seed_minimum_distance:.8g} is below {min_distance_cutoff:.8g}."
         )
     expected_seed_count = int(master_config.get("bootstrap_set", seed_positions.shape[0]))
-    if h5_frames != expected_seed_count or seed_positions.shape[0] < expected_seed_count:
+    if seed_positions.shape[0] < expected_seed_count:
         raise ValueError(
-            f"Expected {expected_seed_count} HDF5 seed frames and at least that many replay frames, "
-            f"found replay={seed_positions.shape[0]}, HDF5={h5_frames}."
+            f"Expected at least {expected_seed_count} replay frames, found {seed_positions.shape[0]}."
+        )
+    runtime_labeled = not bool(builder_config.get("prelabeled_seed_file_names"))
+    bootstrap_summary = _validate_bootstrap_frame_count(
+        bootstrap_ids,
+        expected_frames=expected_seed_count,
+        runtime_labeled=runtime_labeled,
+    )
+    if h5_frames != int(bootstrap_summary["accepted_bootstrap_frames"]):
+        raise ValueError(
+            f"Bootstrap frame scan found {h5_frames} coordinate frames but "
+            f"{bootstrap_summary['accepted_bootstrap_frames']} molecule IDs."
         )
 
     settings = topology_config(sampler_config)
@@ -366,6 +458,7 @@ def run_preflight(
         "seed_topology_extrema": seed_extrema,
         "h5_topology_extrema": h5_extrema,
         "stable_h5_topology_ids": True,
+        **bootstrap_summary,
     }
     if str(settings["bond_window_mode"]).strip().lower() == "linear":
         summary["bond_compression_tolerance_A"] = float(

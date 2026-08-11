@@ -316,7 +316,12 @@ if args.test_qm:
             sys.stdout.write(property_key + ': ' + str(test_configuration[2][property_key]) + '\n')
     if os.path.exists(master_config['master_directory'] + '/qm_test.h5'):
         os.remove(master_config['master_directory'] + '/qm_test.h5')
-    store_current_data(master_config['master_directory'] + '/qm_test.h5',queue_output,master_config['properties_list'])
+    store_current_data(
+        master_config['master_directory'] + '/qm_test.h5',
+        queue_output,
+        master_config['properties_list'],
+        sampler_config,
+    )
     test_db = anidataloader(master_config['master_directory'] + '/qm_test.h5')
     
     print("Data written to qm_test.h5:")
@@ -417,7 +422,8 @@ if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
     status['lifetime_failed_QM_tasks'] = status['lifetime_failed_QM_tasks'] + failed    
     store_current_data(master_config['h5_path'].format(status['current_h5_id']),
                        results_list,
-                       master_config['properties_list'])
+                       master_config['properties_list'],
+                       sampler_config)
     status['current_h5_id'] = status['current_h5_id'] + 1
     
 if status['current_model_id'] < 0:
@@ -616,7 +622,12 @@ while True:
             with open(master_config['status_path'], "w") as outfile:
                 json.dump(status, outfile, indent=2)
             continue
-        store_current_data(master_config['h5_path'].format(status['current_h5_id']), results_list, master_config['properties_list'])
+        store_current_data(
+            master_config['h5_path'].format(status['current_h5_id']),
+            results_list,
+            master_config['properties_list'],
+            sampler_config,
+        )
 #        with open('data-bk-{:04d}.pickle'.format(status['current_h5_id']),'wb') as pkbk: 
 #            pickle.dump(results_list,pkbk)
         status['current_h5_id'] = status['current_h5_id'] + 1

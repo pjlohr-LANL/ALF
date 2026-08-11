@@ -43,7 +43,7 @@ def _worker_init() -> str:
 def _srun_overrides(node_names: list[str]) -> str:
     return (
         f"--nodes={len(node_names)} --ntasks={len(node_names)} --ntasks-per-node=1 "
-        f"--nodelist={','.join(node_names)} --cpu-bind=none"
+        f"--nodelist={','.join(node_names)} --cpu-bind=none --mem=0"
     )
 
 

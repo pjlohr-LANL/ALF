@@ -20,12 +20,18 @@ def _resolve_config_path(path_value: str, master_directory: str) -> Path:
     return path
 
 
-def _load_configs(master_path: Path, run_dir: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _load_configs(
+    master_path: Path,
+    run_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     os.chdir(run_dir)
     master_config = load_config_file(str(master_path))
     builder_config = load_config_file(master_config["builder_config_path"], master_config["master_directory"])
     qm_config = load_config_file(master_config["QM_config_path"], master_config["master_directory"])
-    return master_config, builder_config, qm_config
+    sampler_config = load_config_file(
+        master_config["sampler_config_path"], master_config["master_directory"]
+    )
+    return master_config, builder_config, qm_config, sampler_config
 
 
 def _validate_molecule(molecule, properties_list: dict[str, list[Any]]) -> list[str]:
@@ -73,7 +79,7 @@ def main(default_run_dir: str | Path | None = None) -> int:
 
     run_dir = Path(args.run_dir).expanduser().resolve()
     master_path = Path(args.master).expanduser().resolve() if args.master else run_dir / "master_config_3node_darwin_test.json"
-    master_config, builder_config, qm_config = _load_configs(master_path, run_dir)
+    master_config, builder_config, qm_config, sampler_config = _load_configs(master_path, run_dir)
     if not builder_config.get("prelabeled_seed_file_names"):
         raise RuntimeError("builder_config must define prelabeled_seed_file_names for prebuilt bootstrap HDF5.")
     if not bool(qm_config.get("accept_prelabeled", False)):
@@ -100,6 +106,7 @@ def main(default_run_dir: str | Path | None = None) -> int:
         properties_list=master_config["properties_list"],
         h5_path=master_config["h5_path"],
         current_h5_id=0,
+        sampler_config=sampler_config,
     )
 
     failed: list[tuple[str, list[str]]] = []
@@ -131,7 +138,12 @@ def main(default_run_dir: str | Path | None = None) -> int:
     try:
         if temp_h5_path.exists():
             temp_h5_path.unlink()
-        store_current_data(str(temp_h5_path), molecules, master_config["properties_list"])
+        store_current_data(
+            str(temp_h5_path),
+            molecules,
+            master_config["properties_list"],
+            sampler_config,
+        )
         if args.force and h5_path.exists():
             h5_path.unlink()
         shutil.move(str(temp_h5_path), str(h5_path))
