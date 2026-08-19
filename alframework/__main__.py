@@ -273,8 +273,6 @@ if args.test_sampler:
     print("Sampler testing returned:")
     print(test_configuration)
     sampler_metadata = test_configuration.get_metadata()
-    print("Sampler metadata:")
-    print(json.dumps(sampler_metadata, indent=2))
     backend_options = dict(sampler_config.get("alchemi_baoab", {}))
     if (
         bool(backend_options.get("strict_gpu", False))
