@@ -134,16 +134,15 @@ def store_current_data(h5path, system_data, properties):
         # Ensure system converged before saving
         if system.check_convergence():
             saved_number += 1
-            # Preserve the input order within each element so fixed-topology
-            # replay can invert ALF's atomic-number storage order exactly.
-            atom_index = np.argsort(
-                cur_atoms.get_atomic_numbers(),
-                kind="stable",
-            )
+            # Store atoms in the order they arrive so a fixed-topology shard is
+            # already in reference-topology order. topology_atom_ids records the
+            # mapping explicitly below, so replay never infers it by convention.
+            atom_index = np.arange(len(cur_atoms.get_atomic_numbers()))
             # If there is already a molecule with the same formula, append
             if molkey in data_dict:
                 data_dict[molkey]["_id"].append(cur_moliculeid)
                 data_dict[molkey]["coordinates"].append(cur_atoms.get_positions()[atom_index])
+                data_dict[molkey]["topology_atom_ids"].append(np.array(atom_index, dtype=np.int64))
                 if any(cur_atoms.get_pbc()):
                     data_dict[molkey]["cell"].append(complete_cell(cur_atoms.get_cell()))
                 for prop in properties:
@@ -159,6 +158,7 @@ def store_current_data(h5path, system_data, properties):
                 data_dict[molkey]["species"] = np.array(cur_atoms.get_chemical_symbols())[atom_index]
                 data_dict[molkey]["_id"] = [cur_moliculeid]
                 data_dict[molkey]["coordinates"] = [cur_atoms.get_positions()[atom_index]]
+                data_dict[molkey]["topology_atom_ids"] = [np.array(atom_index, dtype=np.int64)]
                 if any(cur_atoms.get_pbc()):
                     data_dict[molkey]["cell"] = [complete_cell(cur_atoms.get_cell())]
                 for prop in properties.keys():

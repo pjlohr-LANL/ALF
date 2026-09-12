@@ -72,7 +72,7 @@ def test_load_config_file_paths(tmp_path):
     assert config["absolute_dir"] == "/already/absolute"
 
 
-def test_store_current_data_writes_converged_sorted_h5(tmp_path):
+def test_store_current_data_writes_converged_input_order_h5(tmp_path):
     atoms = Atoms(
         "OH2",
         positions=[[0.0, 0.0, 0.0], [0.0, 0.7, 0.7], [0.0, -0.7, 0.7]],
@@ -97,8 +97,18 @@ def test_store_current_data_writes_converged_sorted_h5(tmp_path):
     with h5py.File(h5_path, "r") as h5:
         assert list(h5.keys()) == ["H02_O01"]
         group = h5["H02_O01"]
-        assert [item.decode("utf-8") for item in group["species"][()]] == ["H", "H", "O"]
+        # Atoms are stored in the order they arrive, not sorted by atomic
+        # number, so the shard is already in reference-topology order.
+        assert [item.decode("utf-8") for item in group["species"][()]] == ["O", "H", "H"]
         assert [item.decode("utf-8") for item in group["_id"][()]] == ["water-0"]
         np.testing.assert_allclose(group["energy"][()], [-3.0])
         assert group["forces"].shape == (1, 3, 3)
         assert group["cell"].shape == (1, 3, 3)
+        # Per-frame atom mapping is recorded explicitly so replay never has to
+        # infer it from a storage-order convention.
+        assert group["topology_atom_ids"].shape == (1, 3)
+        np.testing.assert_array_equal(group["topology_atom_ids"][()], [[0, 1, 2]])
+        np.testing.assert_allclose(
+            group["forces"][()],
+            np.arange(9).reshape(1, 3, 3) * 0.5,
+        )
