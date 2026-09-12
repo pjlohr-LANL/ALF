@@ -244,6 +244,7 @@ ranges and adds the following fields:
      "alchemi_calculator_options": {},
      "uncertainty_policy": "stop",
      "return_top_n": 1,
+     "max_candidates_per_replica": null,
      "friction_per_fs": 0.0019645,
      "alchemi_baoab": {
        "batch_size": 50,
@@ -253,6 +254,15 @@ ranges and adds the following fields:
        "random_seed": 42
      }
    }
+
+``max_candidates_per_replica`` caps how many frames one replica may contribute
+to the returned batch. Candidates are grouped by ``parent_molecule_id``, and the
+cap is applied before the global ``return_top_n`` truncation. The default
+``null`` places no per-replica limit, which reproduces the historical behavior.
+Under ``uncertainty_policy`` ``continue`` a diverging replica scores higher as it
+leaves the training manifold, so without a cap a single trajectory can occupy
+every returned slot with frames one ``Ncheck`` interval apart. ``stop`` provides
+that guarantee implicitly by freezing each replica at its first uncertain frame.
 
 Fixed-topology gating is separately opt-in:
 
@@ -389,11 +399,94 @@ its first valid uncertainty event, while other replicas in the GPU batch keep
 running. At most one candidate is returned for each input replica.
 
 ``continue`` keeps uncertain replicas active. At every ``Ncheck`` interval,
-qualifying frames are ranked across the whole task batch using
-``max(Es/Escut, Fs/Fscut, Fsmax/(3*Fscut))``. Only the global
-``return_top_n`` frames are returned. Results are sent directly through Parsl,
-so large values of ``return_top_n`` increase task-result serialization and
-driver memory use.
+qualifying frames are ranked across the whole task batch by ``ranking_score``,
+capped per replica by ``max_candidates_per_replica``, and truncated to the
+global ``return_top_n``. Results are sent directly through Parsl, so large
+values of ``return_top_n`` increase task-result serialization and driver memory
+use.
+
+Candidate scoring
+~~~~~~~~~~~~~~~~~
+
+Admission is always decided by the legacy thresholds ``Es > Escut``,
+``Fs > Fscut``, and ``Fsmax > 3*Fscut``, matching the other ALF samplers.
+The optional ``score`` block selects only how admitted candidates are *ranked*.
+
+``mode: "max"`` is the default and is used whenever the block is absent. It
+ranks by the normalized worst violation,
+``max(Es/Escut, Fs/Fscut, Fsmax/(3*Fscut))``.
+
+``mode: "sum"`` ranks by a weighted sum of normalized terms:
+
+.. code-block:: json
+
+   {
+     "score": {
+       "mode": "sum",
+       "w_energy": 1.0,
+       "w_force": 1.0,
+       "w_gap_uncertainty": 5.0,
+       "gap_std_cut_eV": 0.01,
+       "gap_pairs": "selected_adjacent"
+     }
+   }
+
+.. code-block:: text
+
+   ranking_score = w_energy          * (Es    / Escut)
+                 + w_force           * (Fsrms / Fscut)
+                 + w_gap_uncertainty * (max_pairs(sigma_gap) / gap_std_cut_eV)
+
+Each term is divided by its own cutoff, so every term is dimensionless and
+equals one at that channel's threshold. The weights therefore express only
+relative importance and remain meaningful across systems and unit choices. Note
+that once weights are free, ``ranking_score > 1`` no longer implies "above
+threshold"; the trigger, not the score, carries that meaning.
+
+``Fsrms`` is the root-mean-square of the per-component ensemble force deviations
+for the selected state. It is used in place of the mean-absolute ``Fs`` because
+it is far less diluted by system size for localized disagreement and is directly
+comparable to the force RMSE reported during training. ``Fsmax`` is
+deliberately absent from the sum: ``Fsmax >= Fs`` always, and ``3*Fscut`` is
+calibrated so the maximum and mean channels fire at similar times for a diffuse
+deviation distribution, so including both would double-count force disagreement
+and make the individual force weights uninterpretable. ``Fsmax`` remains in the
+trigger, where it acts as the localized-failure admission net.
+
+The gap term requires ``model_mode`` ``excited_state``. Its state pairs are
+declared inside the ``score`` block rather than through ``dE#`` properties,
+because the deviation is derived by subtracting per-member state energies the
+model already predicts. No trained gap head, HDF5 gap dataset, QM-interface
+change, or retraining is needed. ``gap_pairs`` accepts:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Value
+     - Monitored pairs
+   * - ``"selected_adjacent"``
+     - Default. Pairs adjacent to the selected state, so an interior state
+       yields two pairs and an edge state yields one.
+   * - ``"adjacent"``
+     - Every ``(i, i+1)`` pair across the configured states.
+   * - ``[[0, 1], [1, 2]]``
+     - Exactly the listed pairs, normalized to ascending order and deduplicated.
+
+When several pairs are monitored, the term uses the **largest** deviation, and
+the winning pair is recorded in ``score_gap_pair``. Requesting the gap term
+loads those pairs into the calculator even when ``gap_diagnostics`` is disabled,
+so ``gap_means`` and ``gap_stds`` appear in candidate metadata.
+
+``sum`` mode requires a per-member ensemble. A single calculator that supplies
+``energy_stdev``, ``forces_stdev_mean``, and ``forces_stdev_max`` directly cannot
+produce ``Fsrms``, and the sampler raises rather than substituting ``Fs``.
+
+Candidate metadata always records both scores: ``uncertainty_score`` holds the
+max formula in every mode, while ``ranking_score``, ``score_mode``,
+``score_components``, ``score_gap_pair``, and ``score_gap_std`` describe the
+score that actually ordered the batch. In ``max`` mode the two are equal, so
+enabling the block changes nothing until ``mode`` is set to ``sum``.
 
 Batches are grouped by exact atomic-number sequence. Excited-state batches are
 also grouped by selected state. ``partial_policy`` currently accepts only

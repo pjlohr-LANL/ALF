@@ -143,6 +143,53 @@ The excited-state HIPPYNN trainer constructs its output heads from
 `properties_list`; there is no separate `n_states` setting in
 `hippynn_config.json`.
 
+## Optional: summed candidate scoring
+
+`sampler_config.json` uses the default scoring, which ranks candidates by the
+normalized worst violation `max(Es/Escut, Fs/Fscut, Fsmax/(3*Fscut))`. Because
+it also uses `uncertainty_policy: "stop"`, each replica freezes at its first
+uncertain frame, so the score is recorded but never actually selects anything.
+
+`sampler_config_summed_score.json` is an alternative that ranks by a weighted
+sum instead, letting you state how much energy, force, and state-gap
+disagreement each matter:
+
+```json
+"score": {
+  "mode": "sum",
+  "w_energy": 1.0,
+  "w_force": 1.0,
+  "w_gap_uncertainty": 5.0,
+  "gap_std_cut_eV": 0.01,
+  "gap_pairs": "selected_adjacent"
+}
+```
+
+Every term is divided by its own cutoff, so the weights carry no units and mean
+the same thing if you change molecule or thresholds. The gap term needs no
+change to `properties_list`, the HDF5 contract, or the QM interface: the gap
+deviation is derived by subtracting per-member state energies the ensemble
+already predicts.
+
+Three other settings change together with it, and the change is only meaningful
+as a group:
+
+| Setting | Default config | Summed-score config | Reason |
+| --- | --- | --- | --- |
+| `uncertainty_policy` | `stop` | `continue` | A score can only rank when replicas keep running and produce competing frames. |
+| `Ncheck` | 10 | 100 | At `dt: 0.1` fs, `continue` with `Ncheck: 10` emits candidates 1 fs apart. 100 gives 10 fs spacing so frames are not near-duplicates. |
+| `return_top_n` | 50 | 25 | Candidates are cheaper and more correlated under `continue`. |
+| `max_candidates_per_replica` | unset | 2 | Without a cap, one diverging trajectory can fill every returned slot. |
+
+Run it with the matching master config:
+
+```bash
+python -m alframework --master master_config_summed_score.json
+```
+
+Use a separate run directory from the default configuration. The two produce
+different datasets and must not share `status.txt`, `h5store/`, or `models/`.
+
 ## Adapt the example to another molecule
 
 Change all coupled inputs before reusing the workflow:

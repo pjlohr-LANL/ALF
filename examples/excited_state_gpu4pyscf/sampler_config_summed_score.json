@@ -1,0 +1,67 @@
+{
+  "model_mode": "excited_state",
+  "state_selection": {
+    "mode": "batch_cycle",
+    "states": [0, 1, 2, 3, 4, 5]
+  },
+  "alchemi_calculator": "alframework.samplers.alchemi_sampling.load_hippynn_alchemi_model",
+  "alchemi_calculator_options": {},
+  "uncertainty_policy": "continue",
+  "score": {
+    "mode": "sum",
+    "w_energy": 1.0,
+    "w_force": 1.0,
+    "w_gap_uncertainty": 5.0,
+    "gap_std_cut_eV": 0.01,
+    "gap_pairs": "selected_adjacent"
+  },
+  "gap_diagnostics": {
+    "enabled": false
+  },
+  "gap_seeking": {
+    "enabled": false
+  },
+  "topology_check": {
+    "enabled": true,
+    "reference_conformer_path": "keto_form_coords.xyz",
+    "reference_format": "xyz",
+    "reference_charge": 0,
+    "bond_min_scale": 0.85,
+    "bond_max_scale": 1.50,
+    "connectivity_scale": 1.25
+  },
+  "dataset_screening": {
+    "enabled": true,
+    "force": true,
+    "min_distance": true,
+    "topology": true
+  },
+  "return_top_n": 25,
+  "max_candidates_per_replica": 2,
+  "dt": 0.1,
+  "maxt": 2.0,
+  "Escut": 0.001,
+  "Fscut": 0.01,
+  "Ncheck": 100,
+  "min_time": 0.1,
+  "distcut": 0.7,
+  "min_distance_cutoff": 0.7,
+  "max_force_cutoff": 16.0,
+  "srt_temp": [300.0, 300.0],
+  "end_temp": [300.0, 300.0],
+  "amp_temp": [0.0, 0.0],
+  "per_temp": [1.0, 1.0],
+  "end_dens": null,
+  "amp_dens": null,
+  "per_dens": null,
+  "translate_to_center": false,
+  "friction_per_fs": 0.1,
+  "MLMD_calculator_options": {},
+  "alchemi_baoab": {
+    "batch_size": 50,
+    "partial_policy": "full_only",
+    "strict_gpu": true,
+    "allow_cpu_debug": false,
+    "random_seed": 42
+  }
+}

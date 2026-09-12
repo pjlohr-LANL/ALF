@@ -19,6 +19,9 @@ from alframework.samplers.alchemi_sampling import (
     alchemi_sampling_task,
     alchemi_calculator_status,
     calculate_uncertainty,
+    candidate_score,
+    configured_alchemi_gap_rows,
+    configured_score,
     load_alchemi_calculator,
     run_alchemi_sampling,
     uncertainty_flags,
@@ -2466,3 +2469,438 @@ def test_hippynn_adapter_uses_raw_members_and_selects_excited_state(monkeypatch)
         atol=1.0e-6,
     )
     assert lcm_output["energy"][1, 0].item() == pytest.approx(4.0)
+
+
+def _score_config(**overrides):
+    score = {
+        "mode": "sum",
+        "w_energy": 1.0,
+        "w_force": 1.0,
+        "w_gap_uncertainty": 5.0,
+        "gap_std_cut_eV": 0.01,
+    }
+    score.update(overrides)
+    return score
+
+
+def _sum_config(score=None, **kwargs):
+    config = _config(**kwargs)
+    config["model_mode"] = "excited_state"
+    config["score"] = _score_config() if score is None else score
+    return config
+
+
+def _sum_diagnostics(*, Es, Fsrms, gap_stds, Fs=0.0, Fsmax=0.0):
+    diagnostics = {"Es": Es, "Fs": Fs, "Fsmax": Fsmax, "Fsrms": Fsrms}
+    for gap_key, value in gap_stds.items():
+        diagnostics[gap_key] = 1.0
+        diagnostics[f"{gap_key}_stdev"] = value
+    return diagnostics
+
+
+def test_absent_score_block_preserves_max_ranking():
+    score = configured_score(_config(), None, None)
+
+    assert score["mode"] == "max"
+    assert score["gap_rows"] == []
+
+    diagnostics = {"Es": 2.0, "Fs": 1.5, "Fsmax": 1.0}
+    flags = uncertainty_flags(diagnostics, Escut=1.0, Fscut=1.0)
+    result = candidate_score(diagnostics, flags, score, Escut=1.0, Fscut=1.0)
+
+    assert result["score_mode"] == "max"
+    assert result["ranking_score"] == flags["uncertainty_score"] == 2.0
+    assert result["score_components"] == {}
+    assert result["score_gap_pair"] is None
+
+
+def test_explicit_max_mode_matches_absent_block():
+    diagnostics = {"Es": 0.5, "Fs": 3.0, "Fsmax": 1.0}
+    flags = uncertainty_flags(diagnostics, Escut=1.0, Fscut=1.0)
+
+    absent = candidate_score(
+        diagnostics, flags, configured_score(_config(), None, None),
+        Escut=1.0, Fscut=1.0,
+    )
+    config = _config()
+    config["score"] = {"mode": "max"}
+    explicit = candidate_score(
+        diagnostics, flags, configured_score(config, None, None),
+        Escut=1.0, Fscut=1.0,
+    )
+
+    assert explicit == absent
+    assert explicit["ranking_score"] == 3.0
+
+
+def test_summed_score_adds_normalized_terms():
+    config = _sum_config()
+    config["Escut"] = 0.001
+    config["Fscut"] = 0.01
+    score = configured_score(config, _excited_properties_with_gap(), 0)
+    diagnostics = _sum_diagnostics(
+        Es=0.002, Fsrms=0.03, gap_stds={"dE01": 0.02}
+    )
+    flags = uncertainty_flags(
+        {**diagnostics, "Fs": 0.02, "Fsmax": 0.05}, Escut=0.001, Fscut=0.01
+    )
+
+    result = candidate_score(
+        diagnostics, flags, score, Escut=0.001, Fscut=0.01
+    )
+
+    # 1.0*(0.002/0.001) + 1.0*(0.03/0.01) + 5.0*(0.02/0.01) = 2 + 3 + 10
+    assert result["score_components"] == {
+        "energy_uncertainty": pytest.approx(2.0),
+        "force_uncertainty": pytest.approx(3.0),
+        "gap_uncertainty": pytest.approx(10.0),
+    }
+    assert result["ranking_score"] == pytest.approx(15.0)
+    assert result["score_mode"] == "sum"
+    assert result["score_gap_pair"] == [0, 1]
+    assert result["score_gap_std"] == pytest.approx(0.02)
+
+
+def test_summed_score_uses_maximum_gap_deviation_over_pairs():
+    config = _sum_config(score=_score_config(gap_pairs="adjacent"))
+    score = configured_score(config, _excited_properties_three_states(), 1)
+    diagnostics = _sum_diagnostics(
+        Es=0.0, Fsrms=0.0, gap_stds={"dE01": 0.004, "dE12": 0.02}
+    )
+    flags = uncertainty_flags(diagnostics, Escut=1.0, Fscut=1.0)
+
+    result = candidate_score(diagnostics, flags, score, Escut=1.0, Fscut=1.0)
+
+    assert result["score_gap_pair"] == [1, 2]
+    assert result["score_gap_std"] == pytest.approx(0.02)
+    assert result["ranking_score"] == pytest.approx(5.0 * 0.02 / 0.01)
+
+
+def test_summed_score_weights_change_candidate_order():
+    """The gap term can outrank a frame that wins on force alone."""
+
+    diagnostics_gap = _sum_diagnostics(
+        Es=0.0, Fsrms=0.01, gap_stds={"dE01": 0.02}
+    )
+    diagnostics_force = _sum_diagnostics(
+        Es=0.0, Fsrms=0.05, gap_stds={"dE01": 0.001}
+    )
+    flags = uncertainty_flags(diagnostics_gap, Escut=1.0, Fscut=1.0)
+    properties = _excited_properties_with_gap()
+
+    gap_heavy = configured_score(
+        _sum_config(score=_score_config(w_gap_uncertainty=5.0)),
+        properties,
+        0,
+    )
+    force_only = configured_score(
+        _sum_config(score=_score_config(w_gap_uncertainty=0.0)),
+        properties,
+        0,
+    )
+
+    def rank(score, diagnostics):
+        return candidate_score(
+            diagnostics, flags, score, Escut=1.0, Fscut=0.01
+        )["ranking_score"]
+
+    assert rank(gap_heavy, diagnostics_gap) > rank(gap_heavy, diagnostics_force)
+    assert rank(force_only, diagnostics_force) > rank(force_only, diagnostics_gap)
+    assert force_only["gap_rows"] == []
+
+
+def test_selected_adjacent_gap_pairs_track_the_selected_state():
+    properties = _excited_properties_three_states()
+    config = _sum_config()
+
+    assert [
+        row["gap_key"] for row in configured_score(config, properties, 0)["gap_rows"]
+    ] == ["dE01"]
+    assert [
+        row["gap_key"] for row in configured_score(config, properties, 1)["gap_rows"]
+    ] == ["dE01", "dE12"]
+    assert [
+        row["gap_key"] for row in configured_score(config, properties, 2)["gap_rows"]
+    ] == ["dE12"]
+
+
+def test_adjacent_and_explicit_gap_pairs_are_normalized():
+    properties = _excited_properties_three_states()
+
+    adjacent = configured_score(
+        _sum_config(score=_score_config(gap_pairs="adjacent")), properties, 0
+    )
+    assert [row["gap_key"] for row in adjacent["gap_rows"]] == ["dE01", "dE12"]
+
+    explicit = configured_score(
+        _sum_config(score=_score_config(gap_pairs=[[2, 0], [0, 2]])),
+        properties,
+        0,
+    )
+    assert [row["gap_key"] for row in explicit["gap_rows"]] == ["dE02"]
+    assert explicit["gap_rows"][0]["lower_state"] == 0
+    assert explicit["gap_rows"][0]["upper_state"] == 2
+
+
+def test_score_gap_pairs_reach_the_calculator_without_gap_diagnostics():
+    config = _sum_config()
+    config["gap_diagnostics"] = {"enabled": False}
+
+    rows, seeking = configured_alchemi_gap_rows(
+        config, _excited_properties_three_states(), 1
+    )
+
+    assert [row["gap_key"] for row in rows] == ["dE01", "dE12"]
+    assert seeking["enabled"] is False
+
+
+def test_score_configuration_rejects_invalid_options():
+    properties = _excited_properties_with_gap()
+
+    with pytest.raises(ValueError, match="Unknown score options: w_gap"):
+        configured_score(_sum_config(score=_score_config(w_gap=1.0)), properties, 0)
+    with pytest.raises(ValueError, match="score.mode must be"):
+        configured_score(_sum_config(score={"mode": "mean"}), properties, 0)
+    with pytest.raises(ValueError, match="score.w_force must be"):
+        configured_score(
+            _sum_config(score=_score_config(w_force=-1.0)), properties, 0
+        )
+    with pytest.raises(ValueError, match="score.w_energy must be"):
+        configured_score(
+            _sum_config(score=_score_config(w_energy=float("nan"))), properties, 0
+        )
+    with pytest.raises(ValueError, match="strictly positive weight"):
+        configured_score(
+            _sum_config(
+                score={
+                    "mode": "sum",
+                    "w_energy": 0.0,
+                    "w_force": 0.0,
+                    "w_gap_uncertainty": 0.0,
+                }
+            ),
+            properties,
+            0,
+        )
+    with pytest.raises(TypeError, match="score must be a dictionary"):
+        configured_score(_sum_config(score=[1.0]), properties, 0)
+
+
+def test_gap_term_requires_cutoff_states_and_excited_mode():
+    properties = _excited_properties_with_gap()
+    missing_cut = _sum_config()
+    del missing_cut["score"]["gap_std_cut_eV"]
+
+    with pytest.raises(ValueError, match="requires score.gap_std_cut_eV"):
+        configured_score(missing_cut, properties, 0)
+    with pytest.raises(ValueError, match="gap_std_cut_eV must be finite"):
+        configured_score(
+            _sum_config(score=_score_config(gap_std_cut_eV=0.0)), properties, 0
+        )
+
+    ground_state = _sum_config()
+    ground_state["model_mode"] = "ground_state"
+    with pytest.raises(ValueError, match="requires model_mode='excited_state'"):
+        configured_score(ground_state, properties, 0)
+
+    with pytest.raises(ValueError, match="requires properties_list"):
+        configured_score(_sum_config(), None, 0)
+    with pytest.raises(ValueError, match="are not present in properties_list"):
+        configured_score(
+            _sum_config(score=_score_config(gap_pairs=[[0, 7]])), properties, 0
+        )
+    with pytest.raises(ValueError, match="cannot reference one state twice"):
+        configured_score(
+            _sum_config(score=_score_config(gap_pairs=[[1, 1]])), properties, 0
+        )
+    with pytest.raises(ValueError, match="score.gap_pairs must be"):
+        configured_score(
+            _sum_config(score=_score_config(gap_pairs="all")), properties, 0
+        )
+    with pytest.raises(ValueError, match="no adjacent state pair"):
+        configured_score(_sum_config(), properties, 5)
+
+
+def test_summed_score_requires_ensemble_force_deviation():
+    score = configured_score(_sum_config(), _excited_properties_with_gap(), 0)
+    diagnostics = {"Es": 1.0, "Fs": 1.0, "Fsmax": 1.0, "dE01_stdev": 0.0}
+    flags = uncertainty_flags(diagnostics, Escut=1.0, Fscut=1.0)
+
+    with pytest.raises(ValueError, match="requires the Fsrms force deviation"):
+        candidate_score(diagnostics, flags, score, Escut=1.0, Fscut=1.0)
+
+
+def test_summed_score_requires_configured_gap_diagnostic():
+    score = configured_score(_sum_config(), _excited_properties_with_gap(), 0)
+    diagnostics = _sum_diagnostics(Es=1.0, Fsrms=1.0, gap_stds={})
+    flags = uncertainty_flags(diagnostics, Escut=1.0, Fscut=1.0)
+
+    with pytest.raises(ValueError, match="requires calculator diagnostic"):
+        candidate_score(diagnostics, flags, score, Escut=1.0, Fscut=1.0)
+
+
+def test_reduce_contributions_returns_root_mean_square_force_deviation():
+    try:
+        import torch
+    except Exception as exc:
+        pytest.skip(f"Optional Torch stack is unavailable: {exc}")
+
+    class RawEnsemble(ALFAlchemiCalculator):
+        def ensemble_forward(self, batch):
+            energy = torch.tensor(
+                [[1.0, 1.0], [3.0, 3.0]], device=batch.positions.device
+            )
+            member_one = torch.zeros(4, 3, device=batch.positions.device)
+            member_two = torch.zeros(4, 3, device=batch.positions.device)
+            # Population deviations of [3, 1, 0] eV/Angstrom on graph zero.
+            member_two[0, 0] = 6.0
+            member_two[0, 1] = 2.0
+            return {
+                "energy_contributions": energy,
+                "force_contributions": torch.stack([member_one, member_two]),
+            }
+
+    model = RawEnsemble(device=torch.device("cpu"))
+    model(_torch_batch(torch))
+    diagnostics = model.diagnostics_for_graph(0)
+
+    deviations = np.array([3.0, 1.0] + [0.0] * 4)
+    assert diagnostics["Fsrms"] == pytest.approx(
+        np.sqrt(np.mean(deviations ** 2))
+    )
+    assert diagnostics["Fs"] == pytest.approx(np.mean(np.abs(deviations)))
+    assert diagnostics["Fsmax"] == pytest.approx(3.0)
+    # RMS sits strictly between the mean-absolute and maximum reductions.
+    assert diagnostics["Fs"] < diagnostics["Fsrms"] < diagnostics["Fsmax"]
+
+
+def test_sum_mode_ranks_gap_uncertainty_above_force_uncertainty():
+    """Replica one loses on the max score but wins on the summed score."""
+
+    config = _sum_config(policy="continue", batch_size=2, return_top_n=2)
+    config["Escut"] = 0.001
+    config["Fscut"] = 0.01
+    config["max_candidates_per_replica"] = 1
+    model = FakeModel(
+        {
+            0: [
+                _sum_diagnostics(
+                    Es=0.0,
+                    Fs=0.05,
+                    Fsmax=0.05,
+                    Fsrms=0.05,
+                    gap_stds={"dE01": 0.0},
+                )
+            ],
+            1: [
+                _sum_diagnostics(
+                    Es=0.0,
+                    Fs=0.02,
+                    Fsmax=0.02,
+                    Fsrms=0.02,
+                    gap_stds={"dE01": 0.05},
+                )
+            ],
+        }
+    )
+
+    outputs = run_alchemi_sampling(
+        [_molecule("first", state=0), _molecule("second", state=0)],
+        config,
+        model,
+        properties_list=_excited_properties_with_gap(),
+        runner_factory=FakeRunner,
+    )
+
+    metadata = [item.get_metadata() for item in outputs]
+    # The max score prefers the higher force deviation ...
+    assert metadata[1]["uncertainty_score"] > metadata[0]["uncertainty_score"]
+    # ... while the summed score prefers the gap-uncertain frame.
+    assert [row["parent_molecule_id"] for row in metadata] == ["second", "first"]
+    assert [row["score_mode"] for row in metadata] == ["sum", "sum"]
+    assert metadata[0]["ranking_score"] == pytest.approx(2.0 + 25.0)
+    assert metadata[1]["ranking_score"] == pytest.approx(5.0)
+    assert metadata[0]["score_components"]["gap_uncertainty"] == pytest.approx(25.0)
+    assert metadata[0]["score_gap_pair"] == [0, 1]
+    assert metadata[0]["Fsrms"] == pytest.approx(0.02)
+    # The gap pair is monitored even though gap_diagnostics stays disabled.
+    assert metadata[0]["gap_stds"]["dE01"] == pytest.approx(0.05)
+
+
+def test_replica_candidate_limit_spreads_output_across_trajectories():
+    config = _config(policy="continue", batch_size=2, return_top_n=3)
+    config["maxt"] = 0.4
+    config["max_candidates_per_replica"] = 1
+    model = FakeModel(
+        {
+            0: [
+                {"Es": 9.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 8.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 7.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 6.0, "Fs": 0.0, "Fsmax": 0.0},
+            ],
+            1: [
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+            ],
+        }
+    )
+
+    outputs = run_alchemi_sampling(
+        [_molecule("first"), _molecule("second")],
+        config,
+        model,
+        runner_factory=FakeRunner,
+    )
+
+    parents = [item.get_metadata()["parent_molecule_id"] for item in outputs]
+    assert parents == ["first", "second"]
+    assert [item.get_metadata()["ranking_score"] for item in outputs] == [9.0, 2.0]
+
+
+def test_absent_replica_candidate_limit_allows_one_trajectory_to_dominate():
+    config = _config(policy="continue", batch_size=2, return_top_n=3)
+    config["maxt"] = 0.4
+    model = FakeModel(
+        {
+            0: [
+                {"Es": 9.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 8.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 7.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 6.0, "Fs": 0.0, "Fsmax": 0.0},
+            ],
+            1: [
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
+            ],
+        }
+    )
+
+    outputs = run_alchemi_sampling(
+        [_molecule("first"), _molecule("second")],
+        config,
+        model,
+        runner_factory=FakeRunner,
+    )
+
+    parents = [item.get_metadata()["parent_molecule_id"] for item in outputs]
+    assert parents == ["first", "first", "first"]
+
+
+def test_replica_candidate_limit_rejects_invalid_values():
+    model = FakeModel({0: [{"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}]})
+
+    for value in (0, -1, 1.5, True):
+        config = _config(policy="continue", batch_size=1, return_top_n=1)
+        config["max_candidates_per_replica"] = value
+        with pytest.raises(ValueError, match="max_candidates_per_replica"):
+            run_alchemi_sampling(
+                [_molecule("first")],
+                config,
+                model,
+                runner_factory=FakeRunner,
+            )
