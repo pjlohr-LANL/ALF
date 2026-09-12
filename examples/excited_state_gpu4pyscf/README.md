@@ -171,20 +171,63 @@ change to `properties_list`, the HDF5 contract, or the QM interface: the gap
 deviation is derived by subtracting per-member state energies the ensemble
 already predicts.
 
-Three other settings change together with it, and the change is only meaningful
+The remaining settings change together with it, and the change is only meaningful
 as a group. `max_candidates_per_replica` is new rather than changed:
 
 | Setting | Default config | Summed-score config | Reason |
 | --- | --- | --- | --- |
 | `uncertainty_policy` | `stop` | `continue` | A score can only rank when replicas keep running and produce competing frames. |
-| `Ncheck` | 10 | 100 | At `dt: 0.1` fs, `continue` with `Ncheck: 10` emits candidates 1 fs apart. 100 gives 10 fs spacing so frames are not near-duplicates. |
-| `return_top_k` | 50 | 25 | Candidates are cheaper and more correlated under `continue`. |
+| `Ncheck` | 10 | 10 | Unchanged. `continue` at `dt: 0.1` fs therefore checks every 1 fs, 2000 times per replica. Redundancy is controlled by the per-replica cap below rather than by check spacing. |
+| `return_top_k` | 50 | 100 | Per-task QM budget. Candidates are cheaper and more numerous under `continue`. |
 | `max_candidates_per_replica` | unset | 10 | Without a cap, one diverging trajectory can fill every returned slot. |
+| `save_h5_threshold` (master) | 50 | 500 | Larger, less frequent HDF5 shards to match the per-task budget. |
+| `ML_config_path` (master) | `hippynn_config.json` | `hippynn_config_summed_score.json` | Separate network settings, so this example does not alter the default one. |
 
-The cap and `return_top_k` interact: with 10 and 25, filling the budget needs a
-minimum of three trajectories (10 + 10 + 5), so most of a 50-replica batch can
-still contribute nothing. Lower the cap if you want a stronger diversity floor —
-2 forces at least 13 distinct trajectories, 1 forces 25.
+The cap and `return_top_k` interact: with 10 and 100, filling the budget needs a
+minimum of ten distinct trajectories, out of the 50 in a batch. Lower the cap for
+a stronger diversity floor — 5 forces at least 20 trajectories, and 2 forces all
+50 to contribute their two best frames each.
+
+### Relationship to the PySEQM production runs
+
+These values are aligned with the validated prototype campaign in
+`ALF/production/Enol_BALF_4_states_EF_300k_topology`, so results are roughly
+comparable. Most parameters already agreed: `dt`, `maxt`, `min_time`, friction,
+temperatures, `min_distance_cutoff`, `max_force_cutoff`, the topology bond scales,
+screening flags, and cyclic state selection.
+
+Two things worth understanding:
+
+- **The energy and force weights already match production.** That run sums raw
+  units (`1.0*uE + 0.1*uF`, eV and eV/Angstrom) while this one sums
+  cutoff-normalized ratios. Since `Escut` and `Fscut` already encode a 10x ratio,
+  production's extra `0.1` on force cancels exactly, and `w_energy = w_force = 1.0`
+  gives a ranking proportional to production's. Its uncertainty gate
+  (`min_uE` 0.001, `min_uF` 0.01) is likewise identical to `Escut` and `Fscut`.
+- **Two deliberate divergences.** Production sets `w_gap_uncertainty` to `0.0`;
+  this config keeps `5.0` so the gap channel is actually exercised. And production
+  uses `return_top_n: 500` with a 2000-structure shard threshold, which is
+  affordable for semiempirical PySEQM but not for CAM-B3LYP TDA, so both numbers
+  are scaled down by five here.
+
+### Cost
+
+`Ncheck: 10` under `continue` means no replica freezes early, so every one runs all
+2000 checks. Measured on one A100, 300 checks of a 50-replica batch took 18
+minutes, which puts a full sampler task near **two hours**. The per-step cost is
+inherent to the excited-state calculator: it evaluates all six states for all four
+ensemble members at every MD step regardless of which surface is selected. The
+default `stop` configuration never pays this, because replicas freeze at their
+first uncertain frame.
+
+`return_top_k: 100` also queues up to 100 CAM-B3LYP TDA calculations per sampler
+task. For reference, a four-GPU node labels roughly 500 structures per hour, so a
+500-structure shard is about an hour of QM.
+
+Because `hippynn_config_summed_score.json` adopts the production network
+(`n_features` 145, `n_sensitivities` 20), ensembles trained here are not
+architecturally comparable to any trained with the default config's 75 and 63.
+Ensemble spread, and therefore score magnitudes, will differ between the two.
 
 Run it with the matching master config:
 
