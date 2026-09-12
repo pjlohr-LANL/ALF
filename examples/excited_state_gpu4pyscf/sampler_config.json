@@ -28,7 +28,7 @@
     "min_distance": true,
     "topology": true
   },
-  "return_top_n": 50,
+  "return_top_k": 50,
   "dt": 0.1,
   "maxt": 2.0,
   "Escut": 0.001,

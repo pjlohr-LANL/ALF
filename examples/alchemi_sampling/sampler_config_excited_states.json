@@ -19,7 +19,7 @@
     "sigma": 3.5,
     "alpha_eV": 0.05
   },
-  "return_top_n": 1,
+  "return_top_k": 1,
   "dt": 0.25,
   "maxt": 1000.0,
   "Escut": 20.0,

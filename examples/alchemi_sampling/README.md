@@ -13,7 +13,7 @@ ground-state HIPPYNN workflow. Point `sampler_config_path` at
 The HIPPYNN configuration must provide `energy_key`, `force_key`,
 `species_key`, and `coordinates_key`. The builder must produce identical atom
 order often enough to fill each strict batch. Change `uncertainty_policy` to
-`continue` and increase `return_top_n` to collect ranked uncertain frames
+`continue` and increase `return_top_k` to collect ranked uncertain frames
 without stopping those replicas.
 
 This example selects the native HIPPYNN loader with `alchemi_calculator`. A
@@ -132,7 +132,7 @@ at least two, and `uncertainty_policy: "stop"`. Confirm that:
 4. incomplete compatibility buckets remain visible in `status.txt`.
 
 Repeat with `uncertainty_policy: "continue"` and verify that no more than the
-batch-wide `return_top_n` candidates are returned in descending normalized
+batch-wide `return_top_k` candidates are returned in descending normalized
 uncertainty order. The excited-state acceptance run uses the same profile with
 `model_mode: "excited_state"` and enough pending structures to fill at least
 one complete batch for each state that should run concurrently. Confirm that

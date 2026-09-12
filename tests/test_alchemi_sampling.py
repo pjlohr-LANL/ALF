@@ -81,11 +81,11 @@ def _enable_topology(config):
     return config
 
 
-def _config(policy="stop", batch_size=2, return_top_n=2):
+def _config(policy="stop", batch_size=2, return_top_k=2):
     return {
         "model_mode": "ground_state",
         "uncertainty_policy": policy,
-        "return_top_n": return_top_n,
+        "return_top_k": return_top_k,
         "dt": 100.0,
         "maxt": 0.2,
         "Ncheck": 1,
@@ -1247,7 +1247,7 @@ def test_topology_rejection_preserves_earlier_valid_top_k_candidate(
     outputs = run_alchemi_sampling(
         [_topology_molecule("first"), _topology_molecule("second")],
         _enable_topology(
-            _config(policy="continue", return_top_n=2)
+            _config(policy="continue", return_top_k=2)
         ),
         model,
         runner_factory=TopologyMutationRunner,
@@ -1436,7 +1436,7 @@ def test_continue_mode_returns_global_top_k_with_deterministic_order():
 
     outputs = run_alchemi_sampling(
         [_molecule("first"), _molecule("second")],
-        _config(policy="continue", return_top_n=2),
+        _config(policy="continue", return_top_k=2),
         model,
         runner_factory=FakeRunner,
     )
@@ -1456,7 +1456,7 @@ def test_gap_diagnostics_add_provenance_without_changing_ranking():
     config = _config(
         policy="continue",
         batch_size=1,
-        return_top_n=1,
+        return_top_k=1,
     )
     config.update(
         {
@@ -1507,7 +1507,7 @@ def test_gap_diagnostics_add_provenance_without_changing_ranking():
 
 def test_stay_fixed_gap_seeking_switches_replicas_independently_at_ncheck():
     config = _enable_gap_seeking(
-        _config(policy="continue", batch_size=2, return_top_n=2)
+        _config(policy="continue", batch_size=2, return_top_k=2)
     )
     quiet = {"Es": 0.0, "Fs": 0.0, "Fsmax": 0.0}
     model = FakeModel(
@@ -1606,7 +1606,7 @@ def test_stay_fixed_gap_seeking_switches_replicas_independently_at_ncheck():
 
 def test_gap_seeking_selects_a_different_adjacent_pair_per_replica():
     config = _enable_gap_seeking(
-        _config(policy="continue", batch_size=2, return_top_n=2)
+        _config(policy="continue", batch_size=2, return_top_k=2)
     )
     quiet = {"Es": 0.0, "Fs": 0.0, "Fsmax": 0.0}
     uncertain = {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}
@@ -1660,7 +1660,7 @@ def test_gap_seeking_selects_a_different_adjacent_pair_per_replica():
 
 def test_stop_mode_frozen_replica_does_not_enter_lcm():
     config = _enable_gap_seeking(
-        _config(policy="stop", batch_size=1, return_top_n=1)
+        _config(policy="stop", batch_size=1, return_top_k=1)
     )
     model = FakeModel(
         {
@@ -1692,7 +1692,7 @@ def test_stop_mode_frozen_replica_does_not_enter_lcm():
 
 def test_distance_rejected_replica_does_not_enter_lcm():
     config = _enable_gap_seeking(
-        _config(policy="continue", batch_size=1, return_top_n=1)
+        _config(policy="continue", batch_size=1, return_top_k=1)
     )
     config["distcut"] = 1.0
     model = FakeModel(
@@ -1728,7 +1728,7 @@ def test_continue_mode_tie_breaks_by_batch_index():
 
     outputs = run_alchemi_sampling(
         [_molecule("first"), _molecule("second")],
-        _config(policy="continue", return_top_n=1),
+        _config(policy="continue", return_top_k=1),
         model,
         runner_factory=FakeRunner,
     )
@@ -2777,7 +2777,7 @@ def test_reduce_contributions_returns_root_mean_square_force_deviation():
 def test_sum_mode_ranks_gap_uncertainty_above_force_uncertainty():
     """Replica one loses on the max score but wins on the summed score."""
 
-    config = _sum_config(policy="continue", batch_size=2, return_top_n=2)
+    config = _sum_config(policy="continue", batch_size=2, return_top_k=2)
     config["Escut"] = 0.001
     config["Fscut"] = 0.01
     config["max_candidates_per_replica"] = 1
@@ -2828,7 +2828,7 @@ def test_sum_mode_ranks_gap_uncertainty_above_force_uncertainty():
 
 
 def test_replica_candidate_limit_spreads_output_across_trajectories():
-    config = _config(policy="continue", batch_size=2, return_top_n=3)
+    config = _config(policy="continue", batch_size=2, return_top_k=3)
     config["maxt"] = 0.4
     config["max_candidates_per_replica"] = 1
     model = FakeModel(
@@ -2861,7 +2861,7 @@ def test_replica_candidate_limit_spreads_output_across_trajectories():
 
 
 def test_absent_replica_candidate_limit_allows_one_trajectory_to_dominate():
-    config = _config(policy="continue", batch_size=2, return_top_n=3)
+    config = _config(policy="continue", batch_size=2, return_top_k=3)
     config["maxt"] = 0.4
     model = FakeModel(
         {
@@ -2895,9 +2895,41 @@ def test_replica_candidate_limit_rejects_invalid_values():
     model = FakeModel({0: [{"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}]})
 
     for value in (0, -1, 1.5, True):
-        config = _config(policy="continue", batch_size=1, return_top_n=1)
+        config = _config(policy="continue", batch_size=1, return_top_k=1)
         config["max_candidates_per_replica"] = value
         with pytest.raises(ValueError, match="max_candidates_per_replica"):
+            run_alchemi_sampling(
+                [_molecule("first")],
+                config,
+                model,
+                runner_factory=FakeRunner,
+            )
+
+
+def test_renamed_return_top_n_key_is_rejected():
+    """The old key must error rather than silently defaulting to one candidate."""
+
+    config = _config(policy="continue", batch_size=1, return_top_k=2)
+    del config["return_top_k"]
+    config["return_top_n"] = 2
+    model = FakeModel({0: [{"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}]})
+
+    with pytest.raises(ValueError, match="return_top_n was renamed to return_top_k"):
+        run_alchemi_sampling(
+            [_molecule("first")],
+            config,
+            model,
+            runner_factory=FakeRunner,
+        )
+
+
+def test_return_top_k_rejects_invalid_values():
+    model = FakeModel({0: [{"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}]})
+
+    for value in (0, -1, 1.5, True):
+        config = _config(policy="continue", batch_size=1)
+        config["return_top_k"] = value
+        with pytest.raises(ValueError, match="return_top_k"):
             run_alchemi_sampling(
                 [_molecule("first")],
                 config,

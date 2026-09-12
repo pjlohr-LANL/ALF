@@ -172,14 +172,19 @@ deviation is derived by subtracting per-member state energies the ensemble
 already predicts.
 
 Three other settings change together with it, and the change is only meaningful
-as a group:
+as a group. `max_candidates_per_replica` is new rather than changed:
 
 | Setting | Default config | Summed-score config | Reason |
 | --- | --- | --- | --- |
 | `uncertainty_policy` | `stop` | `continue` | A score can only rank when replicas keep running and produce competing frames. |
 | `Ncheck` | 10 | 100 | At `dt: 0.1` fs, `continue` with `Ncheck: 10` emits candidates 1 fs apart. 100 gives 10 fs spacing so frames are not near-duplicates. |
-| `return_top_n` | 50 | 25 | Candidates are cheaper and more correlated under `continue`. |
-| `max_candidates_per_replica` | unset | 2 | Without a cap, one diverging trajectory can fill every returned slot. |
+| `return_top_k` | 50 | 25 | Candidates are cheaper and more correlated under `continue`. |
+| `max_candidates_per_replica` | unset | 10 | Without a cap, one diverging trajectory can fill every returned slot. |
+
+The cap and `return_top_k` interact: with 10 and 25, filling the budget needs a
+minimum of three trajectories (10 + 10 + 5), so most of a 50-replica batch can
+still contribute nothing. Lower the cap if you want a stronger diversity floor —
+2 forces at least 13 distinct trajectories, 1 forces 25.
 
 Run it with the matching master config:
 

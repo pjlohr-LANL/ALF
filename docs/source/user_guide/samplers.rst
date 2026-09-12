@@ -243,7 +243,7 @@ ranges and adds the following fields:
      "alchemi_calculator": "alframework.samplers.alchemi_sampling.load_hippynn_alchemi_model",
      "alchemi_calculator_options": {},
      "uncertainty_policy": "stop",
-     "return_top_n": 1,
+     "return_top_k": 1,
      "max_candidates_per_replica": null,
      "friction_per_fs": 0.0019645,
      "alchemi_baoab": {
@@ -257,7 +257,7 @@ ranges and adds the following fields:
 
 ``max_candidates_per_replica`` caps how many frames one replica may contribute
 to the returned batch. Candidates are grouped by ``parent_molecule_id``, and the
-cap is applied before the global ``return_top_n`` truncation. The default
+cap is applied before the global ``return_top_k`` truncation. The default
 ``null`` places no per-replica limit, which reproduces the historical behavior.
 Under ``uncertainty_policy`` ``continue`` a diverging replica scores higher as it
 leaves the training manifold, so without a cap a single trajectory can occupy
@@ -401,8 +401,8 @@ running. At most one candidate is returned for each input replica.
 ``continue`` keeps uncertain replicas active. At every ``Ncheck`` interval,
 qualifying frames are ranked across the whole task batch by ``ranking_score``,
 capped per replica by ``max_candidates_per_replica``, and truncated to the
-global ``return_top_n``. Results are sent directly through Parsl, so large
-values of ``return_top_n`` increase task-result serialization and driver memory
+global ``return_top_k``. Results are sent directly through Parsl, so large
+values of ``return_top_k`` increase task-result serialization and driver memory
 use.
 
 Candidate scoring

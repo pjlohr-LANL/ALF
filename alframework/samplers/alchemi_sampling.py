@@ -520,14 +520,42 @@ def _configured_replica_candidate_limit(
     return limit
 
 
+def _configured_return_top_k(sampler_config: dict[str, Any]) -> int:
+    """Return the validated per-task top-K candidate budget."""
+
+    if "return_top_n" in sampler_config:
+        raise ValueError(
+            "return_top_n was renamed to return_top_k; update the sampler "
+            "configuration. The old key is rejected rather than ignored "
+            "because silently falling back to the default would return one "
+            "candidate per task instead of the configured budget."
+        )
+    value = sampler_config.get("return_top_k", 1)
+    if isinstance(value, bool):
+        raise ValueError("return_top_k must be a positive integer.")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"return_top_k must be a positive integer; received {value!r}."
+        ) from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(
+            f"return_top_k must be a positive integer; received {value!r}."
+        )
+    if limit < 1:
+        raise ValueError("return_top_k must be at least one.")
+    return limit
+
+
 def _prune_candidates(
     candidates: list[dict[str, Any]],
-    return_top_n: int,
+    return_top_k: int,
     max_candidates_per_replica: int | None,
 ) -> list[dict[str, Any]]:
-    """Rank candidates, cap each trajectory, then apply the global limit.
+    """Rank candidates, cap each trajectory, then apply the global top-K limit.
 
-    ``return_top_n`` alone is a global budget: under ``uncertainty_policy``
+    ``return_top_k`` alone is a global budget: under ``uncertainty_policy``
     ``continue`` one diverging replica can occupy every slot with frames a
     single check apart. Capping per replica first keeps the returned batch
     spread across distinct starting structures.
@@ -545,7 +573,7 @@ def _prune_candidates(
             counts[parent] = counts.get(parent, 0) + 1
             kept.append(candidate)
         ranked = kept
-    return ranked[: int(return_top_n)]
+    return ranked[: int(return_top_k)]
 
 
 def configured_gap_diagnostics(
@@ -868,6 +896,7 @@ def _validate_sampling_inputs(
     policy = str(sampler_config.get("uncertainty_policy", "stop")).strip().lower()
     if policy not in {"stop", "continue"}:
         raise ValueError("uncertainty_policy must be 'stop' or 'continue'.")
+    _configured_return_top_k(sampler_config)
     _configured_replica_candidate_limit(sampler_config)
 
     reference_numbers: tuple[int, ...] | None = None
@@ -1081,9 +1110,7 @@ def run_alchemi_sampling(
     min_time = float(sampler_config.get("min_time", 0.0))
     if dt <= 0 or maxt <= 0 or ncheck < 1 or min_time < 0:
         raise ValueError("dt and maxt must be positive; Ncheck >= 1 and min_time >= 0.")
-    return_top_n = int(sampler_config.get("return_top_n", 1))
-    if return_top_n < 1:
-        raise ValueError("return_top_n must be at least one.")
+    return_top_k = _configured_return_top_k(sampler_config)
     max_candidates_per_replica = _configured_replica_candidate_limit(sampler_config)
     score = configured_score(
         sampler_config,
@@ -1299,7 +1326,7 @@ def run_alchemi_sampling(
             else:
                 candidates[:] = _prune_candidates(
                     candidates,
-                    return_top_n,
+                    return_top_k,
                     max_candidates_per_replica,
                 )
 
@@ -1376,7 +1403,7 @@ def run_alchemi_sampling(
     else:
         candidates = _prune_candidates(
             candidates,
-            return_top_n,
+            return_top_k,
             max_candidates_per_replica,
         )
 
