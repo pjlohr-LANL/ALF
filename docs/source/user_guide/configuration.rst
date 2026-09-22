@@ -77,8 +77,10 @@ The master config controls the workflow wiring. Common fields include:
        files.
    * - ``properties_list``
      - Mapping from ALF property names to HDF5 dataset names, property scope,
-       and unit conversion factors. See :doc:`units` for the conversion
-       direction and common factors.
+       and unit conversion factors. Supported scopes are ``system`` (one value
+       per structure), ``atomic`` (``[atoms, 3]``), and ``pair_atomic``
+       (``[pairs, atoms, 3]``, used for nonadiabatic coupling). See
+       :doc:`units` for the conversion direction and common factors.
    * - ``parsl_configuration``
      - Parsl resource configuration used for normal runs.
    * - ``parsl_debug_configuration``

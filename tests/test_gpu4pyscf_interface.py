@@ -12,12 +12,16 @@ from alframework.qm_interfaces.gpu4pyscf_interface import (
     GPU4PySCFDependencyError,
     GPU4PySCFDeviceError,
     GPU4PySCFGradientError,
+    GPU4PySCFNACError,
+    GPU4PySCFOutputError,
     GPU4PySCFSCFError,
     GPU4PySCFTDAError,
+    NACR_PROPERTY_KEY,
     _require_scf_convergence,
     _require_tda_convergence,
     _to_numpy,
     convert_gpu4pyscf_atomic_units,
+    excited_excited_nac_pairs,
     gpu4pyscf_excited_state_task,
     label_gpu4pyscf_excited_state_molecule,
     run_gpu4pyscf_states,
@@ -29,7 +33,7 @@ from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.tools import build_input_dict, store_current_data
 
 
-def _properties(nroots=1, *, include_gap=False):
+def _properties(nroots=1, *, include_gap=False, include_nacr=False):
     properties = {}
     for state in range(nroots + 1):
         properties[f"sE{state}"] = [
@@ -44,6 +48,8 @@ def _properties(nroots=1, *, include_gap=False):
         ]
     if include_gap:
         properties["dE01"] = ["gap_01", "system", 1.0]
+    if include_nacr:
+        properties[NACR_PROPERTY_KEY] = ["nacr", "pair_atomic", 1.0]
     return properties
 
 
@@ -78,6 +84,28 @@ def _predictions(nroots=1):
         states, 3, 3
     )
     return energies, forces
+
+
+def _no_nac(atom_count=3):
+    """Empty coupling array returned when compute_nacr is disabled."""
+
+    return np.empty((0, atom_count, 3), dtype=np.float64)
+
+
+def _no_pairs():
+    return np.empty((0, 2), dtype=np.int64)
+
+
+def _nac_predictions(nroots, atom_count=3):
+    """Deterministic coupling vectors for every excited-excited pair."""
+
+    pairs = np.asarray(
+        excited_excited_nac_pairs(nroots), dtype=np.int64
+    ).reshape(-1, 2)
+    nacr = np.arange(
+        len(pairs) * atom_count * 3, dtype=np.float64
+    ).reshape(len(pairs), atom_count, 3)
+    return nacr, pairs
 
 
 def test_validated_defaults_are_five_root_cam_b3lyp():
@@ -433,7 +461,7 @@ def test_backend_constructs_rks_tda_and_uses_one_based_gradients(
         }
     )
 
-    energies, forces, versions = run_gpu4pyscf_states(
+    energies, forces, nacr, nac_pairs, versions = run_gpu4pyscf_states(
         _molecule().get_atoms(),
         options,
         device_index=2,
@@ -454,7 +482,11 @@ def test_backend_constructs_rks_tda_and_uses_one_based_gradients(
         "pyscf_version": "2.test",
         "gpu4pyscf_version": "1.test",
         "cupy_version": "13.test",
+        # compute_nacr defaults off, so S1 still comes from the TDA gradient.
+        "s1_gradient_source": "tda_gradient",
     }
+    assert nacr.shape == (0, 3, 3)
+    assert nac_pairs.shape == (0, 2)
 
 
 def test_labeling_maps_states_forces_gap_offset_and_metadata(monkeypatch):
@@ -473,6 +505,8 @@ def test_labeling_maps_states_forces_gap_offset_and_metadata(monkeypatch):
         return (
             energies.copy(),
             forces.copy(),
+            _no_nac(),
+            _no_pairs(),
             {
                 "pyscf_version": "fake",
                 "gpu4pyscf_version": "fake",
@@ -524,7 +558,7 @@ def test_sampler_energy_offset_is_compatibility_fallback(monkeypatch):
     monkeypatch.setattr(
         gpu4pyscf_module,
         "run_gpu4pyscf_states",
-        lambda *args, **kwargs: (energies, forces, {}),
+        lambda *args, **kwargs: (energies, forces, _no_nac(), _no_pairs(), {}),
     )
 
     labeled = label_gpu4pyscf_excited_state_molecule(
@@ -642,7 +676,7 @@ def test_malformed_converted_output_is_rejected(monkeypatch):
     monkeypatch.setattr(
         gpu4pyscf_module,
         "run_gpu4pyscf_states",
-        lambda *args, **kwargs: (np.zeros(1), forces, {}),
+        lambda *args, **kwargs: (np.zeros(1), forces, _no_nac(), _no_pairs(), {}),
     )
 
     failed = label_gpu4pyscf_excited_state_molecule(
@@ -700,7 +734,7 @@ def test_labeling_results_follow_existing_hdf5_storage_path(
     monkeypatch.setattr(
         gpu4pyscf_module,
         "run_gpu4pyscf_states",
-        lambda *args, **kwargs: (energies, forces, {}),
+        lambda *args, **kwargs: (energies, forces, _no_nac(), _no_pairs(), {}),
     )
     properties = _properties(1, include_gap=True)
     labeled = label_gpu4pyscf_excited_state_molecule(
@@ -731,7 +765,7 @@ def test_public_task_uses_existing_driver_contract(monkeypatch):
     monkeypatch.setattr(
         gpu4pyscf_module,
         "run_gpu4pyscf_states",
-        lambda *args, **kwargs: (energies, forces, {}),
+        lambda *args, **kwargs: (energies, forces, _no_nac(), _no_pairs(), {}),
     )
     molecule = _molecule("task-contract")
     task_input = build_input_dict(
@@ -753,3 +787,194 @@ def test_public_task_uses_existing_driver_contract(monkeypatch):
     assert labeled.check_convergence() is True
     assert set(labeled.get_results()) == {"sE0", "F0", "sE1", "F1"}
     assert gpu4pyscf_excited_state_task.executors == ["alf_QM_executor"]
+
+
+def test_excited_excited_pairs_follow_ordered_combinations():
+    assert excited_excited_nac_pairs(1) == ()
+    assert excited_excited_nac_pairs(2) == ((1, 2),)
+    assert excited_excited_nac_pairs(3) == ((1, 2), (1, 3), (2, 3))
+    # nroots=5 is the production keto/indigo setting: 10 pairs.
+    assert len(excited_excited_nac_pairs(5)) == 10
+    assert len(excited_excited_nac_pairs(6)) == 15
+
+
+def test_compute_nacr_defaults_off_and_requires_two_roots():
+    assert validate_gpu4pyscf_config({})["compute_nacr"] is False
+    assert (
+        validate_gpu4pyscf_config({"compute_nacr": True, "nroots": 2})[
+            "compute_nacr"
+        ]
+        is True
+    )
+
+    with pytest.raises(ValueError, match="compute_nacr requires nroots >= 2"):
+        validate_gpu4pyscf_config({"compute_nacr": True, "nroots": 1})
+    with pytest.raises(ValueError, match="compute_nacr must be a Boolean"):
+        validate_gpu4pyscf_config({"compute_nacr": "yes"})
+
+
+def test_nacr_property_and_flag_must_agree():
+    with_nacr = _properties(2, include_nacr=True)
+    without = _properties(2)
+
+    validate_gpu4pyscf_properties(with_nacr, nroots=2, compute_nacr=True)
+    validate_gpu4pyscf_properties(without, nroots=2, compute_nacr=False)
+
+    with pytest.raises(ValueError, match="compute_nacr requires properties_list"):
+        validate_gpu4pyscf_properties(without, nroots=2, compute_nacr=True)
+    with pytest.raises(ValueError, match="compute_nacr is false"):
+        validate_gpu4pyscf_properties(with_nacr, nroots=2, compute_nacr=False)
+
+    wrong_scope = _properties(2)
+    wrong_scope[NACR_PROPERTY_KEY] = ["nacr", "atomic", 1.0]
+    with pytest.raises(ValueError, match="must use the 'pair_atomic' scope"):
+        validate_gpu4pyscf_properties(wrong_scope, nroots=2, compute_nacr=True)
+
+
+def test_nac_output_validation_rejects_bad_pairs_shape_and_values():
+    nacr, pairs = _nac_predictions(3)
+    validated_nacr, validated_pairs = gpu4pyscf_module._validated_nac_outputs(
+        nacr, pairs, nroots=3, atom_count=3
+    )
+    np.testing.assert_allclose(validated_nacr, nacr)
+    np.testing.assert_array_equal(validated_pairs, pairs)
+
+    with pytest.raises(GPU4PySCFOutputError, match="pair ordering"):
+        gpu4pyscf_module._validated_nac_outputs(
+            nacr, pairs[::-1], nroots=3, atom_count=3
+        )
+    with pytest.raises(GPU4PySCFOutputError, match="malformed coupling vectors"):
+        gpu4pyscf_module._validated_nac_outputs(
+            nacr[:, :2], pairs, nroots=3, atom_count=3
+        )
+    with pytest.raises(GPU4PySCFOutputError, match="malformed NAC pair index"):
+        gpu4pyscf_module._validated_nac_outputs(
+            nacr, pairs[:1], nroots=3, atom_count=3
+        )
+    nonfinite = nacr.copy()
+    nonfinite[0, 0, 0] = np.nan
+    with pytest.raises(GPU4PySCFOutputError, match="non-finite coupling"):
+        gpu4pyscf_module._validated_nac_outputs(
+            nonfinite, pairs, nroots=3, atom_count=3
+        )
+
+
+def test_labeling_stores_nacr_and_pair_metadata(monkeypatch):
+    energies, forces = _predictions(2)
+    nacr, pairs = _nac_predictions(2)
+    monkeypatch.setattr(
+        gpu4pyscf_module, "select_gpu4pyscf_device", lambda count: _device()
+    )
+    monkeypatch.setattr(
+        gpu4pyscf_module,
+        "run_gpu4pyscf_states",
+        lambda *args, **kwargs: (
+            energies,
+            forces,
+            nacr,
+            pairs,
+            {"s1_gradient_source": "nac_solver"},
+        ),
+    )
+
+    labeled = label_gpu4pyscf_excited_state_molecule(
+        _molecule(),
+        QM_config={"nroots": 2, "compute_nacr": True},
+        properties_list=_properties(2, include_nacr=True),
+    )
+
+    assert labeled.check_convergence() is True
+    results = labeled.get_results()
+    np.testing.assert_allclose(results[NACR_PROPERTY_KEY], nacr)
+    assert results[NACR_PROPERTY_KEY].shape == (1, 3, 3)
+
+    metadata = labeled.get_metadata()
+    assert metadata["compute_nacr"] is True
+    assert metadata["nac_pairs"] == [[1, 2]]
+    assert metadata["nac_scope"] == "excited_excited"
+    assert metadata["nacr_units"] == "angstrom^-1"
+    assert metadata["qm_nac_converged"] is True
+    assert metadata["s1_gradient_source"] == "nac_solver"
+
+
+def test_labeling_without_nacr_stores_no_coupling(monkeypatch):
+    energies, forces = _predictions(2)
+    monkeypatch.setattr(
+        gpu4pyscf_module, "select_gpu4pyscf_device", lambda count: _device()
+    )
+    monkeypatch.setattr(
+        gpu4pyscf_module,
+        "run_gpu4pyscf_states",
+        lambda *args, **kwargs: (energies, forces, _no_nac(), _no_pairs(), {}),
+    )
+
+    labeled = label_gpu4pyscf_excited_state_molecule(
+        _molecule(),
+        QM_config={"nroots": 2},
+        properties_list=_properties(2),
+    )
+
+    assert labeled.check_convergence() is True
+    assert NACR_PROPERTY_KEY not in labeled.get_results()
+    metadata = labeled.get_metadata()
+    assert metadata["compute_nacr"] is False
+    assert "nac_pairs" not in metadata
+
+
+def test_nac_failure_marks_molecule_unconverged(monkeypatch):
+    monkeypatch.setattr(
+        gpu4pyscf_module, "select_gpu4pyscf_device", lambda count: _device()
+    )
+
+    def fail(*args, **kwargs):
+        raise GPU4PySCFNACError("coupling solver exploded", failed_states=(1, 2))
+
+    monkeypatch.setattr(gpu4pyscf_module, "run_gpu4pyscf_states", fail)
+
+    labeled = label_gpu4pyscf_excited_state_molecule(
+        _molecule(),
+        QM_config={"nroots": 2, "compute_nacr": True},
+        properties_list=_properties(2, include_nacr=True),
+    )
+
+    assert labeled.check_convergence() is False
+    metadata = labeled.get_metadata()
+    assert metadata["qm_failed_stage"] == "nac"
+    # SCF and TDA completed before the coupling stage; NAC did not.
+    assert metadata["qm_scf_converged"] is True
+    assert metadata["qm_tda_converged"] is True
+    assert metadata["qm_nac_converged"] is False
+    assert metadata["qm_failed_states"] == [1, 2]
+    assert NACR_PROPERTY_KEY not in labeled.get_results()
+
+
+def test_nacr_round_trips_through_hdf5_storage(monkeypatch, tmp_path):
+    energies, forces = _predictions(2)
+    nacr, pairs = _nac_predictions(2)
+    monkeypatch.setattr(
+        gpu4pyscf_module, "select_gpu4pyscf_device", lambda count: _device()
+    )
+    monkeypatch.setattr(
+        gpu4pyscf_module,
+        "run_gpu4pyscf_states",
+        lambda *args, **kwargs: (energies, forces, nacr, pairs, {}),
+    )
+    properties = _properties(2, include_nacr=True)
+    labeled = label_gpu4pyscf_excited_state_molecule(
+        _molecule(),
+        QM_config={"nroots": 2, "compute_nacr": True},
+        properties_list=properties,
+    )
+
+    h5path = str(tmp_path / "nacr.h5")
+    store_current_data(h5path, [labeled], properties)
+
+    with h5py.File(h5path, "r") as handle:
+        group = handle[list(handle.keys())[0]]
+        # [frames, pairs, atoms, 3]
+        assert group["nacr"].shape == (1, 1, 3, 3)
+        np.testing.assert_allclose(group["nacr"][0], nacr)
+        # The pair index is stored once per group, not per frame.
+        assert group["nac_pairs"].shape == (1, 2)
+        np.testing.assert_array_equal(group["nac_pairs"][...], pairs)
+        assert group["state_0_forces"].shape == (1, 3, 3)

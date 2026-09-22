@@ -132,3 +132,19 @@ resumes from ``status.txt``. Only one driver may control a run directory.
 See ``examples/excited_state_gpu4pyscf/README.md`` for the complete seed
 schema, generic adaptation checklist, environment setup, expected outputs,
 monitoring, and recovery instructions.
+
+Variants
+--------
+
+``sampler_config_summed_score.json`` and ``master_config_summed_score.json`` in
+the same directory rank candidates by a weighted sum of normalized energy,
+force, and state-gap uncertainty instead of the default worst-violation
+maximum. The example README documents the settings that must change with it.
+
+``examples/excited_state_gpu4pyscf_nacr`` builds on that summed-score variant
+and additionally labels excited-excited nonadiabatic coupling vectors, so a
+dataset need not be relabeled for later dynamics work. The machine-learned
+potential still trains on energies and forces only. See
+:doc:`../user_guide/qm_interfaces` for the ``compute_nacr`` contract, and that
+directory's README for the shard layout, measured cost, and the two behaviors
+worth planning for.

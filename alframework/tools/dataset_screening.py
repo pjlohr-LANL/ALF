@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -15,6 +16,7 @@ from alframework.tools.molecules_class import MoleculesObject
 
 
 _SCREEN_KEYS = frozenset({"enabled", "force", "min_distance", "topology"})
+_FORCE_KEY = re.compile(r"^F(\d+)$")
 
 
 def dataset_screening_options(
@@ -65,10 +67,13 @@ def _force_property_keys(
 ) -> list[str]:
     keys: list[str] = []
     for property_key, schema in dict(properties_list or {}).items():
+        # Match the exact F# state-force pattern rather than any key starting
+        # with "F", so other atomic-scope properties are never screened as
+        # forces and asserted to have shape [atoms, 3].
         if (
             len(schema) >= 2
             and str(schema[1]).strip().lower() == "atomic"
-            and str(property_key).startswith("F")
+            and _FORCE_KEY.fullmatch(str(property_key)) is not None
         ):
             keys.append(str(property_key))
     missing = [key for key in keys if key not in results]

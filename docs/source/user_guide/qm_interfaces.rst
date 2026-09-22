@@ -144,13 +144,54 @@ excited roots:
      "num_threads": 8,
      "max_memory_mb": null,
      "verbosity": 0,
-     "energy_offset_eV": 0.0
+     "energy_offset_eV": 0.0,
+     "compute_nacr": false
    }
 
 With ``nroots: 5``, ``properties_list`` must contain every ``sE#`` and ``F#``
 from state zero through state five. The task stores total state energies in eV
 and forces in eV/Angstrom. Explicit ``dE#`` properties are derived after the
 common energy offset is applied, so the offset cancels.
+
+Optional Nonadiabatic Coupling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``compute_nacr`` additionally labels excited-excited nonadiabatic coupling
+vectors so a dataset need not be relabeled for later dynamics work. It defaults
+to ``false``; enabling it requires ``nroots >= 2`` and one extra property:
+
+.. code-block:: json
+
+   {
+     "nacr": ["nacr", "pair_atomic", 1.0]
+   }
+
+The flag and the property are cross-validated and must be set together, so a
+configuration can neither compute coupling with nowhere to store it nor declare
+storage for data that is never produced.
+
+**Coupling is stored but never learned.** The excited-state trainer derives its
+output heads by matching the ``sE#``, ``F#``, and ``dE#`` name patterns, so a
+property named ``nacr`` produces no head, no loss term, and no data load. The
+machine-learned potential still targets energies and forces only. This holds
+structurally rather than by configuration.
+
+All ``C(nroots, 2)`` ordered excited-excited pairs are computed: ten pairs for
+``nroots: 5``, fifteen for six, so cost and storage grow quadratically in state
+count. Each shard group gains ``nacr`` with shape
+``[structures, pairs, atoms, 3]`` in Angstrom^-1, plus a ``nac_pairs`` index of
+shape ``[pairs, 2]`` written once per group so the shard describes its own pair
+ordering.
+
+Two behaviors to plan for. Each pair's coupling carries an arbitrary global
+sign, which ALF stores unaligned; downstream analysis must resolve it. And with
+coupling enabled the S1 gradient comes from the coupling solver rather than the
+TDA gradient method, recorded per molecule as ``s1_gradient_source``. Enabling
+the option therefore changes how an existing quantity is obtained, which is why
+it is opt-in.
+
+On a 30-atom molecule at 6-31G* on an A100, coupling raised total labeling time
+about 1.55x, from 32.5 s to 50.3 s, at 22.7 GiB peak GPU memory.
 
 SCF and every requested TDA root must expose valid Boolean convergence flags.
 The interface rejects the entire molecule on any convergence, gradient,
@@ -171,8 +212,8 @@ calls GPU4PySCF directly because its standard ASE adapter does not expose
 ALF's multi-state ``sE#``/``F#`` properties.
 
 Only singlet RKS/TDA is supported in this slice. Roots are energy ordered at
-each geometry. Dipoles, transition dipoles, NACVs, full TDDFT, state tracking,
-PBC, and QM batching are not included.
+each geometry. Dipoles, transition dipoles, ground-excited coupling, full TDDFT,
+state tracking, PBC, and QM batching are not included.
 
 See :doc:`../examples/excited_state_gpu4pyscf` for a seeded HDF5 workflow,
 generic state-count configuration, input preparation, and Darwin execution.

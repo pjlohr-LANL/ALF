@@ -103,6 +103,65 @@ def random_rotation_matrix(deflection=1.0, randnums=None):
     return M
 
 
+PAIR_INDEX_METADATA_KEY = "nac_pairs"
+PAIR_INDEX_DATASET = "nac_pairs"
+
+
+def pair_atomic_property(values, atom_index, property_key):
+    """Reorder one ``[pairs, atoms, 3]`` property into shard atom order.
+
+    ``pair_atomic`` exists because the atom permutation applies to axis 1. The
+    ``atomic`` branch of :func:`store_current_data` indexes axis 0, which would
+    silently permute the pair axis instead.
+    """
+
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 3 or array.shape[1] != len(atom_index) or array.shape[2] != 3:
+        raise RuntimeError(
+            f"pair_atomic property {property_key!r} must have shape "
+            f"[pairs, {len(atom_index)}, 3]; received {array.shape}."
+        )
+    return array[:, atom_index]
+
+
+def store_pair_index(group, system, properties):
+    """Record the pair index for ``pair_atomic`` properties once per group.
+
+    The mapping is constant for a given state count, so it is stored like
+    ``species`` rather than appended per frame. A shard therefore describes its
+    own pair ordering and analysis code never has to recompute it.
+    """
+
+    if not any(
+        str(schema[1]).lower() == "pair_atomic"
+        for schema in properties.values()
+        if len(schema) >= 2
+    ):
+        return
+    pairs = system.get_metadata().get(PAIR_INDEX_METADATA_KEY)
+    if pairs is None:
+        raise RuntimeError(
+            "A pair_atomic property requires the QM interface to record "
+            f"{PAIR_INDEX_METADATA_KEY!r} metadata describing its pair order."
+        )
+    pair_array = np.asarray(pairs, dtype=np.int64)
+    if pair_array.ndim != 2 or pair_array.shape[1] != 2:
+        raise RuntimeError(
+            f"{PAIR_INDEX_METADATA_KEY!r} must have shape [pairs, 2]; "
+            f"received {pair_array.shape}."
+        )
+    stored = group.get(PAIR_INDEX_DATASET)
+    if stored is None:
+        group[PAIR_INDEX_DATASET] = pair_array
+    elif not np.array_equal(stored, pair_array):
+        # Mixing pair orderings inside one group would make every stored
+        # pair_atomic slice ambiguous.
+        raise RuntimeError(
+            "Molecules in one empirical-formula group reported different "
+            f"{PAIR_INDEX_METADATA_KEY!r} orderings."
+        )
+
+
 def store_current_data(h5path, system_data, properties):
     """Stores the key results of the QM calculations in the database.
 
@@ -150,8 +209,16 @@ def store_current_data(h5path, system_data, properties):
                         data_dict[molkey][properties[prop][0]].append(cur_properties[prop] * properties[prop][2])
                     elif properties[prop][1].lower() == "atomic":
                         data_dict[molkey][properties[prop][0]].append(np.array(cur_properties[prop])[atom_index] * properties[prop][2])
+                    elif properties[prop][1].lower() == "pair_atomic":
+                        # [pairs, atoms, 3]: the atom reordering applies to axis 1,
+                        # so the atomic branch above would index the pair axis.
+                        data_dict[molkey][properties[prop][0]].append(
+                            pair_atomic_property(cur_properties[prop], atom_index, prop)
+                            * properties[prop][2]
+                        )
                     else:
                         raise RuntimeError('Unknown property format')
+                store_pair_index(data_dict[molkey], system, properties)
             # If there is not already a molecule with this empirical formula, make a new one
             else:
                 data_dict[molkey] = {}
@@ -166,8 +233,14 @@ def store_current_data(h5path, system_data, properties):
                         data_dict[molkey][properties[prop][0]] = [cur_properties[prop] * properties[prop][2]]
                     elif properties[prop][1].lower() == "atomic":
                         data_dict[molkey][properties[prop][0]] = [np.array(cur_properties[prop])[atom_index] * properties[prop][2]]
+                    elif properties[prop][1].lower() == "pair_atomic":
+                        data_dict[molkey][properties[prop][0]] = [
+                            pair_atomic_property(cur_properties[prop], atom_index, prop)
+                            * properties[prop][2]
+                        ]
                     else:
                         raise RuntimeError('Unknown property format')
+                store_pair_index(data_dict[molkey], system, properties)
         elif not isinstance(system, MoleculesObject): # code never enter in this line, but leaving for now to avoid problems
             nan_number += 1
         elif not system.check_convergence():

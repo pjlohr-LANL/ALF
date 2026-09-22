@@ -186,3 +186,47 @@ def test_dataset_screening_validates_options():
                 "max_force_cutoff": 0.0,
             }
         )
+
+
+def test_screening_ignores_pair_atomic_properties(tmp_path):
+    """Only F# state forces are screened, not every atomic-like property.
+
+    A pair_atomic property has shape [pairs, atoms, 3], so treating it as a
+    force would fail the (atoms, 3) shape assertion.
+    """
+
+    properties = dict(PROPERTIES)
+    properties["nacr"] = ["nacr", "pair_atomic", 1.0]
+    molecule = _molecule("mol-0")
+    molecule.get_results()["nacr"] = np.ones((3, 3, 3))
+
+    kept, summary = filter_dataset_screening(
+        [molecule],
+        properties,
+        _sampler_config(tmp_path),
+        master_directory=str(tmp_path),
+    )
+
+    assert kept == [molecule]
+    assert summary["kept"] == 1
+    assert summary["rejected_force"] == 0
+
+
+def test_screening_does_not_treat_other_f_prefixed_keys_as_forces(tmp_path):
+    """The force selector matches the exact F# pattern, not any leading "F"."""
+
+    properties = dict(PROPERTIES)
+    # An atomic property whose name merely starts with F.
+    properties["Fsomething"] = ["Fsomething", "atomic", 1.0]
+    molecule = _molecule("mol-0")
+    molecule.get_results()["Fsomething"] = np.ones((3, 3))
+
+    kept, summary = filter_dataset_screening(
+        [molecule],
+        properties,
+        _sampler_config(tmp_path),
+        master_directory=str(tmp_path),
+    )
+
+    assert kept == [molecule]
+    assert summary["kept"] == 1

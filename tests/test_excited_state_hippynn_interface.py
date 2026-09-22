@@ -937,3 +937,46 @@ def test_task_signature_and_destructive_options(tmp_path, monkeypatch):
             remove_existing=False,
             h5_test_dir="separate-test-data",
         )
+
+
+def test_nacr_datasets_in_a_shard_are_never_loaded_for_training(tmp_path):
+    """A shard labeled with coupling trains exactly as an E/F-only shard does.
+
+    NACR is stored so a dataset need not be relabeled later, but the MLIP must
+    still learn energies and forces only. That holds because the loader reads
+    only the names derived from the sE#/F#/dE# patterns, so the extra datasets
+    are invisible rather than merely unused.
+    """
+
+    plain = tmp_path / "plain"
+    with_nacr = tmp_path / "with_nacr"
+    plain.mkdir()
+    with_nacr.mkdir()
+    _write_group(plain / "data-0000.h5", "HO", count=4)
+    _write_group(with_nacr / "data-0000.h5", "HO", count=4)
+
+    # Add coupling datasets exactly as store_current_data would.
+    with h5py.File(with_nacr / "data-0000.h5", "a") as store:
+        store["HO"].create_dataset("nacr", data=np.ones((4, 1, 2, 3)))
+        store["HO"].create_dataset(
+            "nac_pairs", data=np.asarray([[1, 2]], dtype=np.int64)
+        )
+
+    loader_kwargs = {
+        "configured_n_atoms": 2,
+        "configured_possible_species": [0, 1, 8],
+    }
+    plain_arrays, plain_summary = ml.load_excited_state_h5_arrays(
+        str(plain), _properties(), **loader_kwargs
+    )
+    nacr_arrays, nacr_summary = ml.load_excited_state_h5_arrays(
+        str(with_nacr), _properties(), **loader_kwargs
+    )
+
+    assert set(nacr_arrays) == set(plain_arrays)
+    assert "nacr" not in nacr_arrays
+    assert "nac_pairs" not in nacr_arrays
+    for key, values in plain_arrays.items():
+        np.testing.assert_allclose(nacr_arrays[key], values)
+    assert nacr_summary["n_structures"] == plain_summary["n_structures"]
+    assert nacr_summary["state_table"] == plain_summary["state_table"]

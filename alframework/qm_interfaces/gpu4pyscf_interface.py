@@ -4,11 +4,18 @@ The public task in this module labels one nonperiodic ``MoleculesObject`` at a
 time on ALF's ordinary QM executor.  It intentionally calls PySCF/GPU4PySCF
 directly: the upstream ASE adapter exposes ordinary ground-state properties,
 but not ALF's flattened ``sE#``/``F#`` multi-state contract.
+
+Optional ``compute_nacr`` additionally labels excited-excited nonadiabatic
+coupling vectors so a dataset need not be relabeled for later dynamics work.
+NACR is stored but never learned: its property key matches none of the
+``sE#``/``F#``/``dE#`` patterns that the excited-state trainer derives its heads
+from, so the machine-learned potential still targets energies and forces only.
 """
 
 from __future__ import annotations
 
 import importlib
+import itertools
 import math
 import numbers
 import os
@@ -43,7 +50,21 @@ DEFAULT_GPU4PYSCF_CONFIG = {
     "max_memory_mb": None,
     "verbosity": 0,
     "energy_offset_eV": 0.0,
+    "compute_nacr": False,
 }
+
+# ALF stores nonadiabatic coupling vectors under one flattened pair_atomic
+# property. The key deliberately matches none of the sE#/F#/dE# training
+# patterns, so the excited-state trainer never builds a head for it.
+NACR_PROPERTY_KEY = "nacr"
+NAC_SCOPE = "excited_excited"
+NACR_UNITS = "angstrom^-1"
+
+
+def excited_excited_nac_pairs(nroots: int) -> tuple[tuple[int, int], ...]:
+    """Return the ordered excited-excited NAC pairs for ``nroots`` roots."""
+
+    return tuple(itertools.combinations(range(1, int(nroots) + 1), 2))
 
 
 class GPU4PySCFError(RuntimeError):
@@ -86,6 +107,12 @@ class GPU4PySCFTDAError(GPU4PySCFError):
     """Raised when one or more TDA roots fail."""
 
     stage = "tda"
+
+
+class GPU4PySCFNACError(GPU4PySCFError):
+    """Raised when the nonadiabatic coupling solver fails or misreports pairs."""
+
+    stage = "nac"
 
 
 class GPU4PySCFGradientError(GPU4PySCFError):
@@ -200,6 +227,14 @@ def validate_gpu4pyscf_config(QM_config: dict[str, Any] | None) -> dict[str, Any
     options["energy_offset_eV"] = _finite_float(
         options.get("energy_offset_eV"), name="energy_offset_eV"
     )
+
+    if not isinstance(options.get("compute_nacr"), bool):
+        raise ValueError("compute_nacr must be a Boolean.")
+    if options["compute_nacr"] and options["nroots"] < 2:
+        raise ValueError(
+            "compute_nacr requires nroots >= 2; excited-excited coupling needs "
+            f"at least two roots but nroots={options['nroots']} yields no pairs."
+        )
     return options
 
 
@@ -207,8 +242,15 @@ def validate_gpu4pyscf_properties(
     properties_list: dict[str, list[Any]],
     *,
     nroots: int,
+    compute_nacr: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Validate ALF's complete energy/force contract for ``nroots``."""
+    """Validate ALF's complete energy/force contract for ``nroots``.
+
+    When ``compute_nacr`` is set, ``properties_list`` must also declare the
+    ``nacr`` pair_atomic property, and vice versa. Requiring both together
+    prevents a configuration that computes coupling with nowhere to store it, or
+    that declares storage for data that is never produced.
+    """
 
     state_table = derive_state_property_table(
         properties_list, require_forces=True
@@ -243,11 +285,40 @@ def validate_gpu4pyscf_properties(
             )
         supported_keys.update((energy_key, force_key))
     supported_keys.update(str(row["gap_key"]) for row in gap_table)
+
+    nacr_declared = NACR_PROPERTY_KEY in properties_list
+    if bool(compute_nacr) and not nacr_declared:
+        raise ValueError(
+            f"compute_nacr requires properties_list to declare the "
+            f"{NACR_PROPERTY_KEY!r} pair_atomic property so coupling vectors "
+            "can be stored."
+        )
+    if nacr_declared and not bool(compute_nacr):
+        raise ValueError(
+            f"properties_list declares {NACR_PROPERTY_KEY!r} but "
+            "QM_config.compute_nacr is false, so no coupling vectors would be "
+            "calculated."
+        )
+    if nacr_declared:
+        nacr_schema = properties_list[NACR_PROPERTY_KEY]
+        if len(nacr_schema) < 2 or str(nacr_schema[1]).lower() != "pair_atomic":
+            raise ValueError(
+                f"Property {NACR_PROPERTY_KEY!r} must use the 'pair_atomic' "
+                "scope."
+            )
+        if not str(nacr_schema[0]):
+            raise ValueError(
+                f"Property {NACR_PROPERTY_KEY!r} requires a nonempty database "
+                "name."
+            )
+        supported_keys.add(NACR_PROPERTY_KEY)
+
     unsupported = sorted(set(properties_list) - supported_keys)
     if unsupported:
         raise ValueError(
             "The GPU4PySCF interface supports only flattened sE#/F#/dE# "
-            f"properties; unsupported keys: {unsupported}."
+            f"properties and {NACR_PROPERTY_KEY!r}; unsupported keys: "
+            f"{unsupported}."
         )
     return state_table, gap_table
 
@@ -471,13 +542,60 @@ def _validated_calculated_outputs(
     return energy_array, force_array
 
 
+def _validated_nac_outputs(
+    nacr: Any,
+    nac_pairs: Any,
+    *,
+    nroots: int,
+    atom_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate coupling pair ordering, shape, and finiteness.
+
+    Failures raise so the molecule is marked unconverged and dropped, rather
+    than writing malformed coupling into a shard that is expensive to relabel.
+    """
+
+    nacr_array = np.asarray(nacr, dtype=np.float64)
+    pair_array = np.asarray(nac_pairs, dtype=np.int64)
+    expected_pairs = excited_excited_nac_pairs(nroots)
+    expected_pair_shape = (len(expected_pairs), 2)
+    expected_nacr_shape = (len(expected_pairs), int(atom_count), 3)
+    if pair_array.shape != expected_pair_shape:
+        raise GPU4PySCFOutputError(
+            "GPU4PySCF returned a malformed NAC pair index: expected "
+            f"{expected_pair_shape}, received {pair_array.shape}."
+        )
+    if [tuple(int(v) for v in pair) for pair in pair_array] != list(
+        expected_pairs
+    ):
+        raise GPU4PySCFOutputError(
+            "GPU4PySCF NAC pair ordering does not match the expected "
+            f"excited-excited combinations {list(expected_pairs)}; received "
+            f"{[tuple(int(v) for v in pair) for pair in pair_array]}."
+        )
+    if nacr_array.shape != expected_nacr_shape:
+        raise GPU4PySCFOutputError(
+            "GPU4PySCF returned malformed coupling vectors: expected "
+            f"{expected_nacr_shape}, received {nacr_array.shape}."
+        )
+    if not np.all(np.isfinite(nacr_array)):
+        raise GPU4PySCFOutputError(
+            "GPU4PySCF returned non-finite coupling vectors."
+        )
+    return nacr_array, pair_array
+
+
 def run_gpu4pyscf_states(
     atoms,
     options: dict[str, Any],
     *,
     device_index: int,
-) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
-    """Run one GPU4PySCF RKS/TDA energy-and-gradient calculation."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Run one GPU4PySCF RKS/TDA energy-and-gradient calculation.
+
+    Returns state energies (eV), forces (eV/Angstrom), NACR (Angstrom^-1, empty
+    unless ``compute_nacr``), the NACR pair index, and backend metadata.
+    """
 
     try:
         pyscf = importlib.import_module("pyscf")
@@ -606,6 +724,67 @@ def run_gpu4pyscf_states(
             f"{type(exc).__name__}: {exc}",
             failed_states=(0,),
         ) from exc
+    compute_nacr = bool(options.get("compute_nacr", False))
+    expected_pairs = (
+        excited_excited_nac_pairs(nroots) if compute_nacr else ()
+    )
+    nac_pairs = np.asarray(expected_pairs, dtype=np.int64).reshape(-1, 2)
+    nacr_bohr_inverse = np.empty((0, atom_count, 3), dtype=np.float64)
+    nac_elapsed: float | None = None
+    # The NAC solver returns the S1 gradient as a byproduct of grad_state=1, so
+    # the direct TDA gradient loop starts at S2 when coupling is requested.
+    first_direct_state = 1
+    if compute_nacr:
+        nac_start = time.time()
+        try:
+            nac_solver = td.nac_gradient_method()
+            nac_solver.states = list(root_states)
+            nac_solver.grad_state = 1
+            nac_results = nac_solver.kernel()
+        except Exception as exc:
+            raise GPU4PySCFNACError(
+                f"GPU4PySCF nonadiabatic coupling failed: "
+                f"{type(exc).__name__}: {exc}",
+                failed_states=root_states,
+            ) from exc
+        nac_elapsed = time.time() - nac_start
+        try:
+            gradients[1] = np.asarray(
+                _to_numpy(nac_solver.grad_result, cupy), dtype=np.float64
+            )
+        except Exception as exc:
+            raise GPU4PySCFNACError(
+                "GPU4PySCF NAC solver did not return a usable S1 gradient: "
+                f"{type(exc).__name__}: {exc}",
+                failed_states=(1,),
+            ) from exc
+        returned_pairs = sorted(
+            tuple(int(state) for state in pair) for pair in nac_results
+        )
+        if returned_pairs != sorted(expected_pairs):
+            raise GPU4PySCFNACError(
+                f"GPU4PySCF returned NAC pairs {returned_pairs}; expected "
+                f"{sorted(expected_pairs)}.",
+                failed_states=root_states,
+            )
+        try:
+            nacr_bohr_inverse = np.stack(
+                [
+                    np.asarray(
+                        _to_numpy(nac_results[pair]["de_etf_scaled"], cupy),
+                        dtype=np.float64,
+                    )
+                    for pair in expected_pairs
+                ]
+            )
+        except Exception as exc:
+            raise GPU4PySCFNACError(
+                "GPU4PySCF NAC results could not be converted to arrays: "
+                f"{type(exc).__name__}: {exc}",
+                failed_states=root_states,
+            ) from exc
+        first_direct_state = 2
+
     try:
         excited_gradient = td.nuc_grad_method()
     except Exception as exc:
@@ -614,7 +793,7 @@ def run_gpu4pyscf_states(
             f"{type(exc).__name__}: {exc}",
             failed_states=root_states,
         ) from exc
-    for state in range(1, nroots + 1):
+    for state in range(first_direct_state, nroots + 1):
         try:
             gradients[state] = _to_numpy(
                 excited_gradient.kernel(state=state), cupy
@@ -625,6 +804,10 @@ def run_gpu4pyscf_states(
                 f"{type(exc).__name__}: {exc}",
                 failed_states=(state,),
             ) from exc
+
+    # de_etf_scaled is bohr^-1; ALF stores angstrom^-1 alongside its
+    # angstrom-based coordinates and eV/angstrom forces.
+    nacr_angstrom_inverse = nacr_bohr_inverse / float(nist.BOHR)
 
     energies_ev, forces_ev_per_angstrom = convert_gpu4pyscf_atomic_units(
         energies_hartree,
@@ -640,14 +823,26 @@ def run_gpu4pyscf_states(
             getattr(gpu4pyscf, "__version__", "unknown")
         ),
         "cupy_version": str(getattr(cupy, "__version__", "unknown")),
+        "s1_gradient_source": (
+            "nac_solver" if compute_nacr else "tda_gradient"
+        ),
     }
-    return energies_ev, forces_ev_per_angstrom, versions
+    if nac_elapsed is not None:
+        versions["qm_nac_seconds"] = float(nac_elapsed)
+    return (
+        energies_ev,
+        forces_ev_per_angstrom,
+        nacr_angstrom_inverse,
+        nac_pairs,
+        versions,
+    )
 
 
 def _convergence_metadata_for_failure(stage: str) -> dict[str, bool]:
     return {
-        "qm_scf_converged": stage in {"tda", "gradient", "output"},
-        "qm_tda_converged": stage in {"gradient", "output"},
+        "qm_scf_converged": stage in {"tda", "nac", "gradient", "output"},
+        "qm_tda_converged": stage in {"nac", "gradient", "output"},
+        "qm_nac_converged": stage in {"gradient", "output"},
     }
 
 
@@ -672,7 +867,9 @@ def label_gpu4pyscf_excited_state_molecule(
     try:
         options = validate_gpu4pyscf_config(qm_options)
         state_table, gap_table = validate_gpu4pyscf_properties(
-            properties_list, nroots=options["nroots"]
+            properties_list,
+            nroots=options["nroots"],
+            compute_nacr=bool(options["compute_nacr"]),
         )
         atoms = molecule_object.get_atoms()
         if atoms is None or len(atoms) < 1:
@@ -705,7 +902,13 @@ def label_gpu4pyscf_excited_state_molecule(
             qm_options, sampler_options
         )
         device = select_gpu4pyscf_device(gpus_per_node)
-        energies, forces, backend_metadata = run_gpu4pyscf_states(
+        (
+            energies,
+            forces,
+            nacr,
+            nac_pairs,
+            backend_metadata,
+        ) = run_gpu4pyscf_states(
             atoms,
             options,
             device_index=int(device["index"]),
@@ -716,6 +919,13 @@ def label_gpu4pyscf_excited_state_molecule(
             state_count=len(state_table),
             atom_count=len(atoms),
         )
+        if options["compute_nacr"]:
+            nacr, nac_pairs = _validated_nac_outputs(
+                nacr,
+                nac_pairs,
+                nroots=int(options["nroots"]),
+                atom_count=len(atoms),
+            )
     except Exception as exc:
         elapsed = time.time() - start_time
         stage = str(getattr(exc, "stage", "configuration"))
@@ -762,11 +972,34 @@ def label_gpu4pyscf_excited_state_molecule(
             results[str(row["upper_energy_key"])]
             - results[str(row["lower_energy_key"])]
         )
+    if options["compute_nacr"]:
+        results[NACR_PROPERTY_KEY] = np.asarray(nacr, dtype=np.float64)
 
     elapsed = time.time() - start_time
+    nac_metadata: dict[str, Any] = {
+        "compute_nacr": bool(options["compute_nacr"]),
+        "qm_nac_converged": True,
+    }
+    if options["compute_nacr"]:
+        nac_metadata.update(
+            {
+                # store_pair_index reads nac_pairs to write the shard's pair
+                # index dataset, so this key is load-bearing, not just record.
+                "nac_pairs": [
+                    [int(pair[0]), int(pair[1])] for pair in nac_pairs
+                ],
+                "nac_scope": NAC_SCOPE,
+                "nacr_units": NACR_UNITS,
+                "nac_pair_count": int(len(nac_pairs)),
+                # NACR carries an arbitrary global sign per pair; nothing is
+                # trained on it, so the raw solver sign is stored unaligned.
+                "nacr_sign_convention": "raw_solver_arbitrary_global_sign",
+            }
+        )
     molecule_object.store_results(results)
     molecule_object.update_metadata(
         {
+            **nac_metadata,
             "qm_backend": "gpu4pyscf",
             "qm_device": str(device["label"]),
             "qm_device_index": int(device["index"]),
