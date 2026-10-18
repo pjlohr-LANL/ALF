@@ -104,7 +104,9 @@ def test_async_queue_handoff_builder_sampler_qm_h5_ml(monkeypatch, tmp_path: Pat
         def advance(self):
             idx = min(self._index, len(self.snapshots) - 1)
             current = deepcopy(self.snapshots[idx])
-            current["forces"] = np.asarray(current["forces"], dtype=float)
+            current["forces"] = np.asarray(current["forces"], dtype=float).reshape(-1, 3)
+            current["F_mean_S0"] = current["forces"].copy()
+            current["F_mean_S1"] = current["forces"].copy()
             current["F_std_S0"] = np.asarray(current["F_std_S0"], dtype=float)
             current["F_std_S1"] = np.asarray(current["F_std_S1"], dtype=float)
             self.results = current

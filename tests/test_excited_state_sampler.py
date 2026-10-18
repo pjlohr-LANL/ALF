@@ -30,9 +30,11 @@ def _snapshot(*, energy, forces, e0, e1, u0, u1, f0, f1):
         "forces": np.asarray(forces, dtype=np.float64),
         "E_mean_S0": float(e0),
         "E_std_S0": float(u0),
+        "F_mean_S0": np.asarray(forces, dtype=np.float64).copy(),
         "F_std_S0": np.asarray(f0, dtype=np.float64),
         "E_mean_S1": float(e1),
         "E_std_S1": float(u1),
+        "F_mean_S1": np.asarray(forces, dtype=np.float64).copy(),
         "F_std_S1": np.asarray(f1, dtype=np.float64),
     }
 
@@ -57,11 +59,104 @@ def _safe_candidate_metrics(atoms, selected_state=0):
         "min_gap": 0.03,
         "min_gap_pair": [0, 1],
         "selected_energy_eV": 0.0,
+        **sampler_mod.FORCE_SCREEN_METADATA,
+        "physical_fmax_by_state": {"0": 0.0, "1": 0.0},
+        "propagation_fmax": 0.0, "gap_bias_fmax": 0.0,
+        "state_energy_gaps": {"dE01": .03},
         "fmax": 0.0,
         "min_dist": 0.96,
         "nearest_neighbor_distances": np.asarray([0.96, 0.96, 0.96], dtype=float),
         "max_nearest_neighbor_distance": 0.96,
     }
+
+
+@pytest.mark.parametrize('physical_max,propagation_max,rejected', [
+    (5., 60., False), (17., .1, True), (16., 60., False), (16.0001, 0., True),
+])
+def test_force_screen_uses_all_physical_states_not_propagation(physical_max, propagation_max, rejected):
+    atoms = Atoms('OHH', positions=[[0, 0, 0], [.96, 0, 0], [-.24, .93, 0]])
+    results = _snapshot(energy=0., forces=np.zeros((3, 3)), e0=0., e1=.03,
+                        u0=.1, u1=.1, f0=np.zeros((3, 3)), f1=np.zeros((3, 3)))
+    # The excessive physical force is on an unselected state. Opposite forces
+    # on different atoms must not cancel, or be replaced by a molecular norm.
+    results['F_mean_S1'][0, 0] = physical_max
+    results['F_mean_S1'][1, 0] = -physical_max
+    results['forces'][0, 0] = propagation_max
+    states = [{'state': 0}, {'state': 1}]
+    metrics = sampler_mod._results_to_metrics(atoms, results, states, [], 0,
+        forces_override=results['forces'], gap_seeking_pair=[0, 1], gap_seeking_active=True)
+    screen = sampler_mod._geometry_screen(atoms, metrics,
+        {'max_force_cutoff': 16., 'min_distance_cutoff': .7}, None)
+    assert metrics['fmax'] == physical_max
+    assert metrics['physical_fmax_by_state'] == {'0': 0., '1': physical_max}
+    assert metrics['propagation_fmax'] == propagation_max
+    assert screen['screen_max_force_failed'] is rejected
+    assert metrics['force_screen_source'] == 'physical_state_mean'
+
+
+@pytest.mark.parametrize('bad', ['missing', 'nan', 'shape'])
+def test_force_screen_never_falls_back_to_propagation(bad):
+    atoms = Atoms('HH', positions=[[0, 0, 0], [1., 0, 0]])
+    results = _snapshot(energy=0., forces=np.zeros((2, 3)), e0=0., e1=.03,
+                        u0=.1, u1=.1, f0=np.zeros((2, 3)), f1=np.zeros((2, 3)))
+    if bad == 'missing': del results['F_mean_S1']
+    elif bad == 'nan': results['F_mean_S1'][0, 0] = np.nan
+    else: results['F_mean_S1'] = np.zeros((2, 2, 3))
+    with pytest.raises(ValueError, match='Physical force screening requires'):
+        sampler_mod._results_to_metrics(atoms, results, [{'state': 0}, {'state': 1}], [], 0,
+                                       forces_override=results['forces'])
+
+
+def test_ase_physical_force_extra_property_singleton_axis():
+    forces = sampler_mod._physical_forces({'F_mean_S0': np.array([[[3., 4., 0.], [0., 0., 0.]]])},
+                                          [{'state': 0}], 2)
+    assert forces[0].shape == (2, 3)
+    assert np.linalg.norm(forces[0], axis=1).max() == 5.
+
+
+def test_four_state_snapshots_keep_all_numeric_force_arrays():
+    atoms = Atoms('H15', positions=np.arange(45).reshape(15, 3))
+    states = [{'state': state} for state in range(4)]
+    results = {'forces': np.ones((15, 3)) * 20.}
+    for state in range(4):
+        results.update({f'E_mean_S{state}':float(state), f'E_std_S{state}':.1,
+                        f'F_mean_S{state}':np.arange(45).reshape(1,15,3) * .01 + state,
+                        f'F_std_S{state}':np.zeros((1,15,3))})
+    metrics = sampler_mod._results_to_metrics(atoms, results, states, [], 0,
+        forces_override=results['forces'], gap_seeking_pair=[1,2], gap_seeking_active=True)
+    for _ in range(3):
+        snapshot = sampler_mod._screen_snapshot(atoms, results, metrics, states,
+            step=10, time_ps=.001, pair=[1,2], active=True)
+        for state in range(4):
+            value = snapshot['physical_forces_by_state'][str(state)]
+            assert isinstance(value, list)
+            np.testing.assert_allclose(value, results[f'F_mean_S{state}'][0])
+
+
+def test_rejected_snapshot_is_same_frame_detached_and_serializable(tmp_path):
+    import pickle
+    atoms = Atoms('HH', positions=[[0, 0, 0], [1., 0, 0]])
+    results = _snapshot(energy=0., forces=np.full((2, 3), 30.), e0=0., e1=.03,
+                        u0=.1, u1=.1, f0=np.zeros((2, 3)), f1=np.zeros((2, 3)))
+    results['F_mean_S0'][:] = 1.
+    results['F_mean_S1'][:] = 2.
+    states = [{'state': 0}, {'state': 1}]
+    metrics = sampler_mod._results_to_metrics(atoms, results, states, [], 0,
+        forces_override=results['forces'], gap_seeking_pair=[0, 1], gap_seeking_active=True)
+    snapshot = sampler_mod._screen_snapshot(atoms, results, metrics, states, step=20,
+        time_ps=.002, pair=[0, 1], active=True, reject_reason='topology', failures=['topology'])
+    atoms.positions[:] = 100.
+    results['F_mean_S0'][:] = 100.
+    metrics['energies'][0] = 100.
+    assert snapshot['positions'][1] == [1., 0., 0.]
+    assert snapshot['physical_forces_by_state']['0'][0] == [1., 1., 1.]
+    assert snapshot['metrics']['energies']['0'] == 0.
+    assert snapshot['gap_bias_forces'][0] == [28.5, 28.5, 28.5]
+    sampler_mod._write_metadata(str(tmp_path), 'snapshot', snapshot, 'both')
+    saved_json = json.loads((tmp_path / 'metadata-snapshot.json').read_text())
+    with (tmp_path / 'metadata-snapshot.p').open('rb') as handle:
+        saved_pickle = pickle.load(handle)
+    assert saved_json == saved_pickle == snapshot
 
 
 def test_selected_state_uncertainty_is_default_for_gate_and_score():
@@ -326,6 +421,48 @@ def _install_fake_sampling_runtime(monkeypatch, snapshots):
     monkeypatch.setitem(sys.modules, "hippynn.interfaces.ase_interface", fake_ase_interface)
 
     return FakeLangevin
+
+
+@pytest.mark.parametrize('first_check_rejected', [False, True])
+def test_ase_physical_force_rejection_preserves_last_valid_and_failed_snapshots(monkeypatch, tmp_path, first_check_rejected):
+    snapshots = []
+    for maximum in [0., 17. if first_check_rejected else 4., 17.]:
+        record = _snapshot(energy=0., forces=np.full((3, 3), 40.), e0=0., e1=.03,
+            u0=.2, u1=.2, f0=np.zeros((3, 3)), f1=np.zeros((3, 3)))
+        record['F_mean_S0'][:] = 0.
+        record['F_mean_S1'][:] = 0.
+        record['F_mean_S1'][0, 0] = maximum
+        snapshots.append(record)
+    runtime = _install_fake_sampling_runtime(monkeypatch, snapshots)
+    original_run = runtime.run
+    def run_with_current_calculator_cache(self, steps):
+        original_run(self, steps)
+        self.atoms.calc.atoms = self.atoms.copy()
+    monkeypatch.setattr(runtime, 'run', run_with_current_calculator_cache)
+    molecule = MoleculesObject(Atoms('OHH', positions=[[0,0,0],[.96,0,0],[-.24,.93,0]]), 'force_snapshots')
+    config = {
+        'dt':1., 'maxt':.002, 'Ncheck':1, 'min_time':0., 'friction':.02,
+        'srt_temp':[100.,100.], 'end_temp':[100.,100.], 'amp_temp':[0.,0.], 'per_temp':[1.,1.],
+        'amp_dens':None, 'per_dens':None, 'end_dens':None,
+        'meta_dir':str(tmp_path), 'metadata_format':'both', 'trajectory_frequency':0.,
+        'write_traj_binary':False, 'write_traj_xyz':False,
+        'min_distance_cutoff':.7, 'max_force_cutoff':16.,
+        'state_selection':{'mode':'fixed','fixed_state':0},
+        'uncertainty':{'enabled':True,'min_uE':.05,'min_uF':.05,'logic':'either'},
+        'score':{'w_energy':1.,'w_force':.1,'w_gap':0.},
+    }
+    sampler_mod.run_excited_state_sampling(molecule, sampler_config=config, model_path=str(tmp_path/'model-{:04d}'),
+        current_model_id=0, gpus_per_node=0, properties_list=_properties_list())
+    data = json.loads((tmp_path/'metadata-force_snapshots.json').read_text())
+    assert data['geometry_reject_reason'] == 'max_force'
+    assert data['rejected_snapshot']['metrics']['fmax'] == 17.
+    assert data['rejected_snapshot']['metrics']['propagation_fmax'] > 16.
+    if first_check_rejected:
+        assert data['last_valid_snapshot'] is None
+    else:
+        assert data['last_valid_snapshot']['metrics']['fmax'] == 4.
+        assert data['last_valid_snapshot']['step'] < data['rejected_snapshot']['step']
+        assert data['best_candidate']['force_screen_scope'] == 'all_states'
 
 
 def test_run_excited_state_sampling_selects_highest_scoring_valid_frame(monkeypatch, tmp_path: Path):
@@ -876,6 +1013,9 @@ def test_alchemi_backend_uses_fake_runner_not_ase_langevin(monkeypatch, tmp_path
 
 
 def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path: Path):
+    real_results_to_metrics = sampler_mod._results_to_metrics
+    force_bad_index = None
+
     class FakeNode:
         def __init__(self, name):
             self.mean = f"{name}.mean"
@@ -936,15 +1076,20 @@ def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path
 
         def results_for_graph(self, graph_index):
             uncertainty = 0.20 + 0.10 * int(graph_index)
-            forces = np.zeros((3, 3), dtype=float)
+            forces = np.full((3, 3), 40., dtype=float)
+            physical = np.zeros((3, 3), dtype=float)
+            if graph_index == force_bad_index:
+                physical[0, 0] = 11.
             return {
                 "energy": float(graph_index),
                 "forces": forces,
                 "E_mean_S0": 0.0,
                 "E_std_S0": uncertainty,
+                "F_mean_S0": np.zeros((3, 3)),
                 "F_std_S0": np.full((3, 3), uncertainty),
                 "E_mean_S1": 0.03,
                 "E_std_S1": 10.0,
+                "F_mean_S1": physical.copy(),
                 "F_std_S1": np.full((3, 3), 10.0),
             }
 
@@ -989,9 +1134,7 @@ def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path
         molecule.update_metadata({"excited_state": 0})
         molecules.append(molecule)
 
-    result = sampler_mod.run_excited_state_sampling_batch(
-        molecules,
-        sampler_config={
+    base_config = {
             "dynamics_backend": "alchemi_baoab",
             "dt": 1.0,
             "maxt": 0.001,
@@ -1021,7 +1164,10 @@ def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path
             "gap_seeking": {"enabled": False},
             "udd": {"enabled": False},
             "score": {"w_energy": 1.0, "w_force": 1.0, "w_gap": 0.0, "uncertainty_aggregate": "max"},
-        },
+        }
+    result = sampler_mod.run_excited_state_sampling_batch(
+        molecules,
+        sampler_config=base_config,
         model_path=str(tmp_path / "models" / "model-{:04d}"),
         current_model_id=0,
         gpus_per_node=0,
@@ -1114,6 +1260,29 @@ def test_batched_alchemi_backend_scores_multiple_molecules(monkeypatch, tmp_path
     assert rejected_payload["rejected_qm_candidates_min_distance"] == 1
 
 
+    # The artificial propagation force is above cutoff for both replicas, but
+    # only replica 1 has an excessive physical force (on the nonselected state).
+    force_bad_index = 1
+    monkeypatch.setattr(sampler_mod, "_results_to_metrics", real_results_to_metrics)
+    force_config = {**base_config, "meta_dir": str(tmp_path / "meta_force")}
+    physical_result = sampler_mod.run_excited_state_sampling_batch(
+        molecules, sampler_config=force_config,
+        model_path=str(tmp_path / "models" / "model-{:04d}"), current_model_id=0,
+        gpus_per_node=0, properties_list=_properties_list())
+    assert len(physical_result) == 1
+    assert physical_result[0].get_metadata()["parent_molecule_id"] == "batch_0"
+    accepted = json.loads((tmp_path / "meta_force/metadata-batch_0.json").read_text())
+    rejected = json.loads((tmp_path / "meta_force/metadata-batch_1.json").read_text())
+    assert accepted["geometry_reject_reason"] is None
+    assert accepted["last_valid_snapshot"]["metrics"]["propagation_fmax"] > 10.
+    assert rejected["geometry_reject_reason"] == "max_force"
+    assert rejected["last_valid_snapshot"] is None
+    assert rejected["rejected_snapshot"]["metrics"]["physical_fmax_by_state"]["1"] == 11.
+    np.testing.assert_allclose(rejected["positions"], rejected["initial_positions"])
+    np.testing.assert_allclose(np.asarray(rejected["rejected_snapshot"]["positions"]),
+                               np.asarray(rejected["initial_positions"]) + .02)  # warmup + checked step
+
+
 def test_batched_gap_seeking_hysteresis_enters_and_exits_lcm(monkeypatch, tmp_path: Path):
     class FakeNode:
         def __init__(self, name):
@@ -1188,9 +1357,11 @@ def test_batched_gap_seeking_hysteresis_enters_and_exits_lcm(monkeypatch, tmp_pa
                 "forces": forces,
                 "E_mean_S0": 0.0,
                 "E_std_S0": uncertainty,
+                "F_mean_S0": forces.copy(),
                 "F_std_S0": np.full((3, 3), uncertainty),
                 "E_mean_S1": gap,
                 "E_std_S1": uncertainty,
+                "F_mean_S1": forces.copy(),
                 "F_std_S1": np.full((3, 3), uncertainty),
             }
 

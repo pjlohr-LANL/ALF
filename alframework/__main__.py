@@ -38,6 +38,9 @@ from alframework.tools.qm_batching import pyseqm_batch_size_from_qm_config
 from alframework.tools.molecule_payloads import flatten_molecule_output
 from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.budgeted_galf import (
+    update_budget_checkpoints, verify_handoff_inputs, verify_initial_ensemble,
+)
 #import logging
 #logging.basicConfig(level=logging.DEBUG)
 
@@ -367,6 +370,11 @@ if testing:
 ########################
     
 #If there is no data and no models, start boostrap jobs
+if master_config.get('accepted_frame_budget') and status['current_model_id'] < 0:
+    verify_handoff_inputs(master_config['master_directory'])
+    if status['current_training_id'] != 0:
+        raise RuntimeError('Initial training was interrupted; repair model-0000/status before retrying. Sampling is disabled.')
+
 if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
     print("Building Bootstrap Set")
     while QM_task_queue.get_exec_done_number() < master_config['bootstrap_set']:
@@ -442,14 +450,21 @@ if status['current_model_id'] < 0:
     else:
         print("Bootstrap network failed to train")
         print("User Investigation Required")
+        if master_config.get('accepted_frame_budget'):
+            raise RuntimeError('Initial ensemble training failed; GALF sampling was not enabled')
         exit()
 
 
 ##################################
 ## Step 6: Begin Active Learning #
 ##################################
+budget_reached = False
+if master_config.get('accepted_frame_budget'):
+    verify_initial_ensemble(master_config['master_directory'])
+    budget_reached = update_budget_checkpoints(master_config['master_directory'], status)
+
 master_loop_iter = 1
-while True:
+while not budget_reached:
     #Re-load configurations, but watch for stupid errors
     try:
         # Load the master configuration:
@@ -631,6 +646,16 @@ while True:
 #        with open('data-bk-{:04d}.pickle'.format(status['current_h5_id']),'wb') as pkbk: 
 #            pickle.dump(results_list,pkbk)
         status['current_h5_id'] = status['current_h5_id'] + 1
+        if master_config.get('accepted_frame_budget'):
+            budget_reached = update_budget_checkpoints(master_config['master_directory'], status, queues={
+                'builder': builder_task_queue, 'sampler': sampler_task_queue,
+                'QM': QM_task_queue, 'ML': ML_task_queue,
+            })
+            if budget_reached:
+                with open(master_config['status_path'], 'w') as outfile:
+                    json.dump(status, outfile, indent=2)
+                print('Accepted-frame budget reached; checkpoints frozen; stopping before more training.')
+                break
         task_input = build_input_dict(ml_task.func,
                                       [{"ML_config": ML_config}, *all_configs, status],
                                       raise_on_fail=True)
@@ -670,4 +695,8 @@ while True:
     
     master_loop_iter += 1
     time.sleep(60)
+
+if budget_reached:
+    # Shut down executor workers rather than leave submitted GPU tasks running.
+    parsl.dfk().cleanup()
 	

@@ -405,6 +405,7 @@ def train_single_excited_state_model(
                 targets=None,
             )
             arrays = database.arr_dict
+            dataset_frames = int(len(arrays[coordinates_key]))
             arrays[species_key] = arrays[species_key].to(torch.int64)
             for key, value in list(arrays.items()):
                 if hasattr(value, "dtype") and value.dtype == torch.float64:
@@ -419,6 +420,7 @@ def train_single_excited_state_model(
             database.make_random_split("valid", float(ML_config.get("valid_size", 0.1)))
             database.make_random_split("test", float(ML_config.get("test_size", 0.1)))
             database.split_the_rest("train")
+            split_frames = {name: int(len(split[coordinates_key])) for name, split in database.splits.items()}
 
             optimizer = torch.optim.AdamW(
                 training_modules.model.parameters(),
@@ -455,6 +457,8 @@ def train_single_excited_state_model(
 
             summary = {
                 "model_id": int(model_id),
+                "dataset_frames": dataset_frames,
+                "split_frames": split_frames,
                 "device": str(device),
                 "cuda_visible_devices": str(cuda_visible),
                 "state_table": state_table,

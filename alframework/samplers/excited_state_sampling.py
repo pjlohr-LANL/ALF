@@ -119,7 +119,7 @@ def _required_sampler_result_keys(state_table: list[dict[str, Any]]) -> list[str
     keys: list[str] = []
     for row in state_table:
         state = int(row["state"])
-        keys.extend([f"E_mean_S{state}", f"E_std_S{state}", f"F_std_S{state}"])
+        keys.extend([f"E_mean_S{state}", f"E_std_S{state}", f"F_mean_S{state}", f"F_std_S{state}"])
     return keys
 
 
@@ -498,6 +498,80 @@ def compute_excited_state_score(
     return float(sum(components.values()))
 
 
+FORCE_SCREEN_METADATA = {
+    "sampler_metadata_schema_version": 2,
+    "force_screen_source": "physical_state_mean",
+    "force_screen_scope": "all_states",
+}
+
+
+def _physical_forces(results, state_table, n_atoms):
+    forces = {}
+    for row in state_table:
+        state = int(row["state"])
+        key = f"F_mean_S{state}"
+        if key not in results:
+            raise ValueError(f"Physical force screening requires {key}; propagation forces cannot substitute.")
+        array = np.asarray(results[key], dtype=np.float64)
+        # HIPPYNN's ASE extra properties retain a singleton molecule axis;
+        # ALCHEMI results_for_graph already removes that axis.
+        if array.shape == (1, n_atoms, 3):
+            array = array[0]
+        if array.shape != (n_atoms, 3) or not np.isfinite(array).all():
+            raise ValueError(f"Physical force screening requires finite {key} with shape ({n_atoms}, 3); got {array.shape}.")
+        forces[state] = array
+    if not forces:
+        raise ValueError("Physical force screening requires at least one modeled state.")
+    return forces
+
+
+def _gap_bias_forces(physical, propagation, pair, active):
+    if not active:
+        return np.zeros_like(propagation)
+    if pair is None or any(int(state) not in physical for state in pair):
+        raise ValueError("Active GALF force diagnostics require both physical state forces.")
+    lo, hi = (int(state) for state in pair)
+    return propagation - 0.5 * (physical[lo] + physical[hi])
+
+
+def _screen_snapshot(atoms, results, metrics, state_table, *, step, time_ps, pair, active,
+                     reject_reason=None, failures=()):
+    """Detached same-frame data; call before rollback/freeze mutates atoms."""
+    physical = _physical_forces(results, state_table, len(atoms))
+    propagation = np.asarray(results["forces"], dtype=np.float64)
+    return json.loads(json.dumps({
+        **FORCE_SCREEN_METADATA,
+        "step": int(step), "time_ps": float(time_ps),
+        "positions": np.asarray(atoms.get_positions(), dtype=np.float64).copy(),
+        "chemical_symbols": atoms.get_chemical_symbols(),
+        "physical_forces_by_state": {str(state): value.copy() for state, value in physical.items()},
+        "propagation_forces": propagation.copy(),
+        "gap_bias_forces": _gap_bias_forces(physical, propagation, pair, active).copy(),
+        "gap_seeking_pair": list(pair) if pair is not None else None,
+        "gap_seeking_current_mode": "lcm_gap" if active else "direct",
+        "geometry_reject_reason": reject_reason, "geometry_screen_failures": list(failures),
+        "metrics": metrics,
+    }, default=_json_default))
+
+
+def _force_trace_fields(metrics):
+    return {key: metrics[key] for key in (
+        "physical_fmax_by_state", "propagation_fmax", "gap_bias_fmax",
+        "force_screen_source", "force_screen_scope", "energies", "gap_means", "gap_pairs", "state_energy_gaps",
+    )}
+
+
+def _initial_rejection_snapshot(atoms, screen):
+    # Initial topology rejection occurs before a model evaluation.
+    return json.loads(json.dumps({
+        **FORCE_SCREEN_METADATA, "step": 0, "time_ps": 0.0,
+        "positions": atoms.get_positions().copy(), "chemical_symbols": atoms.get_chemical_symbols(),
+        "physical_forces_by_state": None, "propagation_forces": None, "gap_bias_forces": None,
+        "geometry_reject_reason": screen["screen_reject_reason"],
+        "geometry_screen_failures": screen["screen_failures"], "metrics": screen,
+    }, default=_json_default))
+
+
 def _results_to_metrics(
     atoms,
     results: dict[str, Any],
@@ -506,6 +580,8 @@ def _results_to_metrics(
     selected_state: int,
     *,
     forces_override: np.ndarray | None = None,
+    gap_seeking_pair: list[int] | None = None,
+    gap_seeking_active: bool = False,
 ) -> dict[str, Any]:
     energies = {int(row["state"]): float(results[f"E_mean_S{int(row['state'])}"]) for row in state_table}
     energy_stds = {int(row["state"]): float(results[f"E_std_S{int(row['state'])}"]) for row in state_table}
@@ -541,17 +617,26 @@ def _results_to_metrics(
         forces = np.asarray(atoms.get_forces(), dtype=np.float64)
     else:
         forces = np.asarray(forces_override, dtype=np.float64)
+    if forces.shape != (len(atoms), 3) or not np.isfinite(forces).all():
+        raise ValueError("Propagation force diagnostics require finite forces shaped (n_atoms, 3).")
+    physical = _physical_forces(results, state_table, len(atoms))
+    physical_maxima = {str(state): float(np.linalg.norm(value, axis=1).max())
+                       for state, value in physical.items()}
+    bias = _gap_bias_forces(physical, forces, gap_seeking_pair, gap_seeking_active)
     all_distances = np.asarray(atoms.get_all_distances(mic=True), dtype=np.float64)
     np.fill_diagonal(all_distances, np.inf)
     nearest_neighbor_distances = all_distances.min(axis=1)
 
     return {
+        **FORCE_SCREEN_METADATA,
         "selected_state": int(selected_state),
         "energies": energies,
         "energy_stds": energy_stds,
         "gap_means": gap_means,
         "gap_stds": gap_stds,
         "gap_pairs": gap_pairs,
+        "state_energy_gaps": {_gap_key_from_pair(pair): energies[pair[1]] - energies[pair[0]]
+                              for pair in _adjacent_gap_pairs(list(energies))},
         "force_stds": force_stds,
         "uncertainty_state": uncertainty_state,
         "uE_selected": float(energy_stds[uncertainty_state]),
@@ -563,7 +648,10 @@ def _results_to_metrics(
         "min_gap": float(min_gap),
         "min_gap_pair": [int(pair[0]), int(pair[1])],
         "selected_energy_eV": float(energies[int(selected_state)]),
-        "fmax": float(np.linalg.norm(forces, axis=1).max()),
+        "fmax": max(physical_maxima.values()),
+        "physical_fmax_by_state": physical_maxima,
+        "propagation_fmax": float(np.linalg.norm(forces, axis=1).max()),
+        "gap_bias_fmax": float(np.linalg.norm(bias, axis=1).max()),
         "min_dist": float(all_distances.min()),
         "nearest_neighbor_distances": nearest_neighbor_distances.astype(float),
         "max_nearest_neighbor_distance": float(nearest_neighbor_distances.max()),
@@ -823,6 +911,8 @@ def _write_qm_candidate_xyz(
                     "selected_state": int(record["selected_state"]),
                     "min_dist": float(record["min_dist"]),
                     "fmax": float(record["fmax"]),
+                    "force_screen_source": record["force_screen_source"],
+                    "propagation_fmax": float(record["propagation_fmax"]),
                 }
             )
             write(handle, atoms, format="xyz")
@@ -903,6 +993,10 @@ def run_excited_state_sampling_batch(
             molecule.get_moleculeid(),
             {
                 **molecule.get_metadata(),
+                **FORCE_SCREEN_METADATA,
+                "initial_positions": atoms.get_positions().copy(),
+                "last_valid_snapshot": None,
+                "rejected_snapshot": _initial_rejection_snapshot(atoms, initial_screen),
                 "best_candidate": None,
                 "top_candidates": [],
                 "geometry_reject_reason": initial_screen["screen_reject_reason"],
@@ -987,6 +1081,7 @@ def run_excited_state_sampling_batch(
         if row["force_node_base"] is not None:
             force_base = ensemble_graph.node_from_name(str(row["force_node_base"]))
             force_node_by_state[state] = force_base
+            extra_properties[f"F_mean_S{state}"] = force_base.mean
             extra_properties[f"F_std_S{state}"] = force_base.std
     for row in gap_table:
         gap_base = ensemble_graph.node_from_name(str(row["gap_node_base"]))
@@ -1065,7 +1160,12 @@ def run_excited_state_sampling_batch(
     replica_stop_reasons: list[str | None] = [None for _ in molecule_objects]
     replica_screen_failures: list[list[str]] = [[] for _ in molecule_objects]
     topology_last_valid_steps: list[int] = [0 for _ in molecule_objects]
-    last_valid_positions = [np.asarray(atoms.get_positions(), dtype=np.float64).copy() for atoms in atoms_list]
+    initial_positions = [np.asarray(atoms.get_positions(), dtype=np.float64).copy() for atoms in atoms_list]
+    last_valid_positions = [positions.copy() for positions in initial_positions]
+    last_valid_snapshots = [None for _ in molecule_objects]
+    rejected_snapshots = [None for _ in molecule_objects]
+    per_molecule_min_gap_trace = [[] for _ in molecule_objects]
+    per_molecule_active_gap_trace = [[] for _ in molecule_objects]
     top_candidates: list[dict[str, Any]] = []
     per_molecule_records: list[list[dict[str, Any]]] = [[] for _ in molecule_objects]
     rejected_qm_candidates_min_distance: list[int] = [0 for _ in molecule_objects]
@@ -1258,6 +1358,8 @@ def run_excited_state_sampling_batch(
                     gap_table,
                     selected_state,
                     forces_override=np.asarray(graph_results["forces"], dtype=np.float64),
+                    gap_seeking_pair=gap_seeking_pair,
+                    gap_seeking_active=gap_seeking_lcm_active,
                 )
                 screen = _geometry_screen(
                     atoms_list[graph_index],
@@ -1266,14 +1368,27 @@ def run_excited_state_sampling_batch(
                     topology,
                 )
                 metrics.update(screen)
+            if gap_seeking_enabled:
+                infos = _gap_infos_from_metric_data(metrics, list(gap_seeking_settings["pairs"]))
+                if infos:
+                    stamp = {"step": current_step, "time_ps": current_step * dt / 1000.0}
+                    per_molecule_min_gap_trace[graph_index].append(
+                        {**stamp, **min(infos, key=lambda item: item["abs_gap_eV"])})
+                    for info in infos:
+                        if info["pair"] == gap_seeking_pair:
+                            per_molecule_active_gap_trace[graph_index].append({**stamp, **info})
+                            break
             current_temperature = float(temperatures[graph_index])
             current_total_energy = float(np.asarray(graph_results["energy"]).reshape(-1)[0] + kinetic[graph_index])
             per_molecule_geometry_trace[graph_index].append(
                 {
                     "step": int(current_step),
-                    "time_ps": float(current_time_ps),
+                    "time_ps": float(current_step * dt) / 1000.0,
                     "min_dist": float(metrics["min_dist"]),
                     "fmax": float(metrics["fmax"]),
+                    **_force_trace_fields(metrics),
+                    "gap_seeking_pair": list(gap_seeking_pair) if gap_seeking_pair is not None else None,
+                    "gap_seeking_current_mode": "lcm_gap" if gap_seeking_lcm_active else "direct",
                     "max_nearest_neighbor_distance": float(metrics["max_nearest_neighbor_distance"]),
                     "nearest_neighbor_distances": np.asarray(metrics["nearest_neighbor_distances"], dtype=float),
                     "screen_reject_reason": metrics["screen_reject_reason"],
@@ -1297,7 +1412,16 @@ def run_excited_state_sampling_batch(
                 if float(metrics["max_nearest_neighbor_distance"]) > max_nn_cutoff:
                     stop_reason = "max_nearest_neighbor_distance"
                     screen_failures = ["max_nearest_neighbor_distance"]
+            snapshot = _screen_snapshot(
+                atoms_list[graph_index], graph_results, metrics, state_table,
+                step=current_step, time_ps=current_step * dt / 1000.0,
+                pair=gap_seeking_pair, active=gap_seeking_lcm_active,
+                reject_reason=stop_reason, failures=screen_failures,
+            )
+            snapshot["integration_step"] = int(dyn.nsteps)
+            snapshot["integration_time_ps"] = float(dyn.nsteps * dt) / 1000.0
             if stop_reason is not None:
+                rejected_snapshots[graph_index] = snapshot
                 active[graph_index] = False
                 replica_stop_reasons[graph_index] = str(stop_reason)
                 replica_screen_failures[graph_index] = screen_failures
@@ -1306,6 +1430,7 @@ def run_excited_state_sampling_batch(
                     dyn.freeze_graph(graph_index, positions=last_valid_positions[graph_index])
                 continue
 
+            last_valid_snapshots[graph_index] = snapshot
             last_valid_positions[graph_index] = np.asarray(
                 atoms_list[graph_index].get_positions(), dtype=np.float64
             ).copy()
@@ -1322,7 +1447,7 @@ def run_excited_state_sampling_batch(
                 "score_gap_uncertainty_key": None,
                 "score_gap_uncertainty_std": None,
                 "step": int(current_step),
-                "time_ps": float(current_time_ps),
+                "time_ps": float(current_step * dt) / 1000.0,
                 "selected_state": int(selected_state),
                 "batch_index": int(graph_index),
                 "batch_size": int(actual_batch_size),
@@ -1407,6 +1532,10 @@ def run_excited_state_sampling_batch(
             "topology_last_valid_step": int(topology_last_valid_steps[graph_index]),
             "rejected_qm_candidates_min_distance": int(rejected_qm_candidates_min_distance[graph_index]),
             "rejected_qm_candidates_screening": int(rejected_qm_candidates_screening[graph_index]),
+            **FORCE_SCREEN_METADATA,
+            "initial_positions": initial_positions[graph_index].copy(),
+            "last_valid_snapshot": last_valid_snapshots[graph_index],
+            "rejected_snapshot": rejected_snapshots[graph_index],
             "geometry_metrics_trace": per_molecule_geometry_trace[graph_index],
             "max_nearest_neighbor_distance": last_geometry_metrics.get("max_nearest_neighbor_distance"),
             "nearest_neighbor_distances": last_geometry_metrics.get("nearest_neighbor_distances"),
@@ -1448,8 +1577,8 @@ def run_excited_state_sampling_batch(
             "gap_seeking_trigger_molecule_id": gap_seeking_trigger_molecule_id,
             "gap_seeking_trigger_batch_index": gap_seeking_trigger_batch_index,
             "gap_seeking_switch_events": gap_seeking_switch_events,
-            "gap_seeking_min_gap_trace": [],
-            "gap_seeking_active_pair_gap_trace": [],
+            "gap_seeking_min_gap_trace": per_molecule_min_gap_trace[graph_index],
+            "gap_seeking_active_pair_gap_trace": per_molecule_active_gap_trace[graph_index],
             "udd_enabled": False,
         }
         meta_dict.update(molecule.get_metadata())
@@ -1501,6 +1630,10 @@ def run_excited_state_sampling(
     if not bool(initial_screen["screen_valid"]):
         rejection_metadata = {
             **molecule_object.get_metadata(),
+            **FORCE_SCREEN_METADATA,
+            "initial_positions": molecule_object.get_atoms().get_positions().copy(),
+            "last_valid_snapshot": None,
+            "rejected_snapshot": _initial_rejection_snapshot(molecule_object.get_atoms(), initial_screen),
             "best_candidate": None,
             "top_candidates": [],
             "geometry_reject_reason": initial_screen["screen_reject_reason"],
@@ -1572,6 +1705,7 @@ def run_excited_state_sampling(
         if row["force_node_base"] is not None:
             force_base = ensemble_graph.node_from_name(str(row["force_node_base"]))
             force_node_by_state[state] = force_base
+            extra_properties[f"F_mean_S{state}"] = force_base.mean
             extra_properties[f"F_std_S{state}"] = force_base.std
     for row in gap_table:
         gap_base = ensemble_graph.node_from_name(str(row["gap_node_base"]))
@@ -1811,7 +1945,10 @@ def run_excited_state_sampling(
     geometry_metrics_trace: list[dict[str, Any]] = []
     geometry_screen_failures: list[str] = []
     topology_last_valid_step = 0
-    last_valid_positions = np.asarray(ase_atoms.get_positions(), dtype=np.float64).copy()
+    initial_positions = np.asarray(ase_atoms.get_positions(), dtype=np.float64).copy()
+    last_valid_positions = initial_positions.copy()
+    last_valid_snapshot = None
+    rejected_snapshot = None
     gap_seeking_min_gap_trace: list[dict[str, Any]] = []
     gap_seeking_active_pair_gap_trace: list[dict[str, Any]] = []
     gap_seeking_switch_events: list[dict[str, Any]] = []
@@ -2133,11 +2270,16 @@ def run_excited_state_sampling(
                         gap_table,
                         selected_state,
                         forces_override=np.asarray(results["forces"], dtype=np.float64),
+                        gap_seeking_pair=gap_seeking_pair,
+                        gap_seeking_active=gap_seeking_lcm_active,
                     )
             else:
                 results = _fresh_ase_results(step=current_step, context="post_md_chunk")
                 with timing.scope("metrics"):
-                    metrics = _results_to_metrics(ase_atoms, results, state_table, gap_table, selected_state)
+                    metrics = _results_to_metrics(
+                        ase_atoms, results, state_table, gap_table, selected_state,
+                        gap_seeking_pair=gap_seeking_pair, gap_seeking_active=gap_seeking_lcm_active,
+                    )
             with timing.scope("metrics"):
                 screen = _geometry_screen(ase_atoms, metrics, sampler_config, topology)
                 metrics.update(screen)
@@ -2187,9 +2329,12 @@ def run_excited_state_sampling(
             geometry_metrics_trace.append(
                 {
                     "step": int(current_step),
-                    "time_ps": float(current_time_ps),
+                    "time_ps": float(current_step * dt) / 1000.0,
                     "min_dist": float(metrics["min_dist"]),
                     "fmax": float(metrics["fmax"]),
+                    **_force_trace_fields(metrics),
+                    "gap_seeking_pair": list(gap_seeking_pair) if gap_seeking_pair is not None else None,
+                    "gap_seeking_current_mode": "lcm_gap" if gap_seeking_lcm_active else "direct",
                     "max_nearest_neighbor_distance": float(metrics["max_nearest_neighbor_distance"]),
                     "nearest_neighbor_distances": np.asarray(metrics["nearest_neighbor_distances"], dtype=float),
                     "screen_reject_reason": metrics["screen_reject_reason"],
@@ -2213,13 +2358,23 @@ def run_excited_state_sampling(
                 if float(metrics["max_nearest_neighbor_distance"]) > max_nn_cutoff:
                     geometry_reject_reason = "max_nearest_neighbor_distance"
                     geometry_screen_failures = ["max_nearest_neighbor_distance"]
+            snapshot = _screen_snapshot(
+                ase_atoms, results, metrics, state_table, step=current_step,
+                time_ps=current_step * dt / 1000.0, pair=gap_seeking_pair,
+                active=gap_seeking_lcm_active, reject_reason=geometry_reject_reason,
+                failures=geometry_screen_failures,
+            )
+            snapshot["integration_step"] = int(getattr(dyn, "nsteps", current_step))
+            snapshot["integration_time_ps"] = float(snapshot["integration_step"] * dt) / 1000.0
             if geometry_reject_reason is not None:
+                rejected_snapshot = snapshot
                 hard_close_contact = geometry_reject_reason == "min_distance"
                 ase_atoms.set_positions(last_valid_positions)
                 if use_alchemi and hasattr(dyn, "freeze_graph"):
                     dyn.freeze_graph(0, positions=last_valid_positions)
                 break
 
+            last_valid_snapshot = snapshot
             last_valid_positions = np.asarray(ase_atoms.get_positions(), dtype=np.float64).copy()
             topology_last_valid_step = int(current_step)
 
@@ -2248,7 +2403,7 @@ def run_excited_state_sampling(
                     "score_gap_uncertainty_key": score_gap_uncertainty_key,
                     "score_gap_uncertainty_std": score_gap_uncertainty_std,
                     "step": int((step_index + 1) * ncheck),
-                    "time_ps": float(current_time_ps),
+                    "time_ps": float(current_step * dt) / 1000.0,
                     "selected_state": int(selected_state),
                     "gap_seeking_switched": bool(gap_seeking_switched),
                     "gap_seeking_current_mode": "lcm_gap" if gap_seeking_lcm_active else "direct",
@@ -2306,6 +2461,10 @@ def run_excited_state_sampling(
         "topology_last_valid_step": int(topology_last_valid_step),
         "rejected_qm_candidates_min_distance": int(rejected_qm_candidates_min_distance),
         "rejected_qm_candidates_screening": int(rejected_qm_candidates_screening),
+        **FORCE_SCREEN_METADATA,
+        "initial_positions": initial_positions.copy(),
+        "last_valid_snapshot": last_valid_snapshot,
+        "rejected_snapshot": rejected_snapshot,
         "geometry_metrics_trace": geometry_metrics_trace,
         "max_nearest_neighbor_distance": last_geometry_metrics.get("max_nearest_neighbor_distance"),
         "nearest_neighbor_distances": last_geometry_metrics.get("nearest_neighbor_distances"),
