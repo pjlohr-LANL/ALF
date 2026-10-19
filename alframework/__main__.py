@@ -32,7 +32,7 @@ from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.dataset_screening import print_dataset_screening_summary
 from alframework.tools.dataset_screening import screen_and_store_dataset
-from alframework.samplers.debug_validation import validate_sampler_debug_output
+from alframework.tools.sampling_validation import validate_sampler_debug_output
 from alframework.tools.sampler_batching import SamplerBatchBuffer
 from alframework.tools.sampler_batching import configured_sampler_calculator_status
 from alframework.tools.sampler_batching import flatten_molecule_output

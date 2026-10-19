@@ -31,3 +31,21 @@ recorded. The directory is opt-in and independent of candidate acquisition.
 
 Propagation, ensemble uncertainties, cutoffs, objectives, and independent
 per-replica stay-fixed gap switching are unchanged.
+
+## Module boundaries
+
+Shared screening policy, physical-force maxima, artificial-force diagnostics,
+cutoff checks, and audit snapshots live in `alframework/tools/force_screen.py`.
+Configuration/input checks, calculator-output shape/finiteness checks, and
+`--test_sampler` output validation live in
+`alframework/tools/sampling_validation.py`. These modules do not import sampler
+implementations. Torch is imported locally only when processing tensors;
+configuration and debug helpers work without the optional GPU stack.
+
+The sampler obtains predictions, delegates numerical validation and screening,
+and executes the resulting strategy decisions (candidate acquisition, replica
+freezing, and independent LCM switching). Runtime execution guards stay alongside
+the strategy. Public sampler configuration functions and calculator methods
+retain their existing import locations/signatures through delegates. The old
+`samplers/force_screen.py` and `samplers/debug_validation.py` helper files have
+been removed; their implementation is under tools, without shim modules.

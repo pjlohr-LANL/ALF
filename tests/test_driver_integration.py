@@ -16,7 +16,7 @@ from ase import Atoms
 
 from alframework.tools import tools as tool_module
 from alframework.tools.molecules_class import MoleculesObject
-from alframework.samplers.debug_validation import validate_sampler_debug_output
+from alframework.tools.sampling_validation import validate_sampler_debug_output
 
 
 class DriverFinished(Exception):

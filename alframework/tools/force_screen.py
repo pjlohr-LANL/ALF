@@ -30,9 +30,7 @@ def physical_force_exceeds(diagnostics, cutoff):
     """Equality passes. Missing and invalid screening values never pass silently."""
     if cutoff is None:
         return False
-    cutoff = float(cutoff)
-    if not np.isfinite(cutoff) or cutoff < 0:
-        raise ValueError("max_force_cutoff must be finite and nonnegative.")
+    cutoff = validated_force_cutoff(cutoff)
     value = diagnostics.get("Fmeanmax")
     if value is None or np.asarray(value).shape != () or not np.isfinite(value) or value < 0:
         raise ValueError("Physical force screen requires a finite nonnegative Fmeanmax.")
@@ -97,3 +95,42 @@ class ForceScreenAudit:
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(_json_value(self.data), indent=2, allow_nan=False) + "\n")
         temporary.replace(self.path)
+
+
+def validated_force_cutoff(cutoff, *, positive=False):
+    """Validate a screening cutoff, retaining the configuration's positive rule."""
+    value = float(cutoff)
+    if not np.isfinite(value) or value < 0 or (positive and value == 0):
+        if positive:
+            raise ValueError("max_force_cutoff must be finite and positive when provided.")
+        raise ValueError("max_force_cutoff must be finite and nonnegative.")
+    return value
+
+
+def physical_force_diagnostics(state_results, num_graphs):
+    """Max atom norm of each physical ensemble mean, then max over states."""
+    import torch
+
+    maxima = {f"physical_F{state}_max": torch.linalg.vector_norm(
+        result["forces"].reshape(num_graphs, -1, 3), dim=2).amax(dim=1)
+        for state, result in state_results.items()}
+    return {**maxima, "Fmeanmax": torch.stack(list(maxima.values())).amax(dim=0)}
+
+
+def lcm_force_diagnostics(lcm_forces, selected_physical_forces, lcm_correction):
+    """Separate total LCM bias from the correction to pair-average forces."""
+    import torch
+
+    return {"lcm_bias_Fmax": torch.linalg.vector_norm(
+                lcm_forces - selected_physical_forces, dim=2).amax(dim=1),
+            "lcm_correction_Fmax": torch.linalg.vector_norm(lcm_correction, dim=2).amax(dim=1)}
+
+
+def propagation_force_diagnostics(propagation_forces, well_forces):
+    """Propagation includes artificial forces; its maximum is not eligibility."""
+    import torch
+
+    return {"confinement_Fmax": (
+                torch.zeros(propagation_forces.shape[0], device=propagation_forces.device)
+                if well_forces is None else torch.linalg.vector_norm(well_forces, dim=2).amax(dim=1)),
+            "propagation_Fmax": torch.linalg.vector_norm(propagation_forces, dim=2).amax(dim=1)}

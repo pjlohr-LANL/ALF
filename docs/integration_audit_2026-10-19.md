@@ -41,8 +41,9 @@ performed. No prototype budget orchestration or analysis utilities were ported.
    rewritten. The upstream storage test is restored verbatim; a fork-only NAC
    round-trip assertion now expects the required atom permutation. See
    [storage_identity.md](storage_identity.md).
-3. **Driver cleanup and this audit.** The driver delegates its optional sampler
-   debug checks to `samplers/debug_validation.py`. No GPU, selected-state,
+3. **`ce7b0ec` — driver cleanup and the initial audit.** The driver delegates
+   its optional sampler debug checks to a helper. That helper initially lived
+   under samplers; the tools-boundary follow-up below supersedes that location. No GPU, selected-state,
    topology-debug assertion, or physical-force-screen implementation lives in
    the core driver. Real entry-point tests cover local asynchronous bootstrap,
    four-member training completion flags, sampling, nested outputs, QM storage,
@@ -58,7 +59,7 @@ including changes predating this integration.
 
 | Existing file | Delta (added/removed) | Why it remains necessary |
 |---|---:|---|
-| `alframework/__main__.py` | 199 / 39 | Generic batching and strict-full buffering; replica-based queue capacity; task argument/config reload support; nested result flattening; storage acceptance hooks and summaries; a sampler-owned debug-validation call. The storage trigger uses `>=` so an exact threshold can retrain. |
+| `alframework/__main__.py` | 199 / 39 | Generic batching and strict-full buffering; replica-based queue capacity; task argument/config reload support; nested result flattening; storage acceptance hooks and summaries; a tools-owned debug-validation call. The storage trigger uses `>=` so an exact threshold can retrain. |
 | `alframework/builders/builders.py` | 5 / 0 | Optional explicit PBC override for molecular CFG inputs; omitted settings retain main behavior. |
 | `alframework/tools/tools.py` | 88 / 1 | `pair_atomic` storage and electronic-state pair metadata; validated, opt-in topology ID persistence. Main's sorting contract is restored; stable ties are deterministic. |
 | `setup.py` | 17 / 1 | Optional excited-state, HIPPYNN, and GPU-dynamics dependencies, keeping base installs usable. |
@@ -146,3 +147,17 @@ raise SystemExit(pytest.main([
     '--basetemp=/ram/tmp/alf_main_contract_integration',
 ]))
 ```
+
+## Tools-boundary follow-up
+
+The three integration commits above are retained. The subsequent refactor moves
+reusable validation into `tools/sampling_validation.py` and force-screen policy,
+metrics, diagnostics, and audit support into `tools/force_screen.py`. Samplers
+retain execution and acquisition strategies and call these helpers. The driver
+imports debug validation from tools. There are no helper shim files left under
+samplers and tools do not import sampler implementations. Optional Torch imports
+are confined to numerical helper functions.
+
+The follow-up retains the current sampling cutoff, diagnostic schema, audit
+format, propagation, and switching behavior. Upstream-style training force
+filters and the optional post-QM storage screen remain separate policies.

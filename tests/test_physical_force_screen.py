@@ -10,7 +10,7 @@ from alframework.samplers.alchemi_sampling import (
     ALFAlchemiCalculator, ALFASEAlchemiModel, ALFNativeEnsembleModel,
     run_alchemi_sampling,
 )
-from alframework.samplers.force_screen import SCHEMA, SOURCE, physical_force_exceeds
+from alframework.tools.force_screen import SCHEMA, SOURCE, physical_force_exceeds
 from tests.test_alchemi_sampling import (
     _torch_batch, _gap_row, _molecule, _config, FakeModel, FakeRunner,
     _topology_molecule, _reference_topology, _enable_topology, TopologyMutationRunner,

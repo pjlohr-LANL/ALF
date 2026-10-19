@@ -14,31 +14,42 @@ from typing import Any, Callable
 
 import numpy as np
 from ase import Atoms, units
-from ase.calculators.calculator import Calculator, all_changes
+from ase.calculators.calculator import all_changes
 from parsl import python_app
 
-from alframework.samplers.force_screen import (
+from alframework.tools.sampling_validation import (
+    _configured_replica_candidate_limit, _configured_return_top_k,
+    _physical_force_states, _validate_sampling_inputs, configured_alchemi_gap_rows,
+    configured_score,
+    normalize_energy_contributions, normalize_contributions, validated_batch_shape,
+    validate_required_physical_states, validate_model_count,
+    normalize_gap_contributions, normalize_uncertainty_override,
+    validate_ase_results, validate_ase_force_shape, native_state_contributions,
+    validate_native_results, hippynn_members_first, hippynn_state_table,
+    validate_numeric_range, validate_temperature_period, uncertainty_cutoffs,
+    validated_numpy_contributions, validate_dynamics_parameters, validate_friction,
+    validate_alchemi_device, validate_gap_model, gap_seeking_settings_for_model,
+    validate_score_diagnostics, validated_seeking_gap, _gap_candidate_metadata,
+    validate_topology_identities, validate_native_models, validate_ase_calculators,
+    validate_hippynn_options,
+)
+# Public configuration helpers remain importable from this sampler module.
+from alframework.tools.sampling_validation import (
+    SCORE_WEIGHT_KEYS as SCORE_WEIGHT_KEYS,
+    configured_gap_diagnostics as configured_gap_diagnostics,
+    configured_gap_seeking as configured_gap_seeking,
+)
+from alframework.tools.force_screen import (
     SCHEMA, SOURCE, ForceScreenAudit, force_screen_metadata, physical_force_exceeds,
+    physical_force_diagnostics, lcm_force_diagnostics, propagation_force_diagnostics,
 )
 from alframework.tools.atom_order import canonicalize_tagged_atoms, attach_topology_ids
-from alframework.tools.excited_state_tools import (
-    _gap_state_index,
-    derive_gap_property_table,
-    derive_state_property_table,
-    gap_key_for_pair,
-    parse_gap_key,
-)
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.molecular_topology import (
     TopologyValidationResult,
     load_reference_topology,
     topology_metadata,
     validate_fixed_topology,
-)
-from alframework.tools.sampler_batching import (
-    sampler_batch_size,
-    selected_state,
-    validate_state_selection,
 )
 from alframework.tools.tools import annealing_schedule, load_module_from_string
 
@@ -80,12 +91,7 @@ def calculate_uncertainty(
 ) -> dict[str, float]:
     """Calculate the exact population statistics used by production MLMD."""
 
-    energies = np.asarray(energy_contributions, dtype=float)
-    forces = np.asarray(force_contributions, dtype=float)
-    if energies.shape[0] != forces.shape[0]:
-        raise ValueError("Energy and force contributions must have the same model count.")
-    if energies.shape[0] < 1:
-        raise ValueError("At least one model contribution is required.")
+    energies, forces = validated_numpy_contributions(energy_contributions, force_contributions)
     force_stdev = np.std(forces, axis=0)
     return {
         "Es": float(np.std(energies)),
@@ -102,10 +108,7 @@ def uncertainty_flags(
 ) -> dict[str, Any]:
     """Apply ALF's existing energy, mean-force, and max-force thresholds."""
 
-    energy_cutoff = float(Escut)
-    force_cutoff = float(Fscut)
-    if energy_cutoff <= 0 or force_cutoff <= 0:
-        raise ValueError("Escut and Fscut must be positive for ALCHEMI sampling.")
+    energy_cutoff, force_cutoff = uncertainty_cutoffs(Escut, Fscut)
     Es = float(diagnostics["Es"])
     Fs = float(diagnostics["Fs"])
     Fsmax = float(diagnostics["Fsmax"])
@@ -137,24 +140,7 @@ def uncertainty_flags(
 
 
 def _sample_range(rng: np.random.Generator, value: Any, name: str) -> float:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError(
-            f"{name} must be a two-value numeric range [minimum, maximum]."
-        )
-    try:
-        lower, upper = (float(value[0]), float(value[1]))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{name} must contain two finite numeric values; received {value!r}."
-        ) from exc
-    if not np.isfinite(lower) or not np.isfinite(upper):
-        raise ValueError(
-            f"{name} must contain two finite numeric values; received {value!r}."
-        )
-    if lower > upper:
-        raise ValueError(
-            f"{name} minimum must not exceed its maximum; received {value!r}."
-        )
+    lower, upper = validate_numeric_range(value, name)
     return float(rng.uniform(lower, upper))
 
 
@@ -173,12 +159,7 @@ def _temperature_parameters(
             "Tsrt": _sample_range(rng, sampler_config.get("srt_temp"), "srt_temp"),
             "Tend": _sample_range(rng, sampler_config.get("end_temp"), "end_temp"),
         }
-        if row["Tper"] <= 0:
-            raise ValueError(
-                "per_temp sampled a nonpositive temperature period "
-                f"({row['Tper']}) for replica {replica_index}; configure "
-                "strictly positive period bounds."
-            )
+        validate_temperature_period(row["Tper"], replica_index)
         parameters.append(row)
     return parameters
 
@@ -197,217 +178,6 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
         int(record["batch_index"]),
         str(record["parent_molecule_id"]),
     )
-
-
-SCORE_WEIGHT_KEYS = ("w_energy", "w_force", "w_gap_uncertainty")
-
-
-def _score_weight(raw: dict[str, Any], name: str) -> float:
-    """Return one validated, nonnegative scoring weight."""
-
-    value = raw.get(name, 0.0)
-    if isinstance(value, bool):
-        raise ValueError(f"score.{name} must be a nonnegative number.")
-    try:
-        weight = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"score.{name} must be a nonnegative number; received {value!r}."
-        ) from exc
-    if not np.isfinite(weight) or weight < 0:
-        raise ValueError(
-            f"score.{name} must be finite and nonnegative; received {value!r}."
-        )
-    return weight
-
-
-def _score_gap_rows(
-    raw: dict[str, Any],
-    sampler_config: dict[str, Any],
-    properties_list: dict[str, Any] | None,
-    selected_state_value: int | None,
-) -> list[dict[str, Any]]:
-    """Resolve the state pairs whose ensemble gap deviation the score consumes.
-
-    Pairs are declared inside the ``score`` block rather than through ``dE#``
-    entries in ``properties_list``. The deviation is derived from per-member
-    state energies the model already predicts, so no trained gap head, HDF5
-    dataset, or QM-interface change is required.
-    """
-
-    if (
-        str(sampler_config.get("model_mode", "ground_state")).strip().lower()
-        != "excited_state"
-    ):
-        raise ValueError(
-            "score.w_gap_uncertainty > 0 requires model_mode='excited_state'."
-        )
-    if properties_list is None:
-        raise ValueError(
-            "score.w_gap_uncertainty > 0 requires properties_list so gap "
-            "state pairs can be validated."
-        )
-    available = sorted(
-        int(row["state"]) for row in derive_state_property_table(properties_list)
-    )
-    if len(available) < 2:
-        raise ValueError(
-            "score.w_gap_uncertainty > 0 requires at least two excited-state "
-            f"energies in properties_list; found states {available}."
-        )
-
-    raw_pairs = raw.get("gap_pairs", "selected_adjacent")
-    if isinstance(raw_pairs, str):
-        mode = raw_pairs.strip().lower()
-        if mode == "adjacent":
-            pair_items = [
-                (lower, upper)
-                for lower, upper in zip(available, available[1:])
-                if upper == lower + 1
-            ]
-        elif mode == "selected_adjacent":
-            if selected_state_value is None:
-                raise ValueError(
-                    "score.gap_pairs='selected_adjacent' requires a resolved "
-                    "selected state for the batch."
-                )
-            selected = int(selected_state_value)
-            candidate_pairs = ((selected - 1, selected), (selected, selected + 1))
-            pair_items = [
-                (lower, upper)
-                for lower, upper in candidate_pairs
-                if lower in set(available) and upper in set(available)
-            ]
-            if not pair_items:
-                raise ValueError(
-                    "score.gap_pairs='selected_adjacent' found no adjacent "
-                    f"state pair for selected state {selected}; available "
-                    f"states are {available}."
-                )
-        else:
-            raise ValueError(
-                "score.gap_pairs must be 'selected_adjacent', 'adjacent', or a "
-                f"list of state pairs; received {raw_pairs!r}."
-            )
-    elif isinstance(raw_pairs, (list, tuple)):
-        if not raw_pairs:
-            raise ValueError("score.gap_pairs must not be an empty list.")
-        pair_items = []
-        for index, pair in enumerate(raw_pairs):
-            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                raise ValueError(
-                    "Each score.gap_pairs entry must contain exactly two "
-                    f"states; entry {index} is {pair!r}."
-                )
-            lower = _gap_state_index(pair[0], context=f"score.gap_pairs[{index}][0]")
-            upper = _gap_state_index(pair[1], context=f"score.gap_pairs[{index}][1]")
-            if lower == upper:
-                raise ValueError(
-                    f"score.gap_pairs entry {index} cannot reference one state "
-                    "twice."
-                )
-            if lower > upper:
-                lower, upper = upper, lower
-            pair_items.append((lower, upper))
-    else:
-        raise TypeError(
-            "score.gap_pairs must be a string or a list of state pairs."
-        )
-
-    unavailable = sorted(
-        {
-            state
-            for lower, upper in pair_items
-            for state in (lower, upper)
-            if state not in set(available)
-        }
-    )
-    if unavailable:
-        raise ValueError(
-            f"score.gap_pairs references states {unavailable} that are not "
-            f"present in properties_list; available states are {available}."
-        )
-
-    rows: list[dict[str, Any]] = []
-    seen: set[tuple[int, int]] = set()
-    for lower, upper in sorted(set(pair_items)):
-        if (lower, upper) in seen:
-            continue
-        seen.add((lower, upper))
-        rows.append(
-            {
-                "lower_state": int(lower),
-                "upper_state": int(upper),
-                "gap_key": gap_key_for_pair(lower, upper),
-            }
-        )
-    return rows
-
-
-def configured_score(
-    sampler_config: dict[str, Any],
-    properties_list: dict[str, Any] | None = None,
-    selected_state_value: int | None = None,
-) -> dict[str, Any]:
-    """Validate the optional candidate-scoring policy.
-
-    ``max`` mode reproduces ALF's normalized worst-violation score exactly.
-    ``sum`` mode ranks candidates by a weighted sum of the same normalized
-    ratios plus an ensemble gap-deviation term, so relative importance becomes
-    configurable while every term remains dimensionless.
-    """
-
-    raw = sampler_config.get("score")
-    if raw is None:
-        return {"mode": "max", "weights": {}, "gap_std_cut_eV": None, "gap_rows": []}
-    if not isinstance(raw, dict):
-        raise TypeError("score must be a dictionary when provided.")
-    allowed = {"mode", "gap_std_cut_eV", "gap_pairs", *SCORE_WEIGHT_KEYS}
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise ValueError("Unknown score options: " + ", ".join(unknown))
-
-    mode = str(raw.get("mode", "max")).strip().lower()
-    if mode not in {"max", "sum"}:
-        raise ValueError("score.mode must be either 'max' or 'sum'.")
-    if mode == "max":
-        return {"mode": "max", "weights": {}, "gap_std_cut_eV": None, "gap_rows": []}
-
-    weights = {name: _score_weight(raw, name) for name in SCORE_WEIGHT_KEYS}
-    if not any(weight > 0 for weight in weights.values()):
-        raise ValueError(
-            "score.mode='sum' requires at least one strictly positive weight; "
-            "received " + ", ".join(f"{k}={v}" for k, v in weights.items()) + "."
-        )
-
-    gap_std_cut: float | None = None
-    gap_rows: list[dict[str, Any]] = []
-    if weights["w_gap_uncertainty"] > 0:
-        if "gap_std_cut_eV" not in raw:
-            raise ValueError(
-                "score.w_gap_uncertainty > 0 requires score.gap_std_cut_eV."
-            )
-        try:
-            gap_std_cut = float(raw["gap_std_cut_eV"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "score.gap_std_cut_eV must be finite and positive; received "
-                f"{raw['gap_std_cut_eV']!r}."
-            ) from exc
-        if not np.isfinite(gap_std_cut) or gap_std_cut <= 0:
-            raise ValueError(
-                "score.gap_std_cut_eV must be finite and positive; received "
-                f"{raw['gap_std_cut_eV']!r}."
-            )
-        gap_rows = _score_gap_rows(
-            raw, sampler_config, properties_list, selected_state_value
-        )
-    return {
-        "mode": "sum",
-        "weights": weights,
-        "gap_std_cut_eV": gap_std_cut,
-        "gap_rows": gap_rows,
-    }
 
 
 def candidate_score(
@@ -436,14 +206,7 @@ def candidate_score(
         }
 
     weights = dict(score["weights"])
-    if "Fsrms" not in diagnostics:
-        raise ValueError(
-            "score.mode='sum' requires the Fsrms force deviation, which is "
-            "only available from a per-member ensemble. The single-calculator "
-            "uncertainty override supplies energy_stdev, forces_stdev_mean, "
-            "and forces_stdev_max only; use an ensemble calculator or "
-            "score.mode='max'."
-        )
+    gap_values = validate_score_diagnostics(diagnostics, score)
     components = {
         "energy_uncertainty": (
             weights["w_energy"] * float(diagnostics["Es"]) / float(Escut)
@@ -456,26 +219,7 @@ def candidate_score(
     gap_pair: list[int] | None = None
     gap_std: float | None = None
     if weights["w_gap_uncertainty"] > 0:
-        best: tuple[float, dict[str, Any]] | None = None
-        for row in score["gap_rows"]:
-            std_key = f"{row['gap_key']}_stdev"
-            if std_key not in diagnostics:
-                raise ValueError(
-                    f"score gap term requires calculator diagnostic {std_key!r}; "
-                    "the ALCHEMI calculator was built without that state pair."
-                )
-            value = float(diagnostics[std_key])
-            if not np.isfinite(value):
-                raise ValueError(
-                    f"score gap term received nonfinite {std_key}={value!r}."
-                )
-            if best is None or value > best[0]:
-                best = (value, row)
-        if best is None:
-            raise ValueError(
-                "score.w_gap_uncertainty > 0 resolved no gap state pairs."
-            )
-        gap_std, row = best
+        gap_std, row = max(gap_values, key=lambda item: item[0])
         gap_pair = [int(row["lower_state"]), int(row["upper_state"])]
         components["gap_uncertainty"] = (
             weights["w_gap_uncertainty"]
@@ -491,65 +235,6 @@ def candidate_score(
         "score_gap_pair": gap_pair,
         "score_gap_std": None if gap_std is None else float(gap_std),
     }
-
-
-def _configured_replica_candidate_limit(
-    sampler_config: dict[str, Any],
-) -> int | None:
-    """Return the validated per-replica candidate cap, or None for unlimited."""
-
-    value = sampler_config.get("max_candidates_per_replica")
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ValueError(
-            "max_candidates_per_replica must be a positive integer or null."
-        )
-    try:
-        limit = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            "max_candidates_per_replica must be a positive integer or null; "
-            f"received {value!r}."
-        ) from exc
-    if isinstance(value, float) and not value.is_integer():
-        raise ValueError(
-            "max_candidates_per_replica must be a positive integer or null; "
-            f"received {value!r}."
-        )
-    if limit < 1:
-        raise ValueError(
-            "max_candidates_per_replica must be at least one when provided."
-        )
-    return limit
-
-
-def _configured_return_top_k(sampler_config: dict[str, Any]) -> int:
-    """Return the validated per-task top-K candidate budget."""
-
-    if "return_top_n" in sampler_config:
-        raise ValueError(
-            "return_top_n was renamed to return_top_k; update the sampler "
-            "configuration. The old key is rejected rather than ignored "
-            "because silently falling back to the default would return one "
-            "candidate per task instead of the configured budget."
-        )
-    value = sampler_config.get("return_top_k", 1)
-    if isinstance(value, bool):
-        raise ValueError("return_top_k must be a positive integer.")
-    try:
-        limit = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            f"return_top_k must be a positive integer; received {value!r}."
-        ) from exc
-    if isinstance(value, float) and not value.is_integer():
-        raise ValueError(
-            f"return_top_k must be a positive integer; received {value!r}."
-        )
-    if limit < 1:
-        raise ValueError("return_top_k must be at least one.")
-    return limit
 
 
 def _prune_candidates(
@@ -580,220 +265,6 @@ def _prune_candidates(
     return ranked[: int(return_top_k)]
 
 
-def configured_gap_diagnostics(
-    sampler_config: dict[str, Any],
-    properties_list: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Return configured direct-gap diagnostics without loading a backend."""
-
-    raw = sampler_config.get("gap_diagnostics")
-    if raw is None:
-        return []
-    if isinstance(raw, bool):
-        enabled = raw
-    elif isinstance(raw, dict):
-        enabled = bool(raw.get("enabled", False))
-        unknown = sorted(set(raw) - {"enabled"})
-        if unknown:
-            raise ValueError(
-                "Unknown gap_diagnostics options: " + ", ".join(unknown)
-            )
-    else:
-        raise TypeError("gap_diagnostics must be a Boolean or dictionary.")
-    if not enabled:
-        return []
-    if (
-        str(sampler_config.get("model_mode", "ground_state")).strip().lower()
-        != "excited_state"
-    ):
-        raise ValueError(
-            "gap_diagnostics requires model_mode='excited_state'."
-        )
-    if properties_list is None:
-        raise ValueError(
-            "gap_diagnostics requires properties_list so state-gap pairs can "
-            "be validated."
-        )
-    rows = derive_gap_property_table(properties_list)
-    if not rows:
-        raise ValueError(
-            "gap_diagnostics.enabled=true requires at least one dE# system "
-            "property in properties_list."
-        )
-    return rows
-
-
-def configured_gap_seeking(
-    sampler_config: dict[str, Any],
-    properties_list: dict[str, Any] | None,
-    selected_state_value: int | None,
-) -> dict[str, Any]:
-    """Validate one-way, selected-adjacent LCM gap seeking."""
-
-    raw = sampler_config.get("gap_seeking")
-    if raw is None:
-        return {"enabled": False, "rows": []}
-    if not isinstance(raw, dict):
-        raise TypeError("gap_seeking must be a dictionary.")
-    enabled = bool(raw.get("enabled", False))
-    if not enabled:
-        return {"enabled": False, "rows": []}
-
-    allowed = {
-        "enabled",
-        "mode",
-        "switch_policy",
-        "candidate_pairs",
-        "trigger_gap_threshold_eV",
-        "sigma",
-        "alpha_eV",
-    }
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise ValueError(
-            "Unknown gap_seeking options: " + ", ".join(unknown)
-        )
-    if (
-        str(sampler_config.get("model_mode", "ground_state")).strip().lower()
-        != "excited_state"
-    ):
-        raise ValueError(
-            "gap_seeking requires model_mode='excited_state'."
-        )
-    mode = str(raw.get("mode", "")).strip().lower()
-    if mode != "levine_coe_martinez_switch":
-        raise ValueError(
-            "gap_seeking.mode must be 'levine_coe_martinez_switch'."
-        )
-    switch_policy = str(raw.get("switch_policy", "")).strip().lower()
-    if switch_policy != "stay_fixed":
-        raise ValueError(
-            "gap_seeking.switch_policy must be 'stay_fixed'; hysteresis and "
-            "LCM exit are not supported."
-        )
-    candidate_pairs = str(raw.get("candidate_pairs", "")).strip().lower()
-    if candidate_pairs != "adjacent":
-        raise ValueError(
-            "gap_seeking.candidate_pairs must be 'adjacent'."
-        )
-    required_parameters = (
-        "trigger_gap_threshold_eV",
-        "sigma",
-        "alpha_eV",
-    )
-    missing = [name for name in required_parameters if name not in raw]
-    if missing:
-        raise ValueError(
-            "Enabled gap_seeking requires explicit values for: "
-            + ", ".join(missing)
-        )
-    parameters: dict[str, float] = {}
-    for name in required_parameters:
-        try:
-            value = float(raw[name])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"gap_seeking.{name} must be finite and positive."
-            ) from exc
-        if not np.isfinite(value) or value <= 0:
-            raise ValueError(
-                f"gap_seeking.{name} must be finite and positive."
-            )
-        parameters[name] = value
-    if properties_list is None:
-        raise ValueError(
-            "gap_seeking requires properties_list so eligible dE# pairs can "
-            "be validated."
-        )
-    if selected_state_value is None:
-        raise ValueError(
-            "gap_seeking requires a resolved selected state for the batch."
-        )
-
-    selected = int(selected_state_value)
-    rows = [
-        dict(row)
-        for row in derive_gap_property_table(properties_list)
-        if int(row["upper_state"]) == int(row["lower_state"]) + 1
-        and selected in {
-            int(row["lower_state"]),
-            int(row["upper_state"]),
-        }
-    ]
-    rows.sort(
-        key=lambda row: (
-            int(row["lower_state"]),
-            int(row["upper_state"]),
-        )
-    )
-    if not rows:
-        raise ValueError(
-            "gap_seeking found no explicitly configured adjacent dE# property "
-            f"containing selected state {selected}."
-        )
-    state_rows = {
-        int(row["state"]): row
-        for row in derive_state_property_table(properties_list)
-    }
-    required_force_states = sorted(
-        {
-            int(state)
-            for row in rows
-            for state in (row["lower_state"], row["upper_state"])
-        }
-    )
-    missing_force_keys = [
-        f"F{state}"
-        for state in required_force_states
-        if state_rows[state]["force_key"] is None
-    ]
-    if missing_force_keys:
-        raise ValueError(
-            "gap_seeking requires force properties for every eligible LCM "
-            "state; missing " + ", ".join(missing_force_keys) + "."
-        )
-    return {
-        "enabled": True,
-        "mode": mode,
-        "switch_policy": switch_policy,
-        "candidate_pairs": candidate_pairs,
-        "selected_state": selected,
-        "rows": rows,
-        **parameters,
-    }
-
-
-def configured_alchemi_gap_rows(
-    sampler_config: dict[str, Any],
-    properties_list: dict[str, Any] | None,
-    selected_state_value: int | None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return the union of diagnostic, scoring, and dynamics-required gap rows."""
-
-    diagnostic_rows = configured_gap_diagnostics(
-        sampler_config,
-        properties_list,
-    )
-    seeking = configured_gap_seeking(
-        sampler_config,
-        properties_list,
-        selected_state_value,
-    )
-    score = configured_score(
-        sampler_config,
-        properties_list,
-        selected_state_value,
-    )
-    rows: list[dict[str, Any]] = []
-    seen: set[tuple[int, int]] = set()
-    for row in [*diagnostic_rows, *seeking["rows"], *score["gap_rows"]]:
-        pair = (int(row["lower_state"]), int(row["upper_state"]))
-        if pair not in seen:
-            seen.add(pair)
-            rows.append(dict(row))
-    return rows, seeking
-
-
 def select_gap_seeking_trigger(
     diagnostics: dict[str, Any],
     settings: dict[str, Any],
@@ -805,15 +276,7 @@ def select_gap_seeking_trigger(
     candidates = []
     for row in settings["rows"]:
         gap_key = str(row["gap_key"])
-        if gap_key not in diagnostics:
-            raise KeyError(
-                f"gap_seeking requires calculator diagnostic {gap_key!r}."
-            )
-        gap = float(diagnostics[gap_key])
-        if not np.isfinite(gap):
-            raise ValueError(
-                f"gap_seeking received nonfinite diagnostic {gap_key}={gap!r}."
-            )
+        gap = validated_seeking_gap(diagnostics, gap_key)
         candidates.append(
             {
                 "pair": [
@@ -838,125 +301,6 @@ def select_gap_seeking_trigger(
     ):
         return None
     return trigger
-
-
-def _gap_candidate_metadata(
-    diagnostics: dict[str, Any],
-) -> dict[str, Any]:
-    means: dict[str, float] = {}
-    stdevs: dict[str, float] = {}
-    pairs: dict[str, list[int]] = {}
-    model_counts: dict[str, int] = {}
-    for key, value in diagnostics.items():
-        pair = parse_gap_key(str(key))
-        if pair is None:
-            continue
-        gap_key = str(key)
-        std_key = f"{gap_key}_stdev"
-        if std_key not in diagnostics:
-            raise ValueError(
-                f"Gap diagnostic {gap_key!r} is missing {std_key!r}."
-            )
-        means[gap_key] = float(value)
-        stdevs[gap_key] = float(diagnostics[std_key])
-        pairs[gap_key] = [int(pair[0]), int(pair[1])]
-        count_key = f"{gap_key}_model_count"
-        if count_key in diagnostics:
-            model_counts[gap_key] = int(diagnostics[count_key])
-    if not means:
-        return {}
-    minimum_key = min(means, key=lambda key: (abs(means[key]), key))
-    return {
-        "gap_means": means,
-        "gap_stds": stdevs,
-        "gap_pairs": pairs,
-        "gap_model_counts": model_counts,
-        "minimum_abs_gap": abs(means[minimum_key]),
-        "minimum_abs_gap_key": minimum_key,
-        "minimum_abs_gap_pair": pairs[minimum_key],
-    }
-
-
-def _validate_sampling_inputs(
-    molecule_objects: list[MoleculesObject],
-    sampler_config: dict[str, Any],
-    properties_list: dict[str, Any] | None = None,
-) -> tuple[str, int | None]:
-    if not isinstance(molecule_objects, list) or not molecule_objects:
-        raise ValueError("molecule_objects must be a non-empty list.")
-    if not all(isinstance(item, MoleculesObject) for item in molecule_objects):
-        raise TypeError("molecule_objects may contain only MoleculesObject instances.")
-    expected_size = sampler_batch_size(sampler_config)
-    if len(molecule_objects) != expected_size:
-        raise ValueError(
-            "Strict-full ALCHEMI sampling expected exactly "
-            f"{expected_size} molecules but received {len(molecule_objects)}."
-        )
-
-    mode = str(sampler_config.get("model_mode", "ground_state")).strip().lower()
-    if mode not in {"ground_state", "excited_state"}:
-        raise ValueError("model_mode must be 'ground_state' or 'excited_state'.")
-    validate_state_selection(sampler_config, properties_list)
-    policy = str(sampler_config.get("uncertainty_policy", "stop")).strip().lower()
-    if policy not in {"stop", "continue"}:
-        raise ValueError("uncertainty_policy must be 'stop' or 'continue'.")
-    _configured_return_top_k(sampler_config)
-    _configured_replica_candidate_limit(sampler_config)
-
-    reference_numbers: tuple[int, ...] | None = None
-    states: set[int] = set()
-    for molecule in molecule_objects:
-        atoms = molecule.get_atoms()
-        if atoms is None:
-            raise ValueError("ALCHEMI cannot sample a molecule whose atoms are None.")
-        if bool(np.any(atoms.get_pbc())):
-            raise NotImplementedError("ALCHEMI sampling currently supports only nonperiodic systems.")
-        numbers = tuple(int(value) for value in atoms.get_atomic_numbers())
-        if reference_numbers is None:
-            reference_numbers = numbers
-        elif numbers != reference_numbers:
-            raise ValueError(
-                "Every molecule in an ALCHEMI batch must have identical atom order."
-            )
-        if mode == "excited_state":
-            states.add(selected_state(molecule, sampler_config))
-    if len(states) > 1:
-        raise ValueError("Every molecule in an excited-state batch must select the same state.")
-    if mode == "excited_state" and properties_list is not None and states:
-        available_states = {
-            int(row["state"])
-            for row in derive_state_property_table(properties_list)
-        }
-        unavailable_states = sorted(states - available_states)
-        if unavailable_states:
-            raise ValueError(
-                f"Selected states {unavailable_states} are not present in "
-                f"properties_list; available states are {sorted(available_states)}."
-            )
-    selected_for_validation = next(iter(states)) if states else None
-    if properties_list is not None:
-        # Also validates the score block, including its gap state pairs.
-        configured_alchemi_gap_rows(
-            sampler_config,
-            properties_list,
-            selected_for_validation,
-        )
-    else:
-        configured_score(sampler_config, None, selected_for_validation)
-
-    for density_key in ("end_dens", "amp_dens", "per_dens"):
-        if sampler_config.get(density_key) is not None:
-            raise NotImplementedError(
-                "ALCHEMI sampling does not yet support density or cell schedules; "
-                f"set {density_key} to null."
-            )
-    if "max_force_cutoff" in sampler_config:
-        max_force_cutoff = float(sampler_config["max_force_cutoff"])
-        if not np.isfinite(max_force_cutoff) or max_force_cutoff <= 0:
-            raise ValueError(
-                "max_force_cutoff must be finite and positive when provided."
-            )
-    return mode, (next(iter(states)) if states else None)
 
 
 def _candidate_record(
@@ -1047,13 +391,6 @@ def _candidate_record(
     return record
 
 
-def _physical_force_states(mode, selected, properties_list):
-    if mode == "ground_state":
-        return [0 if selected is None else int(selected)]
-    return [int(row["state"]) for row in
-            derive_state_property_table(properties_list, require_forces=True)]
-
-
 def run_alchemi_sampling(
     molecule_objects: list[MoleculesObject],
     sampler_config: dict[str, Any],
@@ -1066,25 +403,7 @@ def run_alchemi_sampling(
 ) -> list[MoleculesObject]:
     """Run one strict-full ALCHEMI batch using stop or continue selection."""
 
-    raw_gap_options = sampler_config.get("gap_diagnostics")
-    diagnostics_enabled = (
-        bool(raw_gap_options.get("enabled", False))
-        if isinstance(raw_gap_options, dict)
-        else bool(raw_gap_options)
-    )
-    raw_seeking_options = sampler_config.get("gap_seeking")
-    seeking_enabled = bool(
-        raw_seeking_options.get("enabled", False)
-    ) if isinstance(raw_seeking_options, dict) else False
-    if (
-        (diagnostics_enabled or seeking_enabled)
-        and properties_list is None
-        and not getattr(model, "gap_rows", None)
-    ):
-        raise ValueError(
-            "Gap diagnostics or gap seeking requires properties_list or a "
-            "calculator loaded with validated gap rows."
-        )
+    validate_gap_model(sampler_config, properties_list, model)
     mode, selected_state_value = _validate_sampling_inputs(
         molecule_objects,
         sampler_config,
@@ -1092,27 +411,8 @@ def run_alchemi_sampling(
     )
     if properties_list is not None and isinstance(model, ALFAlchemiCalculator):
         model.require_physical_states(_physical_force_states(mode, selected_state_value, properties_list))
-    if properties_list is not None:
-        _, gap_seeking_settings = configured_alchemi_gap_rows(
-            sampler_config,
-            properties_list,
-            selected_state_value,
-        )
-    else:
-        gap_seeking_settings = dict(
-            getattr(
-                model,
-                "gap_seeking_settings",
-                {"enabled": False, "rows": []},
-            )
-        )
-        if seeking_enabled and not bool(
-            gap_seeking_settings.get("enabled", False)
-        ):
-            raise ValueError(
-                "gap_seeking requires properties_list or a calculator loaded "
-                "with validated gap-seeking settings."
-            )
+    gap_seeking_settings = gap_seeking_settings_for_model(
+        sampler_config, properties_list, model, selected_state_value)
     policy = str(sampler_config.get("uncertainty_policy", "stop")).strip().lower()
     backend = dict(sampler_config["alchemi_baoab"])
     random_seed = int(backend.get("random_seed", 42))
@@ -1120,8 +420,7 @@ def run_alchemi_sampling(
     maxt = float(sampler_config["maxt"])
     ncheck = int(sampler_config["Ncheck"])
     min_time = float(sampler_config.get("min_time", 0.0))
-    if dt <= 0 or maxt <= 0 or ncheck < 1 or min_time < 0:
-        raise ValueError("dt and maxt must be positive; Ncheck >= 1 and min_time >= 0.")
+    validate_dynamics_parameters(dt, maxt, ncheck, min_time)
     return_top_k = _configured_return_top_k(sampler_config)
     max_candidates_per_replica = _configured_replica_candidate_limit(sampler_config)
     score = configured_score(
@@ -1150,20 +449,7 @@ def run_alchemi_sampling(
             validate_fixed_topology(atoms, reference_topology)
             for atoms in atoms_list
         ]
-        identity_failures = [
-            index
-            for index, result in enumerate(topology_results)
-            if result.reason == "topology_identity"
-        ]
-        if identity_failures:
-            first = identity_failures[0]
-            violation = topology_results[first].violations[0]
-            raise ValueError(
-                "ALCHEMI topology checking requires the exact reference atom "
-                f"order. Replica {first} has atomic numbers "
-                f"{violation['actual_atomic_numbers']}, expected "
-                f"{violation['expected_atomic_numbers']}."
-            )
+        validate_topology_identities(topology_results)
         active = np.asarray(
             [result.valid for result in topology_results],
             dtype=bool,
@@ -1208,8 +494,7 @@ def run_alchemi_sampling(
         friction_per_fs = float(
             sampler_config.get("friction_per_fs", DEFAULT_FRICTION_PER_FS)
         )
-        if not np.isfinite(friction_per_fs) or friction_per_fs < 0:
-            raise ValueError("friction_per_fs must be a finite nonnegative value.")
+        validate_friction(friction_per_fs)
         if runner_factory is None:
             runner_factory = AlchemiDynamicsRunner
         runner = runner_factory(
@@ -1602,11 +887,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             self._lcm_controls[index] = control
 
         @staticmethod
-        def _batch_shape(batch) -> tuple[int, int]:
-            counts = batch.num_nodes_per_graph
-            if not bool(torch.all(counts == counts[0]).detach().cpu().item()):
-                raise ValueError("ALCHEMI calculator batches require equal atom counts.")
-            return int(batch.num_graphs), int(counts[0].detach().cpu().item())
+        def _batch_shape(batch):
+            return validated_batch_shape(batch)
 
         def _well_energy_forces(self, batch, positions_batched):
             if self.well_params is None:
@@ -1639,49 +921,11 @@ if _ALCHEMI_IMPORT_ERROR is None:
 
         @staticmethod
         def _normalize_energy_contributions(batch, energy_values):
-            num_graphs = int(batch.num_graphs)
-            energy = torch.as_tensor(
-                energy_values,
-                dtype=batch.positions.dtype,
-                device=batch.positions.device,
-            )
-            if energy.ndim < 2 or int(energy.shape[1]) != num_graphs:
-                raise ValueError(
-                    "ALCHEMI energy contributions must have shape [models, batch, ...]."
-                )
-            model_count = int(energy.shape[0])
-            energy = energy.reshape(model_count, num_graphs, -1).sum(dim=2)
-            if model_count < 1:
-                raise ValueError("At least one calculator contribution is required.")
-            return energy
+            return normalize_energy_contributions(batch, energy_values)
 
         @staticmethod
         def _normalize_contributions(batch, energy_values, force_values):
-            total_atoms = int(batch.positions.shape[0])
-            energy = ALFAlchemiCalculator._normalize_energy_contributions(
-                batch, energy_values
-            )
-            model_count = int(energy.shape[0])
-            forces = torch.as_tensor(
-                force_values,
-                dtype=batch.positions.dtype,
-                device=batch.positions.device,
-            )
-            if forces.ndim < 3 or int(forces.shape[0]) != model_count:
-                raise ValueError(
-                    "ALCHEMI force contributions must use the same model count as energies."
-                )
-            allowed_shapes = {(model_count, total_atoms, 3),
-                              (model_count, int(batch.num_graphs),
-                               int(batch.num_nodes_per_graph[0]), 3)}
-            if tuple(forces.shape) not in allowed_shapes:
-                raise ValueError(
-                    "ALCHEMI force contributions must have shape [models, total_atoms, 3]."
-                )
-            forces = forces.reshape(model_count, total_atoms, 3)
-            if not bool(torch.isfinite(forces).all()) or not bool(torch.isfinite(energy).all()):
-                raise ValueError("Physical energy/force contributions must be finite.")
-            return energy, forces
+            return normalize_contributions(batch, energy_values, force_values)
 
         @staticmethod
         def _reduce_contributions(batch, energy, forces) -> dict[str, Any]:
@@ -1758,9 +1002,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     "force_contributions": forces,
                 },
             )
-            missing = sorted(set(self.physical_force_states) - set(state_contributions))
-            if missing:
-                raise KeyError(f"Physical force screening requires state_contributions for states {missing}.")
+            validate_required_physical_states(state_contributions, self.physical_force_states)
             state_results: dict[int, dict[str, Any]] = {}
             for state_value, values in state_contributions.items():
                 state_energy, state_forces = self._normalize_contributions(
@@ -1772,12 +1014,9 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     batch, state_energy, state_forces
                 )
                 state = int(state_value)
-                if int(state_energy.shape[0]) != int(energy.shape[0]):
-                    raise ValueError("Physical states must use the same ordered model count.")
+                validate_model_count(state_energy.shape[0], energy.shape[0],
+                                     "Physical states must use the same ordered model count.")
                 state_results[state] = state_result
-                diagnostics[f"physical_F{state}_max"] = torch.linalg.vector_norm(
-                    state_result["forces"].reshape(int(batch.num_graphs), -1, 3), dim=2
-                ).amax(dim=1)
                 diagnostics[f"sE{state}"] = state_result["energy"]
                 diagnostics[f"sE{state}_stdev"] = state_result["energy_std"]
                 diagnostics[f"F{state}"] = state_result["forces"].reshape(
@@ -1800,33 +1039,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             )
             selected_model_count = int(energy.shape[0])
             for row in self.gap_rows:
-                lower = int(row["lower_state"])
-                upper = int(row["upper_state"])
-                missing_states = [
-                    state
-                    for state in (lower, upper)
-                    if state not in state_energy_contributions
-                ]
-                if missing_states:
-                    raise KeyError(
-                        f"Gap diagnostic {row['gap_key']} requires raw energy "
-                        f"contributions for states {missing_states}."
-                    )
-                lower_energy = self._normalize_energy_contributions(
-                    batch, state_energy_contributions[lower]
-                )
-                upper_energy = self._normalize_energy_contributions(
-                    batch, state_energy_contributions[upper]
-                )
-                if (
-                    int(lower_energy.shape[0]) != selected_model_count
-                    or int(upper_energy.shape[0]) != selected_model_count
-                ):
-                    raise ValueError(
-                        f"Gap diagnostic {row['gap_key']} requires the same "
-                        "ordered model members for both states and the selected "
-                        "dynamics ensemble."
-                    )
+                lower_energy, upper_energy = normalize_gap_contributions(
+                    batch, state_energy_contributions, row, selected_model_count)
                 gap_members = upper_energy - lower_energy
                 gap_mean = torch.mean(gap_members, dim=0)
                 if selected_model_count == 1:
@@ -1852,21 +1066,9 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 diagnostics["Fsmax"] = selected["Fsmax"]
                 diagnostics["Fsrms"] = selected["Fsrms"]
             else:
-                for key in ("Es", "Fs", "Fsmax"):
-                    value = torch.as_tensor(
-                        uncertainty_override[key],
-                        dtype=batch.positions.dtype,
-                        device=batch.positions.device,
-                    ).reshape(-1)
-                    if int(value.shape[0]) != int(batch.num_graphs):
-                        raise ValueError(
-                            f"Calculator-provided {key} must have one value per graph."
-                        )
-                    diagnostics[key] = value
+                diagnostics.update(normalize_uncertainty_override(batch, uncertainty_override))
 
-            diagnostics["Fmeanmax"] = torch.stack([
-                diagnostics[f"physical_F{state}_max"] for state in state_results
-            ]).amax(dim=0)
+            diagnostics.update(physical_force_diagnostics(state_results, int(batch.num_graphs)))
             num_graphs, num_atoms = self._batch_shape(batch)
             positions_batched = batch.positions.reshape(num_graphs, num_atoms, 3)
             selected_energy = selected["energy"].reshape(num_graphs, 1).clone()
@@ -1911,21 +1113,15 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 lcm_correction[graph_index] = lcm_forces - 0.5 * (
                     lower_result["forces"].reshape(num_graphs, num_atoms, 3)[graph_index]
                     + upper_result["forces"].reshape(num_graphs, num_atoms, 3)[graph_index])
-            diagnostics["lcm_bias_Fmax"] = torch.linalg.vector_norm(
-                selected_forces - physical_selected_forces, dim=2).amax(dim=1)
-            diagnostics["lcm_correction_Fmax"] = torch.linalg.vector_norm(
-                lcm_correction, dim=2).amax(dim=1)
+            diagnostics.update(lcm_force_diagnostics(
+                selected_forces, physical_selected_forces, lcm_correction))
             well_energy, well_forces = self._well_energy_forces(
                 batch, positions_batched
             )
             if well_energy is not None:
                 selected_energy = selected_energy + well_energy
                 selected_forces = selected_forces + well_forces
-            diagnostics["confinement_Fmax"] = (
-                torch.zeros(num_graphs, device=selected_forces.device) if well_forces is None
-                else torch.linalg.vector_norm(well_forces, dim=2).amax(dim=1))
-            diagnostics["propagation_Fmax"] = torch.linalg.vector_norm(
-                selected_forces, dim=2).amax(dim=1)
+            diagnostics.update(propagation_force_diagnostics(selected_forces, well_forces))
             self.last_diagnostics = {
                 key: value.detach() if hasattr(value, "detach") else value
                 for key, value in diagnostics.items()
@@ -1966,13 +1162,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             calculator_loader: str | None = None,
         ) -> None:
             model_list = list(models)
-            if not model_list:
-                raise ValueError("A native ALCHEMI ensemble requires at least one model.")
-            if not all(isinstance(model, BaseModelMixin) for model in model_list):
-                raise TypeError("Every native ensemble member must implement BaseModelMixin.")
-            input_signature = model_list[0].input_data()
-            if any(model.input_data() != input_signature for model in model_list[1:]):
-                raise ValueError("Native ensemble members require incompatible batch inputs.")
+            validate_native_models(model_list, BaseModelMixin)
             super().__init__(
                 selected_state_value=selected_state_value,
                 physical_force_states=physical_force_states,
@@ -2010,43 +1200,14 @@ if _ALCHEMI_IMPORT_ERROR is None:
             }
             for model in self.models:
                 output = model(batch)
-                if self.energy_key not in output or self.force_key not in output:
-                    raise KeyError(
-                        "Native calculator output must contain configured energy and force keys."
-                    )
+                validate_native_results(output, self.energy_key, self.force_key)
                 energies.append(output[self.energy_key])
                 forces.append(output[self.force_key])
                 if required_lcm_states:
-                    raw_states = {
-                        int(state): values
-                        for state, values in dict(
-                            output.get("state_contributions") or {}
-                        ).items()
-                    }
-                    raw_states.setdefault(self.selected_state_value, {
-                        "energy": output[self.energy_key], "forces": output[self.force_key]})
-                    missing = sorted(required_lcm_states - set(raw_states))
-                    if missing:
-                        raise KeyError(
-                            "Native gap seeking requires state_contributions "
-                            f"with energy and force values for states {missing}."
-                        )
-                    for state in sorted(required_lcm_states):
-                        values = raw_states[state]
-                        energy_value = values.get(
-                            "energy",
-                            values.get("energy_contributions"),
-                        )
-                        force_value = values.get(
-                            "forces",
-                            values.get("force_contributions"),
-                        )
-                        if energy_value is None or force_value is None:
-                            raise KeyError(
-                                "Native gap-seeking state_contributions must "
-                                "provide energy/forces or "
-                                "energy_contributions/force_contributions."
-                            )
+                    raw_states = native_state_contributions(
+                        output, required_lcm_states, self.selected_state_value,
+                        self.energy_key, self.force_key)
+                    for state, (energy_value, force_value) in raw_states.items():
                         state_members[state]["energy"].append(energy_value)
                         state_members[state]["forces"].append(force_value)
             prediction = {
@@ -2089,12 +1250,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 calculator_list = list(calculators)
             else:
                 calculator_list = [calculators]
-            if not calculator_list or not all(
-                isinstance(calculator, Calculator) for calculator in calculator_list
-            ):
-                raise TypeError(
-                    "ase_calculator must return an ASE Calculator or a non-empty list of them."
-                )
+            validate_ase_calculators(calculator_list)
             selected = 0 if selected_state_value is None else int(selected_state_value)
             super().__init__(
                 selected_state_value=selected,
@@ -2172,14 +1328,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 *self.gap_energy_keys.values(),
                 *self.gap_force_keys.values(),
             ]
-            missing = [
-                key for key in required if key not in calculator.results
-            ]
-            if missing:
-                raise KeyError(
-                    "ASE fallback calculator did not provide required properties: "
-                    + ", ".join(missing)
-                )
+            validate_ase_results(calculator.results, required)
             energy = float(np.asarray(calculator.results[self.energy_key]).sum())
             forces = np.asarray(calculator.results[self.force_key], dtype=float)
             state_energies = {
@@ -2240,11 +1389,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
                         state_energies,
                         state_forces,
                     ) = self._evaluate_one(calculator, atoms)
-                    if forces.shape != (num_atoms, 3):
-                        raise ValueError(
-                            f"ASE fallback {self.force_key} must have shape "
-                            f"({num_atoms}, 3)."
-                        )
+                    validate_ase_force_shape(forces, num_atoms, self.force_key)
                     energy_members[model_index].append(energy)
                     force_members[model_index].append(forces)
                     for state, state_energy in state_energies.items():
@@ -2252,11 +1397,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
                             state_energy
                         )
                     for state, state_force in state_forces.items():
-                        if state_force.shape != (num_atoms, 3):
-                            raise ValueError(
-                                f"ASE fallback F{state} must have shape "
-                                f"({num_atoms}, 3)."
-                            )
+                        validate_ase_force_shape(state_force, num_atoms, f"F{state}")
                         state_force_members[state][model_index].append(
                             state_force
                         )
@@ -2384,11 +1525,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
 
         @staticmethod
         def _members_first(values, model_count: int, name: str):
-            if values.ndim < 2 or int(values.shape[1]) != int(model_count):
-                raise ValueError(
-                    f"HIPPYNN {name} .all output must place the model axis second."
-                )
-            return torch.movedim(values, 1, 0)
+            return hippynn_members_first(values, model_count, name)
 
         def ensemble_forward(self, batch) -> dict[str, Any]:
             positions = batch.positions.detach()
@@ -2404,10 +1541,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             for row in self.state_nodes:
                 energy_count = int(row["energy_model_count"])
                 force_count = int(row["force_model_count"])
-                if energy_count != force_count:
-                    raise ValueError(
-                        "HIPPYNN energy and force ensembles must contain the same models."
-                    )
+                validate_model_count(energy_count, force_count,
+                                     "HIPPYNN energy and force ensembles must contain the same models.")
                 energy = self._members_first(
                     predictions[row["energy_all_node"]], energy_count, "energy"
                 ).reshape(energy_count, num_graphs, -1).sum(dim=2)
@@ -2586,39 +1721,13 @@ def load_hippynn_alchemi_model(
     ensure_alchemi_available()
     import hippynn
 
-    if options:
-        raise TypeError(
-            "Unknown HIPPYNN ALCHEMI calculator options: "
-            + ", ".join(sorted(options))
-        )
+    validate_hippynn_options(options)
 
     ensemble_graph, (_, output_info) = hippynn.graphs.make_ensemble(
         os.path.join(str(ensemble_directory), "model-*"), quiet=True
     )
     ensemble_graph.to(device)
-    mode = str(model_mode).strip().lower()
-    if mode == "ground_state":
-        energy_key = str(ML_config.get("energy_key", "energy"))
-        force_key = ML_config.get("force_key")
-        if force_key is None:
-            raise ValueError("Ground-state ALCHEMI requires ML_config.force_key.")
-        table = [
-            {
-                "state": 0,
-                "energy_db_name": energy_key,
-                "force_db_name": str(force_key),
-            }
-        ]
-        selected = 0
-    elif mode == "excited_state":
-        table = derive_state_property_table(properties_list, require_forces=True)
-        if selected_state_value is None:
-            raise ValueError("Excited-state ALCHEMI requires selected_state metadata.")
-        selected = int(selected_state_value)
-        if selected not in {int(row["state"]) for row in table}:
-            raise ValueError(f"Selected state {selected} is not present in properties_list.")
-    else:
-        raise ValueError("model_mode must be 'ground_state' or 'excited_state'.")
+    table, selected = hippynn_state_table(model_mode, selected_state_value, ML_config, properties_list)
     gap_rows, gap_seeking_settings = configured_alchemi_gap_rows(
         sampler_config,
         properties_list,
@@ -2793,11 +1902,7 @@ def alchemi_sampling_task(
         torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
-        if strict_gpu and not allow_cpu_debug:
-            raise RuntimeError(
-                "ALCHEMI sampling requires CUDA by default. Set "
-                "alchemi_baoab.allow_cpu_debug=true only for local smoke tests."
-            )
+        validate_alchemi_device(False, strict_gpu=strict_gpu, allow_cpu_debug=allow_cpu_debug)
 
     model = load_alchemi_calculator(
         sampler_config=sampler_config,
