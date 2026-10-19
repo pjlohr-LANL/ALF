@@ -1,10 +1,12 @@
 # Production excited-state integration audit — 2026-10-19
 
-Current production-checkout validation: **422 fork tests passed** and
-**47 unchanged main tests passed**. Both suites were rerun against imports
-from `/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF` after the five integration
-commits were transferred. Earlier isolated-checkout results remain below
-as history.
+Current production-checkout validation after test consolidation: **400 fork
+tests passed** and **47 unchanged main tests passed**. Imports were pinned to
+`/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF`. The suite is down from 422 cases
+and 303 functions to 400 cases and 279 functions, with 829 fewer test/support
+lines. Runtime code and scientific settings are unchanged. See the
+[consolidation coverage map](test_consolidation_2026-10-19.md). Earlier
+integration and transfer results remain below as history.
 
 ## Checkout and ancestry
 
@@ -218,9 +220,10 @@ unchanged and were verified as ancestors of the updated branch:
 4. `ebdb793` — tools-owned screening and reusable sampling validation.
 5. `b90e58c` — upstream training-filter compatibility regressions.
 
-All runtime code and tests match `b90e58c` exactly; only this audit and its
-reproduction paths were updated after the fast-forward. The documentation
-update is committed separately.
+At the initial transfer, all runtime code and tests matched `b90e58c`
+exactly; only the audit and reproduction paths were updated in the separate
+documentation commit `e1f875b`. The subsequent test-only consolidation is
+documented above and in its coverage map; runtime code still matches.
 
 | Production-checkout check | Result |
 |---|---|
