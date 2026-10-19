@@ -5,6 +5,11 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+from ase import Atoms
+from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.sampling_validation import validate_sampler_debug_output
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,3 +53,21 @@ def test_tools_have_no_imports_from_sampler_implementations():
                            for name in modules), str(path)
     assert not (ROOT/'alframework/samplers/force_screen.py').exists()
     assert not (ROOT/'alframework/samplers/debug_validation.py').exists()
+
+
+@pytest.mark.parametrize('metadata,passes', [
+    ({'sampler_device':'cuda:0','selected_state':1,'topology_valid':True}, True),
+    ({'sampler_device':'cpu','selected_state':1,'topology_valid':True}, False),
+    ({'sampler_device':'cuda:0','selected_state':0,'topology_valid':True}, False),
+    ({'sampler_device':'cuda:0','selected_state':1,'topology_valid':False}, False),
+])
+def test_sampler_debug_validation(metadata, passes):
+    mol = MoleculesObject(Atoms('H'), 'debug')
+    mol.update_metadata(metadata)
+    cfg = {'alchemi_baoab': {'strict_gpu':True}, 'model_mode':'excited_state',
+           'state_selection':{'mode':'fixed','state':1}, 'topology_check':{'enabled':True}}
+    if passes:
+        validate_sampler_debug_output(mol, cfg)
+    else:
+        with pytest.raises(AssertionError):
+            validate_sampler_debug_output(mol, cfg)

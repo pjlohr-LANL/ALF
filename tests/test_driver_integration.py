@@ -13,10 +13,12 @@ from parsl.config import Config
 from parsl.executors import ThreadPoolExecutor
 import pytest
 from ase import Atoms
+from ase.io import write as write_atoms
+
+from alframework.builders.builders import simple_cfg_loader_task
 
 from alframework.tools import tools as tool_module
 from alframework.tools.molecules_class import MoleculesObject
-from alframework.tools.sampling_validation import validate_sampler_debug_output
 
 
 class DriverFinished(Exception):
@@ -44,10 +46,15 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     training_calls, sampler_calls = [], []
     model_pattern = str(tmp_path/'models/model-{:04d}')
     h5_pattern = str(tmp_path/'h5/data-{:04d}.h5')
+    library = tmp_path / 'cfg_library'
+    library.mkdir()
+    reference = Atoms('OH2', positions=[[0,0,0],[.96,0,0],[-.24,.93,0]], cell=np.eye(3)*8)
+    write_atoms(library / 'water.cfg', reference, format='cfg')
+    builder_config = {'molecule_library_dir': str(library), 'pbc': False}
 
     @python_app(executors=['alf_builder_executor'])
-    def builder(moleculeid):
-        mol = MoleculesObject(Atoms('OH2', positions=[[0,0,0],[.96,0,0],[-.24,.93,0]]), moleculeid)
+    def builder(moleculeid, builder_config):
+        mol = simple_cfg_loader_task.func(moleculeid, builder_config, shake=0.) if batched else MoleculesObject(reference.copy(), moleculeid)
         # Bootstrap accepts the legacy object. Active learning tests nested lists.
         return [[mol]] if batched and 'boot' not in moleculeid else mol
 
@@ -64,6 +71,9 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     @python_app(executors=['alf_sampler_executor'])
     def batch(molecule_objects, current_model_id):
         assert len(molecule_objects) == 2
+        assert all(mol.get_metadata()['selected_state'] == 0 for mol in molecule_objects)
+        assert all(mol.get_metadata()['molecule_library_file'] == str(library / 'water.cfg') for mol in molecule_objects)
+        assert all(not mol.get_atoms().pbc.any() for mol in molecule_objects)
         rows = [sample_one(molecule, current_model_id) for molecule in molecule_objects]
         return [rows[0], [rows[1]]]
 
@@ -100,8 +110,9 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
                   maximum_completed_QM=4, gpus_per_node=0)
     sampler_config = {'model_mode':'ground_state'}
     if batched:
+        sampler_config.update(model_mode='excited_state', state_selection={'mode': 'fixed', 'state': 0})
         sampler_config['alchemi_baoab'] = {'batch_size':2, 'partial_policy':'full_only'}
-    for name, values in [('master',master), ('builder',{}), ('sampler',sampler_config), ('qm',{}), ('ml',{})]:
+    for name, values in [('master',master), ('builder',builder_config), ('sampler',sampler_config), ('qm',{}), ('ml',{})]:
         (tmp_path/f'{name}.json').write_text(json.dumps(values))
     monkeypatch.setattr(sys, 'argv', ['alframework','--master',str(tmp_path/'master.json')])
     original_sleep = time.sleep
@@ -142,25 +153,3 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
         group = handle['H02_O01']
         assert group['species'][()].tolist() == [b'H',b'H',b'O']
         assert 'topology_atom_ids' not in group
-
-
-@pytest.mark.parametrize('metadata,passes', [
-    ({'sampler_device':'cuda:0','selected_state':1,'topology_valid':True}, True),
-    ({'sampler_device':'cpu','selected_state':1,'topology_valid':True}, False),
-    ({'sampler_device':'cuda:0','selected_state':0,'topology_valid':True}, False),
-    ({'sampler_device':'cuda:0','selected_state':1,'topology_valid':False}, False),
-])
-def test_sampler_owned_debug_validation(metadata, passes):
-    mol = MoleculesObject(Atoms('H'), 'debug')
-    mol.update_metadata(metadata)
-    cfg = {'alchemi_baoab': {'strict_gpu':True}, 'model_mode':'excited_state',
-           'state_selection':{'mode':'fixed','state':1}, 'topology_check':{'enabled':True}}
-    if passes:
-        validate_sampler_debug_output(mol, cfg)
-    else:
-        with pytest.raises(AssertionError):
-            validate_sampler_debug_output(mol, cfg)
-
-
-def test_legacy_debug_has_no_excited_state_or_gpu_requirements():
-    validate_sampler_debug_output(MoleculesObject(Atoms('H'), 'legacy'), {})
