@@ -32,6 +32,7 @@ from alframework.tools.pyanitools import anidataloader
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.dataset_screening import print_dataset_screening_summary
 from alframework.tools.dataset_screening import screen_and_store_dataset
+from alframework.samplers.debug_validation import validate_sampler_debug_output
 from alframework.tools.sampler_batching import SamplerBatchBuffer
 from alframework.tools.sampler_batching import configured_sampler_calculator_status
 from alframework.tools.sampler_batching import flatten_molecule_output
@@ -272,30 +273,7 @@ if args.test_sampler:
     assert isinstance(test_configuration, MoleculesObject), 'test_configuration must be a MoleculesObject instance'
     print("Sampler testing returned:")
     print(test_configuration)
-    sampler_metadata = test_configuration.get_metadata()
-    backend_options = dict(sampler_config.get("alchemi_baoab", {}))
-    if (
-        bool(backend_options.get("strict_gpu", False))
-        and not bool(backend_options.get("allow_cpu_debug", False))
-    ):
-        assert str(sampler_metadata.get("sampler_device", "")).startswith(
-            "cuda:"
-        ), "Strict-GPU sampler testing must return CUDA device metadata."
-    if sampler_config.get("model_mode") == "excited_state":
-        state_selection = dict(sampler_config.get("state_selection", {}))
-        configured_states = (
-            {state_selection.get("state")}
-            if state_selection.get("mode") == "fixed"
-            else set(state_selection.get("states", []))
-        )
-        assert sampler_metadata.get("selected_state") in configured_states, (
-            "Excited-state sampler testing must return configured "
-            "selected_state metadata."
-        )
-    if bool(sampler_config.get("topology_check", {}).get("enabled", False)):
-        assert sampler_metadata.get("topology_valid") is True, (
-            "Topology-enabled sampler testing must return topology_valid=true."
-        )
+    validate_sampler_debug_output(test_configuration, sampler_config)
     testing = True
 
 #def ase_calculator_task(input_system,configuration_list,directory,command,properties=['energy','forces']):
