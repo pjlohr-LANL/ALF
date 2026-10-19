@@ -529,80 +529,6 @@ def test_ase_fallback_reads_flattened_excited_state_properties():
     assert model.diagnostics_for_graph(0)["Es"] == pytest.approx(1.0)
 
 
-def test_ase_fallback_gap_diagnostics_match_raw_member_reduction():
-    import torch
-
-    class MultiStateCalculator(Calculator):
-        implemented_properties = ["sE0", "sE1", "F1"]
-
-        def __init__(self, energy0, energy1):
-            super().__init__()
-            self.energy0 = float(energy0)
-            self.energy1 = float(energy1)
-
-        def calculate(
-            self,
-            atoms=None,
-            properties=("sE1",),
-            system_changes=all_changes,
-        ):
-            super().calculate(atoms, properties, system_changes)
-            self.results = {
-                "sE0": self.energy0,
-                "sE1": self.energy1,
-                "F1": np.zeros((len(atoms), 3)),
-            }
-
-    model = ALFASEAlchemiModel(
-        [
-            MultiStateCalculator(0.0, 4.0),
-            MultiStateCalculator(2.0, 2.0),
-        ],
-        model_mode="excited_state",
-        selected_state_value=1,
-        gap_rows=[_gap_row()],
-        device=torch.device("cpu"),
-    )
-    model(_torch_batch(torch))
-    diagnostics = model.diagnostics_for_graph(0)
-
-    assert diagnostics["dE01"] == pytest.approx(2.0)
-    assert diagnostics["dE01_stdev"] == pytest.approx(2.0)
-    assert diagnostics["dE01_model_count"] == 2
-
-
-def test_single_ase_calculator_gap_deviation_is_zero():
-    import torch
-
-    class MultiStateCalculator(Calculator):
-        implemented_properties = ["sE0", "sE1", "F1"]
-
-        def calculate(
-            self,
-            atoms=None,
-            properties=("sE1",),
-            system_changes=all_changes,
-        ):
-            super().calculate(atoms, properties, system_changes)
-            self.results = {
-                "sE0": 1.0,
-                "sE1": 1.75,
-                "F1": np.zeros((len(atoms), 3)),
-            }
-
-    model = ALFASEAlchemiModel(
-        MultiStateCalculator(),
-        model_mode="excited_state",
-        selected_state_value=1,
-        gap_rows=[_gap_row()],
-        device=torch.device("cpu"),
-    )
-    model(_torch_batch(torch))
-
-    assert model.diagnostics_for_graph(0)["dE01"] == pytest.approx(0.75)
-    assert model.diagnostics_for_graph(0)["dE01_stdev"] == pytest.approx(0.0)
-
-
 def test_ase_fallback_gap_diagnostics_require_all_state_energies():
     import torch
 
@@ -2294,41 +2220,6 @@ def _sum_diagnostics(*, Es, Fsrms, gap_stds, Fs=0.0, Fsmax=0.0):
     return diagnostics
 
 
-def test_absent_score_block_preserves_max_ranking():
-    score = configured_score(_config(), None, None)
-
-    assert score["mode"] == "max"
-    assert score["gap_rows"] == []
-
-    diagnostics = {"Es": 2.0, "Fs": 1.5, "Fsmax": 1.0}
-    flags = uncertainty_flags(diagnostics, Escut=1.0, Fscut=1.0)
-    result = candidate_score(diagnostics, flags, score, Escut=1.0, Fscut=1.0)
-
-    assert result["score_mode"] == "max"
-    assert result["ranking_score"] == flags["uncertainty_score"] == 2.0
-    assert result["score_components"] == {}
-    assert result["score_gap_pair"] is None
-
-
-def test_explicit_max_mode_matches_absent_block():
-    diagnostics = {"Es": 0.5, "Fs": 3.0, "Fsmax": 1.0}
-    flags = uncertainty_flags(diagnostics, Escut=1.0, Fscut=1.0)
-
-    absent = candidate_score(
-        diagnostics, flags, configured_score(_config(), None, None),
-        Escut=1.0, Fscut=1.0,
-    )
-    config = _config()
-    config["score"] = {"mode": "max"}
-    explicit = candidate_score(
-        diagnostics, flags, configured_score(config, None, None),
-        Escut=1.0, Fscut=1.0,
-    )
-
-    assert explicit == absent
-    assert explicit["ranking_score"] == 3.0
-
-
 def test_summed_score_adds_normalized_terms():
     config = _sum_config()
     config["Escut"] = 0.001
@@ -2623,70 +2514,6 @@ def test_sum_mode_ranks_gap_uncertainty_above_force_uncertainty():
     assert metadata[0]["gap_stds"]["dE01"] == pytest.approx(0.05)
 
 
-def test_replica_candidate_limit_spreads_output_across_trajectories():
-    config = _config(policy="continue", batch_size=2, return_top_k=3)
-    config["maxt"] = 0.4
-    config["max_candidates_per_replica"] = 1
-    model = FakeModel(
-        {
-            0: [
-                {"Es": 9.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 8.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 7.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 6.0, "Fs": 0.0, "Fsmax": 0.0},
-            ],
-            1: [
-                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
-            ],
-        }
-    )
-
-    outputs = run_alchemi_sampling(
-        [_molecule("first"), _molecule("second")],
-        config,
-        model,
-        runner_factory=FakeRunner,
-    )
-
-    parents = [item.get_metadata()["parent_molecule_id"] for item in outputs]
-    assert parents == ["first", "second"]
-    assert [item.get_metadata()["ranking_score"] for item in outputs] == [9.0, 2.0]
-
-
-def test_absent_replica_candidate_limit_allows_one_trajectory_to_dominate():
-    config = _config(policy="continue", batch_size=2, return_top_k=3)
-    config["maxt"] = 0.4
-    model = FakeModel(
-        {
-            0: [
-                {"Es": 9.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 8.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 7.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 6.0, "Fs": 0.0, "Fsmax": 0.0},
-            ],
-            1: [
-                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
-                {"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0},
-            ],
-        }
-    )
-
-    outputs = run_alchemi_sampling(
-        [_molecule("first"), _molecule("second")],
-        config,
-        model,
-        runner_factory=FakeRunner,
-    )
-
-    parents = [item.get_metadata()["parent_molecule_id"] for item in outputs]
-    assert parents == ["first", "first", "first"]
-
-
 def test_replica_candidate_limit_rejects_invalid_values():
     model = FakeModel({0: [{"Es": 2.0, "Fs": 0.0, "Fsmax": 0.0}]})
 
@@ -2732,3 +2559,69 @@ def test_return_top_k_rejects_invalid_values():
                 model,
                 runner_factory=FakeRunner,
             )
+
+
+@pytest.mark.parametrize('diagnostics,expected', [
+    ({'Es': 2., 'Fs': 1.5, 'Fsmax': 1.}, 2.),
+    ({'Es': .5, 'Fs': 3., 'Fsmax': 1.}, 3.),
+], ids=['energy-dominated', 'force-dominated'])
+def test_default_and_explicit_max_score_preserve_legacy_ranking(diagnostics, expected):
+    flags = uncertainty_flags(diagnostics, Escut=1., Fscut=1.)
+    config = _config()
+    absent_score = configured_score(config, None, None)
+    assert absent_score['gap_rows'] == []
+    absent = candidate_score(diagnostics, flags, absent_score, Escut=1., Fscut=1.)
+    config['score'] = {'mode': 'max'}
+    explicit = candidate_score(diagnostics, flags, configured_score(config, None, None), Escut=1., Fscut=1.)
+    assert absent == explicit
+    assert absent['score_mode'] == 'max'
+    assert absent['ranking_score'] == flags['uncertainty_score'] == expected
+    assert absent['score_components'] == {}
+    assert absent['score_gap_pair'] is None
+
+
+@pytest.mark.parametrize('limit,parents,scores', [
+    (1, ['first', 'second'], [9., 2.]),
+    (None, ['first', 'first', 'first'], [9., 8., 7.]),
+], ids=['limited', 'unlimited'])
+def test_replica_candidate_limit_controls_trajectory_concentration(limit, parents, scores):
+    config = _config(policy='continue', batch_size=2, return_top_k=3)
+    config['maxt'] = .4
+    if limit is not None:
+        config['max_candidates_per_replica'] = limit
+    model = FakeModel({index: [{'Es': score, 'Fs': 0., 'Fsmax': 0.} for score in sequence]
+                       for index, sequence in enumerate(([9., 8., 7., 6.], [2.] * 4))})
+    outputs = run_alchemi_sampling([_molecule('first'), _molecule('second')], config, model, runner_factory=FakeRunner)
+    assert [item.get_metadata()['parent_molecule_id'] for item in outputs] == parents
+    assert [item.get_metadata()['ranking_score'] for item in outputs] == scores
+
+
+@pytest.mark.parametrize('energies,gap,deviation', [
+    ([(0., 4.), (2., 2.)], 2., 2.),
+    ([(1., 1.75)], .75, 0.),
+], ids=['correlated-ensemble', 'single-calculator'])
+def test_ase_gap_statistics_follow_raw_member_differences(energies, gap, deviation):
+    import torch
+
+    class MultiStateCalculator(Calculator):
+        implemented_properties = ['sE0', 'sE1', 'F1']
+
+        def __init__(self, values):
+            super().__init__()
+            self.values = values
+
+        def calculate(self, atoms=None, properties=('sE1',), system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {'sE0': self.values[0], 'sE1': self.values[1], 'F1': np.zeros((len(atoms), 3))}
+
+    calculators = [MultiStateCalculator(values) for values in energies]
+    model = ALFASEAlchemiModel(calculators[0] if len(calculators) == 1 else calculators,
+                              model_mode='excited_state', selected_state_value=1,
+                              gap_rows=[_gap_row()], device=torch.device('cpu'))
+    model(_torch_batch(torch))
+    diagnostics = model.diagnostics_for_graph(0)
+    assert diagnostics['dE01'] == pytest.approx(gap)
+    assert diagnostics['dE01_stdev'] == pytest.approx(deviation)
+    assert diagnostics['dE01_model_count'] == len(energies)
+    if len(energies) == 1:
+        assert diagnostics['Es'] == diagnostics['Fs'] == diagnostics['Fsmax'] == 0.
