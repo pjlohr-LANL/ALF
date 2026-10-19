@@ -1,5 +1,8 @@
 # Excited-state test consolidation — 2026-10-19
 
+This report records the test-only consolidation ending at `e7cbd59`; subsequent
+feature tests are counted in the [RDKit audit](rdkit_initialization_audit_2026-10-19.md).
+
 Baseline: `e1f875b` on `production_excited_states`. Changes are confined to tests,
 test helpers, and documentation in the production checkout. Runtime code, public
 interfaces, example settings, packaging, CI, and pytest selection remain unchanged.
@@ -45,7 +48,7 @@ regressions covered elsewhere.
 | `test_explicit_max_mode_matches_absent_block` | `test_default_and_explicit_max_score_preserve_legacy_ranking`: energy- and force-dominated cases retain both default/explicit equivalence and metadata checks. |
 | `test_replica_candidate_limit_spreads_output_across_trajectories` | `test_replica_candidate_limit_controls_trajectory_concentration`: limited/unlimited cases retain separate parameter IDs and expected parents/scores. |
 | `test_single_ase_calculator_gap_deviation_is_zero` | `test_ase_gap_statistics_follow_raw_member_differences`: anticorrelated ensemble and single-calculator cases preserve gap means, deviations, model counts, and zero single-member uncertainty. |
-| `test_cfg_builder_strict_batch_list_sampler_to_individual_qm` | `test_actual_driver_bootstrap_training_sampling_qm_and_retraining[True]`: real CFG-loader body inside a local asynchronous builder; metadata, fixed state, full batch, nested results, individual QM, and retraining. |
+| `test_cfg_builder_strict_batch_list_sampler_to_individual_qm` | `test_actual_driver_bootstrap_training_sampling_qm_and_retraining[cfg]`: real CFG-loader body inside a local asynchronous builder; metadata, fixed state, full batch, nested results, individual QM, and retraining. |
 | `test_legacy_debug_has_no_excited_state_or_gpu_requirements` | `test_sampling_tools_import_without_gpu_stack_or_sampler_modules` already executes the identical legacy validation with GPU imports blocked. |
 | `test_sampler_owned_debug_validation` | `test_sampler_debug_validation` in the tools suite; same four metadata cases. |
 | `test_all_example_json_files_parse` | `test_example_paths_and_task_wiring`: five shipped master variants; JSON/path checks and actual task-signature routing, including argument identity. |

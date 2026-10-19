@@ -1,12 +1,12 @@
 # Production excited-state integration audit — 2026-10-19
 
-Current production-checkout validation after test consolidation: **400 fork
-tests passed** and **47 unchanged main tests passed**. Imports were pinned to
-`/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF`. The suite is down from 422 cases
-and 303 functions to 400 cases and 279 functions, with 829 fewer test/support
-lines. Runtime code and scientific settings are unchanged. See the
-[consolidation coverage map](test_consolidation_2026-10-19.md). Earlier
-integration and transfer results remain below as history.
+Current production-checkout validation after adding optional RDKit KDG/FPS
+initialization: **414 fork tests passed** and **47 unchanged main tests passed**.
+The new preparation tool uses the existing H5 bootstrap path without changes
+to the core driver, sampling, or training. See the
+[RDKit implementation audit](rdkit_initialization_audit_2026-10-19.md).
+The prior [test consolidation](test_consolidation_2026-10-19.md) reduced the
+then-existing suite to 400 cases; earlier results below remain as history.
 
 ## Checkout and ancestry
 
@@ -223,7 +223,8 @@ unchanged and were verified as ancestors of the updated branch:
 At the initial transfer, all runtime code and tests matched `b90e58c`
 exactly; only the audit and reproduction paths were updated in the separate
 documentation commit `e1f875b`. The subsequent test-only consolidation is
-documented above and in its coverage map; runtime code still matches.
+documented above and in its coverage map. Existing runtime files still match;
+the later optional RDKit preparation module is a separate addition.
 
 | Production-checkout check | Result |
 |---|---|

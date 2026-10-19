@@ -182,6 +182,39 @@ Batched builders
    task may return. Use it with
    ``simple_multi_condensed_phase_builder_task``.
 
+RDKit KDG + FPS Initialization
+------------------------------
+
+The optional CPU preparation tool generates unlabeled, geometry-screened KDG
+conformers and selects seeds by stratified farthest-point sampling. It uses
+JSON configuration plus a reference geometry; no dynamics or force-field
+optimization is required.
+
+From the production fork checkout, run:
+
+.. code-block:: bash
+
+   python -m alframework.tools.rdkit_initialization \
+     --config examples/rdkit_initialization/enol.json \
+     --output-dir /path/to/new/enol_seed
+
+The corresponding ``keto.json`` provides the keto preset. Both presets generate
+50,000 accepted pool geometries and select 5,000 before QM labeling. Counts,
+reference paths, random seeds, threads, widening levels, and geometry screens
+are editable JSON settings. RDKit is available through the ``topology`` extra.
+
+The output includes ``pool.h5``, ``seed.h5``, a reference snapshot,
+``builder_config.json``, and ``provenance.json``. It contains no energy/force
+labels. Use the master/sampler fields under ``alf_configuration`` in provenance
+with the existing H5 replay builder. Set ``bootstrap_set`` to the selected input
+count. ALF labels these geometries, applies its configured storage screen, trains
+fresh, and then replays its own labeled H5 data. Rejected labels are not refilled.
+
+This preparation does not modify the core driver, training filters, sampling
+policy, QM backend, or state count. Geometry files must stay outside the run's
+labeled training store. See ``examples/rdkit_initialization/README.md`` for the
+full method, atom-identity guarantees, configuration fields, and count accounting.
+
 Related Examples
 ----------------
 
