@@ -20,6 +20,8 @@ from alframework.tools.tools import build_input_dict, load_config_file, load_mod
 EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
 VARIANTS = [
     ('excited_state_pyseqm', 'master_config.json', 'pyseqm'),
+    ('keto_rdkit_alf_galf', 'master_alf.json', 'pyseqm'),
+    ('keto_rdkit_alf_galf', 'master_galf.json', 'pyseqm'),
     ('excited_state_pyseqm', 'master_config_existing_h5.json', 'pyseqm'),
     ('excited_state_gpu4pyscf', 'master_config.json', 'gpu4pyscf'),
     ('excited_state_gpu4pyscf', 'master_config_summed_score.json', 'gpu4pyscf'),
@@ -27,7 +29,7 @@ VARIANTS = [
 ]
 
 
-@pytest.fixture(params=VARIANTS, ids=['pyseqm', 'pyseqm-replay', 'gpu4pyscf', 'gpu4pyscf-sum', 'gpu4pyscf-nacr'])
+@pytest.fixture(params=VARIANTS, ids=['pyseqm', 'keto-alf', 'keto-galf', 'pyseqm-replay', 'gpu4pyscf', 'gpu4pyscf-sum', 'gpu4pyscf-nacr'])
 def example(request, monkeypatch):
     directory, filename, backend = request.param
     directory = EXAMPLES / directory
@@ -111,7 +113,8 @@ def test_example_resources_are_independent_and_start_no_allocations(directory, m
     spec = importlib.util.spec_from_file_location(f'example_resources_{directory}', EXAMPLES / directory / 'parsl_configs.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    executors = {executor.label: executor for executor in module.config_darwin.executors}
+    config = module.config_darwin if hasattr(module, 'config_darwin') else module.config
+    executors = {executor.label: executor for executor in config.executors}
     assert {'alf_ML_executor', 'alf_sampler_executor', 'alf_QM_executor'} <= executors.keys()
     providers = [executor.provider for executor in executors.values() if hasattr(executor, 'provider')]
     assert providers

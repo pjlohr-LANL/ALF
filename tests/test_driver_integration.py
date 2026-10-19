@@ -1,5 +1,6 @@
 """Execute ALF's real entry point with asynchronous, local-only mock tasks."""
 import json
+import importlib.util
 from pathlib import Path
 import runpy
 import sys
@@ -13,11 +14,14 @@ from parsl.config import Config
 from parsl.executors import ThreadPoolExecutor
 import pytest
 from ase import Atoms
-from ase.io import write as write_atoms
+from ase.io import read, write as write_atoms
 
 from alframework.builders.builders import simple_cfg_loader_task
 from alframework.builders.h5_replay_builder import build_h5_replay_structures
 from alframework.tools.rdkit_initialization import prepare_rdkit_seed
+from alframework.samplers.alchemi_sampling import run_alchemi_sampling
+from alframework.tools.force_screen import SCHEMA, SOURCE
+from tests.helpers.fakes import FakeModel, FakeRunner
 
 from alframework.tools import tools as tool_module
 from alframework.tools.molecules_class import MoleculesObject
@@ -46,11 +50,15 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     parsl.clear()
     monkeypatch.chdir(tmp_path)
     training_calls, sampler_calls, bootstrap_labels = [], [], []
+    galf_phase = False
+    example = Path(__file__).resolve().parents[1] / "examples/keto_rdkit_alf_galf"
     model_pattern = str(tmp_path/'models/model-{:04d}')
     h5_pattern = str(tmp_path/'h5/data-{:04d}.h5')
     library = tmp_path / 'cfg_library'
     library.mkdir()
     reference = Atoms('OH2', positions=[[0,0,0],[.96,0,0],[-.24,.93,0]], cell=np.eye(3)*8)
+    if rdkit_seed:
+        reference = read(example / 'keto.xyz')
     write_atoms(library / 'water.cfg', reference, format='cfg')
     builder_config = {'molecule_library_dir': str(library), 'pbc': False}
     if rdkit_seed:
@@ -58,7 +66,7 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
         reference_path = tmp_path / 'reference.xyz'
         write_atoms(reference_path, reference)
         seed_report = prepare_rdkit_seed({
-            'smiles': 'O', 'reference_geometry': str(reference_path),
+            'smiles': 'CC(=O)CC(C)=O', 'reference_geometry': str(reference_path),
             'pool_size': 4, 'seed_size': 2,
             **{key: [0.] for key in ('bond_scales', 'angle_scales', 'xh_bond_scales', 'xh_angle_scales', 'torsion_scales')},
         }, tmp_path / 'rdkit_seed')
@@ -91,11 +99,23 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
         assert all(mol.get_metadata()['selected_state'] == 0 for mol in molecule_objects)
         if rdkit_seed:
             assert all(not mol.get_metadata()['replay_external_bootstrap'] for mol in molecule_objects)
-            assert all(mol.get_metadata()['replay_source_path'] == h5_pattern.format(0) for mol in molecule_objects)
+            assert all(Path(mol.get_metadata()['replay_source_path']).parent == Path(h5_pattern).parent for mol in molecule_objects)
+            if not galf_phase:
+                assert all(mol.get_metadata()['replay_source_path'] == h5_pattern.format(0) for mol in molecule_objects)
         else:
             assert all(mol.get_metadata()['molecule_library_file'] == str(library / 'water.cfg') for mol in molecule_objects)
         assert all(not mol.get_atoms().pbc.any() for mol in molecule_objects)
         rows = [sample_one(molecule, current_model_id) for molecule in molecule_objects]
+        if galf_phase:
+            diagnostic = {'Es': .002, 'Fs': 0., 'Fsrms': 0., 'Fsmax': 0., 'Fmeanmax': 1.,
+                          'force_screen_schema': SCHEMA, 'force_screen_source': SOURCE,
+                          **{key: value for gap in ('dE01','dE12','dE23')
+                             for key,value in ((gap,.05),(gap+'_stdev',0.),(gap+'_model_count',4))}}
+            outputs = run_alchemi_sampling(rows, sampler_config, FakeModel({i:[diagnostic,{**diagnostic,'Es':.004}] for i in range(2)}),
+                properties_list=master['properties_list'], runner_factory=FakeRunner, master_directory=str(tmp_path))
+            assert len(FakeRunner.last_instance.lcm_calls) == 2
+            assert any(mol.get_metadata()['gap_seeking_switched'] for mol in outputs)
+            return outputs
         return [rows[0], [rows[1]]]
 
     @python_app(executors=['alf_QM_executor'])
@@ -107,8 +127,10 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
         if rdkit_seed:
             # Both seed labels converge; reject the second on a nonselected state.
             excessive = molecule_object.get_moleculeid() == 'mol-boot-0000000001'
-            molecule_object.store_results({'sE0': 1., 'sE1': 2., 'F0': np.zeros((3, 3)),
-                                           'F1': np.full((3, 3), 20. if excessive else 0.)})
+            results = {f'sE{state}': 1. + state*.05 for state in range(4)}
+            results.update({f'F{state}': np.full((len(reference),3),20. if excessive and state==1 else 0.) for state in range(4)})
+            results.update({f'dE{i}{i+1}':results[f'sE{i+1}']-results[f'sE{i}'] for i in range(3)})
+            molecule_object.store_results(results)
         else:
             molecule_object.store_results({'energy': 1., 'forces': np.arange(9).reshape(3,3)})
         molecule_object.set_converged_flag(True)
@@ -121,6 +143,16 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
         target = Path(model_pattern.format(current_training_id))
         target.mkdir(parents=True, exist_ok=False)
         (target/'complete').write_text('four mock members completed\n')
+        if rdkit_seed:
+            for member in range(4):
+                directory = target/f'model-{member:02d}'
+                directory.mkdir()
+                (directory/'training_summary.json').write_text(json.dumps({
+                    'data': {'n_structures':len(ids),'n_structures_before_filtering':len(ids)},
+                    'gap_targets': {'enabled':False}}))
+                (directory/'training_log.txt').write_text('Training complete\n')
+                for artifact in ('experiment_structure.pt','best_checkpoint.pt'):
+                    (directory/artifact).write_bytes(b'mock checkpoint')
         return [True]*4, current_training_id
 
     config = Config(executors=[ThreadPoolExecutor(label=f'alf_{name}_executor', max_threads=2)
@@ -143,11 +175,12 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
         sampler_config['alchemi_baoab'] = {'batch_size':2, 'partial_policy':'full_only'}
     if rdkit_seed:
         master['properties_list'] = {f'{prefix}{state}': [f'{prefix}{state}', scope, 1.]
-                                     for state in (0, 1) for prefix, scope in [('sE', 'system'), ('F', 'atomic')]}
+                                     for state in range(4) for prefix, scope in [('sE', 'system'), ('F', 'atomic')]}
+        master['properties_list'].update({f'dE{i}{i+1}':[f'dE{i}{i+1}','system',1.] for i in range(3)})
         sampler_config.update(seed_report['alf_configuration']['sampler'])
         sampler_config.update(max_force_cutoff=16., dataset_screening={
             'enabled': True, 'force': True, 'min_distance': True, 'topology': True})
-    for name, values in [('master',master), ('builder',builder_config), ('sampler',sampler_config), ('qm',{}), ('ml',{})]:
+    for name, values in [('master',master), ('builder',builder_config), ('sampler',sampler_config), ('qm',json.loads((example/'QM_config.json').read_text()) if rdkit_seed else {}), ('ml',{})]:
         (tmp_path/f'{name}.json').write_text(json.dumps(values))
     monkeypatch.setattr(sys, 'argv', ['alframework','--master',str(tmp_path/'master.json')])
     original_sleep = time.sleep
@@ -156,7 +189,8 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     def local_sleep(seconds):
         if seconds == 60:
             ticks.append(seconds)
-            status = json.loads((tmp_path/'status.json').read_text())
+            status = json.loads((tmp_path/('galf/status.json' if galf_phase else 'status.json')).read_text())
+            assert status['lifetime_failed_sampler_tasks'] == 0, 'Local sampler task failed; inspect Parsl log'
             capacity = status['sampler_capacity']
             assert capacity['submitted_sampler_replicas'] <= 2
             if status['current_model_id'] >= 1:
@@ -189,6 +223,48 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     status = json.loads((tmp_path/'status.json').read_text())
     assert all(status[f'lifetime_failed_{name}_tasks'] == 0 for name in ('builder','sampler','QM','ML'))
     with h5py.File(tmp_path/'h5/data-0001.h5') as handle:
-        group = handle['H02_O01']
-        assert group['species'][()].tolist() == [b'H',b'H',b'O']
+        group = next(iter(handle.values()))
+        assert group['species'].asstr()[()].tolist() == sorted(reference.get_chemical_symbols(), key=lambda symbol: {'H':1,'C':6,'O':8}[symbol])
         assert ('topology_atom_ids' in group) is rdkit_seed
+
+    if rdkit_seed:
+        # Freeze a reduced exact handoff, then exercise the real driver again.
+        spec = importlib.util.spec_from_file_location('keto_driver_example', example/'prepare.py')
+        workflow = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(workflow)
+        galf = tmp_path/'galf'
+        master['QM_task']='alframework.qm_interfaces.pyseqm_interface.pyseqm_excited_state_task'
+        workflow.write_json(tmp_path/'master.json',master)
+        manifest = workflow.freeze(tmp_path/'master.json',galf,2,handoff=True)
+        assert manifest['phase_counts'] == {'seed':1,'alf':1,'galf':0}
+        master = workflow.read_json(galf/'master_config.json')
+        model_pattern, h5_pattern = master['model_path'], master['h5_path']
+        sampler_config = workflow.read_json(galf/'sampler_galf.json')
+        sampler_config.update(dt=.1,maxt=.0002,Ncheck=1,min_time=0.,return_top_k=2)
+        sampler_config['alchemi_baoab']['batch_size']=2
+        sampler_config['state_selection']={'mode':'fixed','state':0}
+        master.update(builder_task='mock.builder',sampler_task='mock.sampler',QM_task='mock.qm',ML_task='mock.ml',
+            parsl_configuration='mock.config',save_h5_threshold=2,parallel_samplers=2,maximum_builder_structures=2,gpus_per_node=0)
+        workflow.write_json(galf/'master_config.json',master)
+        workflow.write_json(galf/'sampler_galf.json',sampler_config)
+        galf_phase=True
+        training_calls.clear()
+        ticks.clear()
+        monkeypatch.setattr(sys,'argv',['alframework','--master',str(galf/'master_config.json')])
+        modules['mock.config']=Config(executors=[ThreadPoolExecutor(label=f'alf_{name}_executor',max_threads=2)
+            for name in ('builder','sampler','QM','ML')],strategy='none',run_dir=str(galf/'runinfo'))
+        monkeypatch.chdir(galf)
+        try:
+            with pytest.raises(DriverFinished):
+                runpy.run_module('alframework',run_name='__main__')
+        finally:
+            parsl.dfk().cleanup()
+            parsl.clear()
+        assert training_calls[0] == (0,[identifier for record in manifest['sources'] for identifier in record['ids']])
+        assert len(workflow.check(galf/'master_config.json',require_trained=True)['initial_training'])==4
+        assert (galf/'h5store/data-0002.h5').exists()
+        small=workflow.freeze(galf/'master_config.json',tmp_path/'checkpoint3',3)
+        large=workflow.freeze(galf/'master_config.json',tmp_path/'checkpoint4',4)
+        keys=lambda result:[(record['sha256'],row) for record in result['sources'] for row in record['rows']]
+        assert keys(small)==keys(large)[:3]
+        assert large['phase_counts']=={'seed':1,'alf':1,'galf':2}
