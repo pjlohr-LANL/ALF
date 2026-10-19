@@ -16,6 +16,8 @@ from ase import Atoms
 from ase.io import write as write_atoms
 
 from alframework.builders.builders import simple_cfg_loader_task
+from alframework.builders.h5_replay_builder import build_h5_replay_structures
+from alframework.tools.rdkit_initialization import prepare_rdkit_seed
 
 from alframework.tools import tools as tool_module
 from alframework.tools.molecules_class import MoleculesObject
@@ -34,8 +36,8 @@ def stored_ids(pattern):
     return ids
 
 
-@pytest.mark.parametrize('batched', [False, True])
-def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, monkeypatch, batched):
+@pytest.mark.parametrize('batched,rdkit_seed', [(False, False), (True, False), (True, True)], ids=['legacy', 'cfg', 'rdkit'])
+def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, monkeypatch, batched, rdkit_seed):
     # No scheduler, GPU, or production files: four local Parsl thread executors.
     try:
         parsl.dfk().cleanup()
@@ -43,7 +45,7 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
         pass
     parsl.clear()
     monkeypatch.chdir(tmp_path)
-    training_calls, sampler_calls = [], []
+    training_calls, sampler_calls, bootstrap_labels = [], [], []
     model_pattern = str(tmp_path/'models/model-{:04d}')
     h5_pattern = str(tmp_path/'h5/data-{:04d}.h5')
     library = tmp_path / 'cfg_library'
@@ -51,9 +53,24 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     reference = Atoms('OH2', positions=[[0,0,0],[.96,0,0],[-.24,.93,0]], cell=np.eye(3)*8)
     write_atoms(library / 'water.cfg', reference, format='cfg')
     builder_config = {'molecule_library_dir': str(library), 'pbc': False}
+    if rdkit_seed:
+        pytest.importorskip('rdkit')
+        reference_path = tmp_path / 'reference.xyz'
+        write_atoms(reference_path, reference)
+        seed_report = prepare_rdkit_seed({
+            'smiles': 'O', 'reference_geometry': str(reference_path),
+            'pool_size': 4, 'seed_size': 2,
+            **{key: [0.] for key in ('bond_scales', 'angle_scales', 'xh_bond_scales', 'xh_angle_scales', 'torsion_scales')},
+        }, tmp_path / 'rdkit_seed')
+        builder_config = json.loads((tmp_path / 'rdkit_seed/builder_config.json').read_text())
 
     @python_app(executors=['alf_builder_executor'])
-    def builder(moleculeid, builder_config):
+    def builder(moleculeid, moleculeids, builder_config, sampler_config, h5_path, current_h5_id, master_directory):
+        if rdkit_seed:
+            return build_h5_replay_structures(
+                moleculeids=moleculeids, builder_config=builder_config,
+                sampler_config=sampler_config, h5_path=h5_path,
+                current_h5_id=current_h5_id, master_directory=master_directory)
         mol = simple_cfg_loader_task.func(moleculeid, builder_config, shake=0.) if batched else MoleculesObject(reference.copy(), moleculeid)
         # Bootstrap accepts the legacy object. Active learning tests nested lists.
         return [[mol]] if batched and 'boot' not in moleculeid else mol
@@ -72,7 +89,11 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     def batch(molecule_objects, current_model_id):
         assert len(molecule_objects) == 2
         assert all(mol.get_metadata()['selected_state'] == 0 for mol in molecule_objects)
-        assert all(mol.get_metadata()['molecule_library_file'] == str(library / 'water.cfg') for mol in molecule_objects)
+        if rdkit_seed:
+            assert all(not mol.get_metadata()['replay_external_bootstrap'] for mol in molecule_objects)
+            assert all(mol.get_metadata()['replay_source_path'] == h5_pattern.format(0) for mol in molecule_objects)
+        else:
+            assert all(mol.get_metadata()['molecule_library_file'] == str(library / 'water.cfg') for mol in molecule_objects)
         assert all(not mol.get_atoms().pbc.any() for mol in molecule_objects)
         rows = [sample_one(molecule, current_model_id) for molecule in molecule_objects]
         return [rows[0], [rows[1]]]
@@ -81,7 +102,15 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     def qm(molecule_object):
         if 'boot' not in molecule_object.get_moleculeid():
             assert molecule_object.get_metadata()['sampled']
-        molecule_object.store_results({'energy': 1., 'forces': np.arange(9).reshape(3,3)})
+        if 'boot' in molecule_object.get_moleculeid():
+            bootstrap_labels.append(molecule_object.get_moleculeid())
+        if rdkit_seed:
+            # Both seed labels converge; reject the second on a nonselected state.
+            excessive = molecule_object.get_moleculeid() == 'mol-boot-0000000001'
+            molecule_object.store_results({'sE0': 1., 'sE1': 2., 'F0': np.zeros((3, 3)),
+                                           'F1': np.full((3, 3), 20. if excessive else 0.)})
+        else:
+            molecule_object.store_results({'energy': 1., 'forces': np.arange(9).reshape(3,3)})
         molecule_object.set_converged_flag(True)
         return [[molecule_object]]  # Generic nested QM result extraction.
 
@@ -112,6 +141,12 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     if batched:
         sampler_config.update(model_mode='excited_state', state_selection={'mode': 'fixed', 'state': 0})
         sampler_config['alchemi_baoab'] = {'batch_size':2, 'partial_policy':'full_only'}
+    if rdkit_seed:
+        master['properties_list'] = {f'{prefix}{state}': [f'{prefix}{state}', scope, 1.]
+                                     for state in (0, 1) for prefix, scope in [('sE', 'system'), ('F', 'atomic')]}
+        sampler_config.update(seed_report['alf_configuration']['sampler'])
+        sampler_config.update(max_force_cutoff=16., dataset_screening={
+            'enabled': True, 'force': True, 'min_distance': True, 'topology': True})
     for name, values in [('master',master), ('builder',builder_config), ('sampler',sampler_config), ('qm',{}), ('ml',{})]:
         (tmp_path/f'{name}.json').write_text(json.dumps(values))
     monkeypatch.setattr(sys, 'argv', ['alframework','--master',str(tmp_path/'master.json')])
@@ -141,7 +176,11 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
         finally:
             parsl.clear()
     assert training_calls[0][0] == 0
-    assert len(training_calls[0][1]) >= 2
+    if rdkit_seed:
+        assert sorted(bootstrap_labels) == ['mol-boot-0000000000', 'mol-boot-0000000001']
+        assert training_calls[0][1] == ['mol-boot-0000000000']
+    else:
+        assert len(training_calls[0][1]) >= 2
     assert all('mol-boot-' in value for value in training_calls[0][1])
     assert any(index == 1 and any('mol-0000-' in value for value in ids)
                for index, ids in training_calls)
@@ -152,4 +191,4 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     with h5py.File(tmp_path/'h5/data-0001.h5') as handle:
         group = handle['H02_O01']
         assert group['species'][()].tolist() == [b'H',b'H',b'O']
-        assert 'topology_atom_ids' not in group
+        assert ('topology_atom_ids' in group) is rdkit_seed

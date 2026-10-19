@@ -20,18 +20,26 @@ import builtins
 import sys
 original_import = builtins.__import__
 def checked_import(name, *args, **kwargs):
+    if name.split('.')[0] == 'rdkit':
+        raise ModuleNotFoundError('RDKit deliberately unavailable')
     if name.split('.')[0] in {'torch', 'hippynn', 'nvalchemi', 'warp'} or name.startswith('alframework.samplers'):
         raise AssertionError('Unexpected optional/strategy import: ' + name)
     return original_import(name, *args, **kwargs)
 builtins.__import__ = checked_import
-from alframework.tools import sampling_validation, force_screen, dataset_screening
+from alframework.tools import sampling_validation, force_screen, dataset_screening, rdkit_initialization
+try:
+    rdkit_initialization._rdkit()
+except ImportError as exc:
+    assert 'topology extra' in str(exc)
+else:
+    raise AssertionError('Missing RDKit was not reported')
 from alframework.tools.molecules_class import MoleculesObject
 from ase import Atoms
 sampling_validation.validate_sampler_debug_output(MoleculesObject(Atoms('H'), 'legacy'), {})
 assert sampling_validation.configured_score({})['mode'] == 'max'
 assert force_screen.validated_force_cutoff(16., positive=True) == 16.
 assert not force_screen.physical_force_exceeds({}, None)
-assert not any(name.split('.')[0] in {'torch','hippynn','nvalchemi','warp'} for name in sys.modules)
+assert not any(name.split('.')[0] in {'torch','hippynn','nvalchemi','warp','rdkit'} for name in sys.modules)
 '''
     environment = dict(os.environ, PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE='1')
     result = subprocess.run([sys.executable, '-B', '-c', script], cwd=tmp_path,
