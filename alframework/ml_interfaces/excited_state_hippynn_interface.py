@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from alframework.tools.atom_order import TOPOLOGY_ATOM_IDS, canonical_orders
 from parsl import python_app
 
 from alframework.tools.excited_state_tools import (
@@ -392,6 +394,12 @@ def load_excited_state_h5_arrays(
                     n_atoms=n_atoms,
                     context=f"{context}:{species_key}",
                 )
+                atom_orders = None
+                if TOPOLOGY_ATOM_IDS in group:
+                    atom_orders = canonical_orders(group[TOPOLOGY_ATOM_IDS], n_systems, n_atoms,
+                                                   context=f"{context}:{TOPOLOGY_ATOM_IDS}")
+                    species_rows = np.take_along_axis(species_rows, atom_orders, axis=1)
+                    coordinates = np.take_along_axis(coordinates, atom_orders[:, :, None], axis=1)
                 for row_index, sequence in enumerate(species_rows):
                     if reference_species is None:
                         reference_species = sequence.copy()
@@ -422,14 +430,12 @@ def load_excited_state_h5_arrays(
                     chunks[energy_name].append(
                         energy_values.astype(np.float32, copy=False)
                     )
-                    chunks[force_name].append(
-                        _normalize_forces(
-                            group[force_name],
-                            n_systems=n_systems,
-                            n_atoms=n_atoms,
-                            context=f"{context}:{force_name}",
-                        )
-                    )
+                    force_values = _normalize_forces(
+                        group[force_name], n_systems=n_systems, n_atoms=n_atoms,
+                        context=f"{context}:{force_name}")
+                    if atom_orders is not None:
+                        force_values = np.take_along_axis(force_values, atom_orders[:, :, None], axis=1)
+                    chunks[force_name].append(force_values)
                 for row in gap_table:
                     gap_name = str(row["gap_db_name"])
                     gap_values = _normalize_energy(

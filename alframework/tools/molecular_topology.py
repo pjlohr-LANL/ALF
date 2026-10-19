@@ -2,8 +2,8 @@
 
 RDKit is used only to read one required reference conformer and determine its
 bond graph. Runtime validation uses NumPy distances against that cached graph.
-Atom remapping and topology persistence are intentionally outside this module:
-sampled structures must retain the reference atom order.
+Validation requires reference atom order. Topology-aware replay and sampler
+extensions normalize explicit IDs using tools.atom_order before validation.
 """
 
 from __future__ import annotations

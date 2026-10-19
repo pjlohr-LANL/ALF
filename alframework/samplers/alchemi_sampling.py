@@ -20,6 +20,7 @@ from parsl import python_app
 from alframework.samplers.force_screen import (
     SCHEMA, SOURCE, ForceScreenAudit, force_screen_metadata, physical_force_exceeds,
 )
+from alframework.tools.atom_order import canonicalize_tagged_atoms, attach_topology_ids
 from alframework.tools.excited_state_tools import (
     _gap_state_index,
     derive_gap_property_table,
@@ -1137,6 +1138,11 @@ def run_alchemi_sampling(
         sampler_config,
         master_directory=master_directory,
     )
+    if reference_topology is not None:
+        atoms_list = [canonicalize_tagged_atoms(atoms) for atoms in atoms_list]
+        for atoms in atoms_list:
+            if np.array_equal(atoms.numbers, reference_topology.atomic_numbers):
+                attach_topology_ids(atoms, reference_topology.atomic_numbers)
     audit = ForceScreenAudit(sampler_config.get("force_screen_audit_dir"), master_directory,
                              molecule_objects, atoms_list, sampler_config.get("max_force_cutoff"))
     try:

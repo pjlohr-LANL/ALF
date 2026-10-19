@@ -973,7 +973,8 @@ def test_nacr_round_trips_through_hdf5_storage(monkeypatch, tmp_path):
         group = handle[list(handle.keys())[0]]
         # [frames, pairs, atoms, 3]
         assert group["nacr"].shape == (1, 1, 3, 3)
-        np.testing.assert_allclose(group["nacr"][0], nacr)
+        atom_order = np.argsort(labeled.get_atoms().numbers, kind="stable")
+        np.testing.assert_allclose(group["nacr"][0], nacr[:, atom_order])
         # The pair index is stored once per group, not per frame.
         assert group["nac_pairs"].shape == (1, 2)
         np.testing.assert_array_equal(group["nac_pairs"][...], pairs)

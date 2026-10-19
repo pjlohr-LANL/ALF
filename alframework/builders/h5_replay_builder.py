@@ -14,6 +14,9 @@ from ase import Atoms
 from ase.data import atomic_numbers
 from parsl import python_app
 
+from alframework.tools.atom_order import (
+    TOPOLOGY_ATOM_IDS, validated_atom_ids, attach_topology_ids,
+)
 from alframework.tools.molecular_topology import load_reference_topology
 from alframework.tools.molecules_class import MoleculesObject
 
@@ -200,17 +203,8 @@ def _canonical_reorder(
             f"reference contains {n_atoms}."
         )
     if topology_atom_ids is not None:
-        atom_ids = np.asarray(topology_atom_ids, dtype=np.int64).reshape(-1)
-        if (
-            atom_ids.shape != (n_atoms,)
-            or np.any(atom_ids < 0)
-            or np.any(atom_ids >= n_atoms)
-            or len(set(atom_ids.tolist())) != n_atoms
-        ):
-            raise ValueError(
-                f"{context}:{_TOPOLOGY_ATOM_IDS_KEY} must be a permutation of "
-                f"0..{n_atoms - 1}; received {atom_ids.tolist()}."
-            )
+        atom_ids = validated_atom_ids(topology_atom_ids, n_atoms,
+                                      context=f"{context}:{_TOPOLOGY_ATOM_IDS_KEY}")
         reorder = np.argsort(atom_ids, kind="stable")
         if not np.array_equal(stored_numbers[reorder], reference_numbers):
             raise ValueError(
@@ -251,14 +245,15 @@ def _load_replay_frame(
             master_directory=master_directory,
         )
         canonicalized = topology is not None
+        raw_ids = None
+        if _TOPOLOGY_ATOM_IDS_KEY in group:
+            dataset = group[_TOPOLOGY_ATOM_IDS_KEY]
+            raw_ids = np.asarray(dataset[int(frame_index)] if dataset.ndim == 2 else dataset[()])
         if topology is None:
-            reorder = np.arange(stored_numbers.size, dtype=np.int64)
+            reorder = (np.arange(stored_numbers.size, dtype=np.int64) if raw_ids is None
+                       else np.argsort(validated_atom_ids(raw_ids, stored_numbers.size, context=context),
+                                       kind="stable"))
         else:
-            raw_ids = None
-            if _TOPOLOGY_ATOM_IDS_KEY in group:
-                raw_ids = np.asarray(group[_TOPOLOGY_ATOM_IDS_KEY])
-                if raw_ids.ndim == 2:
-                    raw_ids = raw_ids[int(frame_index)]
             reorder = _canonical_reorder(
                 stored_numbers=stored_numbers,
                 topology_atom_ids=raw_ids,
@@ -272,6 +267,8 @@ def _load_replay_frame(
             positions=positions[reorder],
             pbc=False,
         )
+        if topology is not None or raw_ids is not None:
+            attach_topology_ids(atoms, atoms.numbers)
         source_id = None
         if _SOURCE_ID_KEY in group:
             raw_source_id = group[_SOURCE_ID_KEY][int(frame_index)]

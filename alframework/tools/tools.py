@@ -3,6 +3,7 @@ import glob
 import logging
 
 from importlib import import_module
+from alframework.tools.atom_order import TOPOLOGY_ATOM_IDS, validated_atom_ids
 import numpy as np
 import json
 from ase.geometry import complete_cell
@@ -201,15 +202,22 @@ def store_current_data(h5path, system_data, properties):
         # Ensure system converged before saving
         if system.check_convergence():
             saved_number += 1
-            # Store atoms in the order they arrive so a fixed-topology shard is
-            # already in reference-topology order. topology_atom_ids records the
-            # mapping explicitly below, so replay never infers it by convention.
-            atom_index = np.arange(len(cur_atoms.get_atomic_numbers()))
+            # Main's species contract: every row in a formula group is sorted.
+            atom_index = np.argsort(cur_atoms.get_atomic_numbers(), kind="stable")
+            topology_ids = None
+            if TOPOLOGY_ATOM_IDS in cur_atoms.arrays:
+                topology_ids = validated_atom_ids(
+                    cur_atoms.arrays[TOPOLOGY_ATOM_IDS], len(cur_atoms),
+                    context=f"{cur_moliculeid}:topology_atom_ids")[atom_index]
+            if molkey in data_dict and ((topology_ids is not None) !=
+                                         (TOPOLOGY_ATOM_IDS in data_dict[molkey])):
+                raise ValueError("Cannot mix tagged and untagged topology layouts in one formula group.")
             # If there is already a molecule with the same formula, append
             if molkey in data_dict:
                 data_dict[molkey]["_id"].append(cur_moliculeid)
                 data_dict[molkey]["coordinates"].append(cur_atoms.get_positions()[atom_index])
-                data_dict[molkey]["topology_atom_ids"].append(np.array(atom_index, dtype=np.int64))
+                if topology_ids is not None:
+                    data_dict[molkey][TOPOLOGY_ATOM_IDS].append(topology_ids)
                 if any(cur_atoms.get_pbc()):
                     data_dict[molkey]["cell"].append(complete_cell(cur_atoms.get_cell()))
                 for prop in properties:
@@ -233,7 +241,8 @@ def store_current_data(h5path, system_data, properties):
                 data_dict[molkey]["species"] = np.array(cur_atoms.get_chemical_symbols())[atom_index]
                 data_dict[molkey]["_id"] = [cur_moliculeid]
                 data_dict[molkey]["coordinates"] = [cur_atoms.get_positions()[atom_index]]
-                data_dict[molkey]["topology_atom_ids"] = [np.array(atom_index, dtype=np.int64)]
+                if topology_ids is not None:
+                    data_dict[molkey][TOPOLOGY_ATOM_IDS] = [topology_ids]
                 if any(cur_atoms.get_pbc()):
                     data_dict[molkey]["cell"] = [complete_cell(cur_atoms.get_cell())]
                 for prop in properties.keys():
