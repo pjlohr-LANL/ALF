@@ -1,13 +1,21 @@
 # Production excited-state integration audit — 2026-10-19
 
-Current tools-boundary follow-up validation: **422 fork tests passed** and
-**47 unchanged main tests passed**. The initial three-commit results below are
-retained as history; see the follow-up section for the current changes.
+Current production-checkout validation: **422 fork tests passed** and
+**47 unchanged main tests passed**. Both suites were rerun against imports
+from `/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF` after the five integration
+commits were transferred. Earlier isolated-checkout results remain below
+as history.
 
 ## Checkout and ancestry
 
-Implementation branch: `integration/physical-force-main-compat` in the isolated
-checkout `/vast/home/pjlohr/github/ALF_production_integration`.
+Active implementation checkout: `/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF`
+on `production_excited_states`. Subsequent development uses this checkout.
+
+The five integration commits were originally implemented and validated on
+`integration/physical-force-main-compat` in the isolated checkout
+`/vast/home/pjlohr/github/ALF_production_integration`. They were imported
+from that local repository and applied by fast-forward from `452c650` to
+`b90e58c`, preserving all five commit identities.
 
 - Production main: `a5bb49e95fdfa458bc11700631e076b067483130`.
 - Production fork base (`production_excited_states`):
@@ -16,11 +24,14 @@ checkout `/vast/home/pjlohr/github/ALF_production_integration`.
   main-only/fork-only commit counts at the start were **0 / 25**.
 - Prototype reference: `733ab9d98ee244f0825079b40bd41aab6690a101`.
 
-This is a local clone, without shared hard-linked objects. The production
-fork, production main, prototype, running jobs, and installed environments
-were not edited. Main has two pre-existing untracked example-run directories
-from July; these were left untouched. No push, merge, or job submission was
-performed. No prototype budget orchestration or analysis utilities were ported.
+During initial implementation, the isolated checkout was a local clone
+without shared hard-linked objects; the production checkouts were unchanged
+at that stage. The approved transfer now updates the production fork only.
+Production main, the prototype, the isolated integration checkout, running
+jobs, and installed environments remain unchanged by the transfer. Main has
+two pre-existing untracked example-run directories from July; these were
+left untouched. No merge commit, push, or job submission was performed.
+No prototype budget orchestration or analysis utilities were ported.
 
 ## Review units
 
@@ -77,7 +88,7 @@ upstream merges still require reviewing these generic orchestration changes;
 passing upstream tests is compatibility evidence, not a guarantee of future
 conflict-free merges.
 
-## Validation results
+## Initial isolated-checkout validation results
 
 Environment: existing `atomistic` Python 3.12, Torch/HIPPYNN/ALCHEMI stack;
 `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`; local CPU execution only.
@@ -127,32 +138,33 @@ fork suite with the existing interpreter:
 
 ```bash
 env PYTHONDONTWRITEBYTECODE=1 \
-  PYTHONPATH=/vast/home/pjlohr/github/ALF_production_integration \
+  PYTHONPATH=/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF \
   OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
   MPLCONFIGDIR=/ram/tmp/alf_production_audit_mpl \
   /vast/home/pjlohr/.conda/envs/atomistic/bin/python -m pytest \
-  /vast/home/pjlohr/github/ALF_production_integration/tests \
+  /vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/tests \
   -q -p no:cacheprovider -o addopts= \
-  --basetemp=/ram/tmp/alf_complete_integration_final
+  -o pythonpath=/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF \
+  --basetemp=/ram/tmp/alf_production_checkout_fork_transfer_rerun
 ```
 
-For upstream compatibility, preimport the integration package and assert its
+For upstream compatibility, preimport the production-fork package and assert its
 location. Otherwise pytest may prepend main's checkout and accidentally test
 main against itself. Use the same environment as above:
 
 ```python
 import alframework, pytest
 assert alframework.__file__.startswith(
-    '/vast/home/pjlohr/github/ALF_production_integration/')
+    '/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/')
 raise SystemExit(pytest.main([
     '/vast/home/pjlohr/ALF_LANL/ALF/tests', '-q', '-p', 'no:cacheprovider',
     '-o', 'addopts=',
-    '-o', 'pythonpath=/vast/home/pjlohr/github/ALF_production_integration',
-    '--basetemp=/ram/tmp/alf_main_contract_integration',
+    '-o', 'pythonpath=/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF',
+    '--basetemp=/ram/tmp/alf_production_checkout_main_transfer',
 ]))
 ```
 
-## Tools-boundary follow-up
+## Tools-boundary follow-up in the isolated checkout
 
 The three integration commits above are retained. The subsequent refactor moves
 reusable validation into `tools/sampling_validation.py` and force-screen policy,
@@ -193,3 +205,44 @@ No thresholds, defaults, training objectives, acquisition policies, diagnostic
 schemas, audit formats, or production jobs changed. Validation remains CPU-only;
 no GPU production trajectory was launched. The earlier warning and sandbox
 notes apply to these runs as well.
+
+## Production-checkout transfer and validation
+
+The clean `production_excited_states` branch in the production checkout was
+fast-forwarded from `452c650` to `b90e58c`. These five commits are retained
+unchanged and were verified as ancestors of the updated branch:
+
+1. `59af6bd` — corrected physical-force screening and bounded audit snapshots.
+2. `41bf32a` — upstream storage ordering and explicit topology identities.
+3. `ce7b0ec` — delegated driver validation and asynchronous entry-point tests.
+4. `ebdb793` — tools-owned screening and reusable sampling validation.
+5. `b90e58c` — upstream training-filter compatibility regressions.
+
+All runtime code and tests match `b90e58c` exactly; only this audit and its
+reproduction paths were updated after the fast-forward. The documentation
+update is committed separately.
+
+| Production-checkout check | Result |
+|---|---|
+| Complete fork suite | **422 passed**, 5 warnings, 11.96 s |
+| Unchanged main suite, with production-fork imports asserted and pinned | **47 passed**, 2 warnings, 1.40 s |
+| Tools imports/dependency boundary, physical-force regressions, training-filter compatibility, and actual legacy/batched driver integration | Included in the passing complete fork suite |
+| Five imported commit identities and ancestry | Verified unchanged |
+| Runtime and test tree relative to `b90e58c` | Identical |
+| Diff whitespace checks | Passed |
+
+Both test runs asserted that `alframework.__file__` resolves inside the actual
+production checkout. Tests ran from `/ram/tmp` with the existing `atomistic`
+interpreter and one CPU thread per numerical library. The complete suite needs
+network-interface inspection for an existing Parsl executor-configuration test;
+its Slurm providers have `init_blocks=0` and no jobs are submitted.
+
+The first full-suite invocation used a Python runner supplied through stdin.
+Its spawned PySEQM smoke-test process could not reopen `/ram/tmp/<stdin>`;
+421 tests passed and that launcher-dependent test failed. Rerunning through
+normal `python -m pytest` passed all 422 tests without source changes. Use the
+module invocation above for reproducible multiprocessing tests. Remaining
+warnings concern existing HIPPYNN/ASE deprecations and unavailable NVML.
+
+No environment installation, remote push, scheduler submission, production
+GPU calculation, or change to running jobs was performed.
