@@ -1,5 +1,9 @@
 # Production excited-state integration audit — 2026-10-19
 
+Current tools-boundary follow-up validation: **422 fork tests passed** and
+**47 unchanged main tests passed**. The initial three-commit results below are
+retained as history; see the follow-up section for the current changes.
+
 ## Checkout and ancestry
 
 Implementation branch: `integration/physical-force-main-compat` in the isolated
@@ -161,3 +165,31 @@ are confined to numerical helper functions.
 The follow-up retains the current sampling cutoff, diagnostic schema, audit
 format, propagation, and switching behavior. Upstream-style training force
 filters and the optional post-QM storage screen remain separate policies.
+
+The refactor is committed as **`ebdb793`**; it preserves the initial three
+commits. A separate follow-up adds the compatibility regressions and this
+updated interpretation of filtering stages. The excited-state training
+implementation itself was not changed in this follow-up.
+
+| Follow-up check | Result |
+|---|---|
+| Complete fork suite, including new regressions | **422 passed**, 13 warnings, 13.62 s |
+| Unchanged main suite imported against fork | **47 passed**, 10 warnings, 1.11 s |
+| Focused sampling/force/actual-driver suite | **108 passed** |
+| Training compatibility, existing trainer, and tools import tests | **62 passed** |
+| Source dependency boundary | Tools have no sampler implementation imports; imports work while Torch, HIPPYNN, ALCHEMI, and Warp are blocked. |
+
+The 15 additional training regressions compare retained indices directly with
+HIPPYNN's `Database.remove_high_property` for fixed, standardized, combined,
+and disabled filtering. Cases include nonzero means, equality at a cutoff,
+zero variance, statistics recomputed after removal, and large physical force
+norms with no component outliers. Multistate cases verify state-order
+independence and alignment of coordinates, all state labels, gaps, indices,
+and extra frame IDs. A training-read test verifies that source H5 fingerprints
+remain unchanged after filtering. Two dependency tests cover tools imports
+without optional GPU dependencies and the absence of sampler helper shims.
+
+No thresholds, defaults, training objectives, acquisition policies, diagnostic
+schemas, audit formats, or production jobs changed. Validation remains CPU-only;
+no GPU production trajectory was launched. The earlier warning and sandbox
+notes apply to these runs as well.

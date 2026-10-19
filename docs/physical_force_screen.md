@@ -49,3 +49,31 @@ the strategy. Public sampler configuration functions and calculator methods
 retain their existing import locations/signatures through delegates. The old
 `samplers/force_screen.py` and `samplers/debug_validation.py` helper files have
 been removed; their implementation is under tools, without shim modules.
+
+## Sampling, storage, and training filters
+
+These controls operate at different points and keep their existing defaults:
+
+| Stage | Controls | Quantity and effect |
+|---|---|---|
+| Sampling | `max_force_cutoff` | Maximum physical ensemble-mean atom-force norm over configured states; stops an excessive-force replica. |
+| Before storage | `dataset_screening` and `max_force_cutoff` | When enabled, screens QM atom-force norms before writing labels. |
+| Training | `remove_high_forces_cut`, `remove_high_forces_std` | Excludes structures with QM force-component outliers when preparing the training pool; original H5 rows remain stored. |
+
+The training options retain upstream HIPPYNN semantics. The fixed cut compares
+`abs(component - mean)` to `remove_high_forces_cut`; the standardized cut compares
+that deviation divided by the component standard deviation to
+`remove_high_forces_std`. Comparisons use strict `>`; equality passes. These
+filters do not use per-atom Euclidean force norms. Setting an option to `null`
+disables that particular outlier filter; other configured filters still apply.
+
+For one state, the existing sequence is force cut, force standard-deviation cut,
+then energy cut and energy standard-deviation cut. Statistics are recomputed
+from the current survivors at each stage. For multiple states, static masks are
+computed from the common pool and unioned across configured state forces and
+energies, followed by standardized masks from the common survivors. This
+preserves the existing state-order-independent extension. Every retained array,
+including gap labels and frame indices, uses the same final row selection.
+Filtering happens before training/validation/test splitting and does not rewrite
+source H5 files. Sampling and storage cutoffs are not mapped onto the training
+options or automatically enabled by them.
