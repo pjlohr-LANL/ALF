@@ -1056,6 +1056,8 @@ def test_maximum_mean_force_screen_rejects_before_candidate_return():
                     "Fs": 0.0,
                     "Fsmax": 0.0,
                     "Fmeanmax": 20.0,
+                    "force_screen_schema": "alf.physical_force_screen.v1",
+                    "force_screen_source": "ensemble_mean_physical_all_states",
                 }
             ],
             1: [
@@ -1064,6 +1066,8 @@ def test_maximum_mean_force_screen_rejects_before_candidate_return():
                     "Fs": 0.0,
                     "Fsmax": 0.0,
                     "Fmeanmax": 1.0,
+                    "force_screen_schema": "alf.physical_force_screen.v1",
+                    "force_screen_source": "ensemble_mean_physical_all_states",
                 }
             ],
         }
@@ -1984,7 +1988,8 @@ def test_task_gpu_assignment_is_independent_of_selected_state(monkeypatch):
         )
         return SimpleNamespace()
 
-    def fake_run(molecule_objects, sampler_config, model, *, device):
+    def fake_run(molecule_objects, sampler_config, model, *, device, properties_list):
+        assert properties_list
         del sampler_config, model, device
         return [molecule_objects[0]]
 

@@ -17,6 +17,9 @@ from ase import Atoms, units
 from ase.calculators.calculator import Calculator, all_changes
 from parsl import python_app
 
+from alframework.samplers.force_screen import (
+    SCHEMA, SOURCE, ForceScreenAudit, force_screen_metadata, physical_force_exceeds,
+)
 from alframework.tools.excited_state_tools import (
     _gap_state_index,
     derive_gap_property_table,
@@ -1037,11 +1040,17 @@ def _candidate_record(
         **_gap_candidate_metadata(diagnostics),
         **temperature_parameters,
     }
-    if "Fmeanmax" in diagnostics:
-        record["Fmeanmax"] = float(diagnostics["Fmeanmax"])
+    record.update(force_screen_metadata(diagnostics))
     if "Fsrms" in diagnostics:
         record["Fsrms"] = float(diagnostics["Fsrms"])
     return record
+
+
+def _physical_force_states(mode, selected, properties_list):
+    if mode == "ground_state":
+        return [0 if selected is None else int(selected)]
+    return [int(row["state"]) for row in
+            derive_state_property_table(properties_list, require_forces=True)]
 
 
 def run_alchemi_sampling(
@@ -1080,6 +1089,8 @@ def run_alchemi_sampling(
         sampler_config,
         properties_list,
     )
+    if properties_list is not None and isinstance(model, ALFAlchemiCalculator):
+        model.require_physical_states(_physical_force_states(mode, selected_state_value, properties_list))
     if properties_list is not None:
         _, gap_seeking_settings = configured_alchemi_gap_rows(
             sampler_config,
@@ -1126,332 +1137,349 @@ def run_alchemi_sampling(
         sampler_config,
         master_directory=master_directory,
     )
-    topology_results: list[TopologyValidationResult] = [
-        validate_fixed_topology(atoms, reference_topology)
-        for atoms in atoms_list
-    ]
-    identity_failures = [
-        index
-        for index, result in enumerate(topology_results)
-        if result.reason == "topology_identity"
-    ]
-    if identity_failures:
-        first = identity_failures[0]
-        violation = topology_results[first].violations[0]
-        raise ValueError(
-            "ALCHEMI topology checking requires the exact reference atom "
-            f"order. Replica {first} has atomic numbers "
-            f"{violation['actual_atomic_numbers']}, expected "
-            f"{violation['expected_atomic_numbers']}."
+    audit = ForceScreenAudit(sampler_config.get("force_screen_audit_dir"), master_directory,
+                             molecule_objects, atoms_list, sampler_config.get("max_force_cutoff"))
+    try:
+        topology_results: list[TopologyValidationResult] = [
+            validate_fixed_topology(atoms, reference_topology)
+            for atoms in atoms_list
+        ]
+        identity_failures = [
+            index
+            for index, result in enumerate(topology_results)
+            if result.reason == "topology_identity"
+        ]
+        if identity_failures:
+            first = identity_failures[0]
+            violation = topology_results[first].violations[0]
+            raise ValueError(
+                "ALCHEMI topology checking requires the exact reference atom "
+                f"order. Replica {first} has atomic numbers "
+                f"{violation['actual_atomic_numbers']}, expected "
+                f"{violation['expected_atomic_numbers']}."
+            )
+        active = np.asarray(
+            [result.valid for result in topology_results],
+            dtype=bool,
         )
-    active = np.asarray(
-        [result.valid for result in topology_results],
-        dtype=bool,
-    )
-    topology_rejections: list[dict[str, Any]] = [
-        {
-            "parent_molecule_id": molecule_objects[index].get_moleculeid(),
-            "batch_index": int(index),
-            "stage": "initial",
-            "step": 0,
-            "time_ps": 0.0,
-            "reason": result.reason,
-            "violations": [
-                dict(violation) for violation in result.violations
-            ],
-        }
-        for index, result in enumerate(topology_results)
-        if not result.valid
-    ]
-    if reference_topology is not None and not np.any(active):
-        print(
-            "ALCHEMI topology summary: "
-            f"{len(topology_rejections)} initial replica(s) rejected; "
-            "dynamics and uncertainty evaluation skipped."
-        )
-        return []
-    temperature_parameters = _temperature_parameters(
-        sampler_config,
-        count=len(molecule_objects),
-        random_seed=random_seed,
-    )
-    initial_temperatures = np.asarray(
-        [
-            annealing_schedule(0.0, maxt, row["Tamp"], row["Tper"], row["Tsrt"], row["Tend"])
-            for row in temperature_parameters
-        ],
-        dtype=float,
-    )
-    friction_per_fs = float(
-        sampler_config.get("friction_per_fs", DEFAULT_FRICTION_PER_FS)
-    )
-    if not np.isfinite(friction_per_fs) or friction_per_fs < 0:
-        raise ValueError("friction_per_fs must be a finite nonnegative value.")
-    if runner_factory is None:
-        runner_factory = AlchemiDynamicsRunner
-    runner = runner_factory(
-        model=model,
-        atoms_list=atoms_list,
-        dt_fs=dt,
-        temperature_K=initial_temperatures,
-        friction_per_fs=friction_per_fs,
-        random_seed=random_seed,
-        device=device,
-    )
-
-    for index, result in enumerate(topology_results):
-        if result.valid:
-            continue
-        runner.freeze_graph(index)
-    temperature_histories: list[list[float]] = [[] for _ in molecule_objects]
-    gap_seeking_states: list[dict[str, Any]] = []
-    for _ in molecule_objects:
-        gap_seeking_states.append(
+        topology_rejections: list[dict[str, Any]] = [
             {
-                "enabled": bool(gap_seeking_settings.get("enabled", False)),
-                "mode": gap_seeking_settings.get("mode"),
-                "current_mode": "direct",
-                "switched": False,
-                "pair": None,
-                "trigger_gap_eV": None,
-                "trigger_step": None,
-                "trigger_time_ps": None,
-                "trigger_gap_threshold_eV": gap_seeking_settings.get(
-                    "trigger_gap_threshold_eV"
-                ),
-                "sigma": gap_seeking_settings.get("sigma"),
-                "alpha_eV": gap_seeking_settings.get("alpha_eV"),
-                "events": [],
+                "parent_molecule_id": molecule_objects[index].get_moleculeid(),
+                "batch_index": int(index),
+                "stage": "initial",
+                "step": 0,
+                "time_ps": 0.0,
+                "reason": result.reason,
+                "violations": [
+                    dict(violation) for violation in result.violations
+                ],
             }
+            for index, result in enumerate(topology_results)
+            if not result.valid
+        ]
+        for index, result in enumerate(topology_results):
+            if not result.valid:
+                audit.record(index, "rejected", atoms_list[index], 0, 0.0, reason=result.reason)
+        if reference_topology is not None and not np.any(active):
+            print(
+                "ALCHEMI topology summary: "
+                f"{len(topology_rejections)} initial replica(s) rejected; "
+                "dynamics and uncertainty evaluation skipped."
+            )
+            return []
+        temperature_parameters = _temperature_parameters(
+            sampler_config,
+            count=len(molecule_objects),
+            random_seed=random_seed,
         )
-    candidates: list[dict[str, Any]] = []
-    n_outer = int(np.ceil((1000.0 * maxt) / (dt * ncheck)))
-    # Preserve molecular MLMD's legacy clock: advance once, then label the
-    # first uncertainty check and thermostat update as time zero.
-    if np.any(active):
-        runner.run(1)
-    for iteration in range(n_outer):
-        if not np.any(active):
-            break
-        time_ps = float(iteration * ncheck * dt / 1000.0)
-        for batch_index in np.where(active)[0]:
-            index = int(batch_index)
-            runner.sync_graph_to_atoms(index, atoms_list[index])
-            topology_result = validate_fixed_topology(
-                atoms_list[index],
-                reference_topology,
-            )
-            topology_results[index] = topology_result
-            if not topology_result.valid:
-                active[index] = False
-                runner.freeze_graph(index)
-                topology_rejections.append(
-                    {
-                        "parent_molecule_id": (
-                            molecule_objects[index].get_moleculeid()
-                        ),
-                        "batch_index": index,
-                        "stage": "ncheck",
-                        "step": int(runner.nsteps),
-                        "time_ps": float(time_ps),
-                        "reason": topology_result.reason,
-                        "violations": [
-                            dict(violation)
-                            for violation in topology_result.violations
-                        ],
-                    }
-                )
-                continue
-        if not np.any(active):
-            break
-        runner.evaluate()
-        diagnostics_by_index: dict[int, dict[str, Any]] = {}
-        for batch_index in np.where(active)[0]:
-            index = int(batch_index)
-            topology_result = topology_results[index]
-            diagnostics = dict(runner.diagnostics_for_graph(index))
-            diagnostics_by_index[index] = diagnostics
-            flags = uncertainty_flags(
-                diagnostics,
-                Escut=float(sampler_config["Escut"]),
-                Fscut=float(sampler_config["Fscut"]),
-            )
-            distance = _minimum_distance(atoms_list[index])
-            if distance < float(sampler_config.get("distcut", 1.2)):
-                active[index] = False
-                runner.freeze_graph(index)
-                continue
-            if (
-                sampler_config.get("max_force_cutoff") is not None
-                and diagnostics.get("Fmeanmax") is not None
-                and float(diagnostics["Fmeanmax"])
-                > float(sampler_config["max_force_cutoff"])
-            ):
-                active[index] = False
-                runner.freeze_graph(index)
-                continue
-            if time_ps < min_time:
-                continue
-            if not flags["uncertain"]:
-                continue
-
-            record = _candidate_record(
-                diagnostics=diagnostics,
-                flags=flags,
-                molecule=molecule_objects[index],
-                batch_index=index,
-                step=int(runner.nsteps),
-                time_ps=time_ps,
-                distance=distance,
-                sampler_config=sampler_config,
-                policy=policy,
-                temperature_parameters=temperature_parameters[index],
-                temperature_history=temperature_histories[index],
-                selected_state_value=selected_state_value,
-                gap_seeking_state=gap_seeking_states[index],
-                score=score,
-            )
-            if reference_topology is not None:
-                record.update(topology_metadata(topology_result))
-            candidates.append(
-                {
-                    "record": record,
-                    "atoms": atoms_list[index].copy(),
-                    "parent_metadata": dict(molecule_objects[index].get_metadata()),
-                }
-            )
-            if policy == "stop":
-                active[index] = False
-                runner.freeze_graph(index)
-            else:
-                candidates[:] = _prune_candidates(
-                    candidates,
-                    return_top_k,
-                    max_candidates_per_replica,
-                )
-
-        if not np.any(active):
-            break
-        switched_this_check = False
-        if bool(gap_seeking_settings.get("enabled", False)):
-            for batch_index in np.where(active)[0]:
-                index = int(batch_index)
-                state = gap_seeking_states[index]
-                if state["switched"]:
-                    continue
-                trigger = select_gap_seeking_trigger(
-                    diagnostics_by_index[index],
-                    gap_seeking_settings,
-                )
-                if trigger is None:
-                    continue
-                runner.set_lcm_mode(
-                    index,
-                    pair=trigger["pair"],
-                    sigma=float(gap_seeking_settings["sigma"]),
-                    alpha_eV=float(gap_seeking_settings["alpha_eV"]),
-                )
-                state.update(
-                    {
-                        "current_mode": "lcm",
-                        "switched": True,
-                        "pair": list(trigger["pair"]),
-                        "trigger_gap_eV": float(trigger["gap_eV"]),
-                        "trigger_step": int(runner.nsteps),
-                        "trigger_time_ps": float(time_ps),
-                    }
-                )
-                state["events"].append(
-                    {
-                        "event": "enter_lcm",
-                        "step": int(runner.nsteps),
-                        "time_ps": float(time_ps),
-                        "pair": list(trigger["pair"]),
-                        "gap_key": str(trigger["gap_key"]),
-                        "gap_eV": float(trigger["gap_eV"]),
-                        "abs_gap_eV": float(trigger["abs_gap_eV"]),
-                    }
-                )
-                switched_this_check = True
-        if switched_this_check:
-            # NVTLangevin consumes the currently stored force at the start of
-            # its next step, so refresh the batch after changing graph modes.
-            runner.evaluate()
-        target_temperatures = np.asarray(
+        initial_temperatures = np.asarray(
             [
-                annealing_schedule(
-                    time_ps,
-                    maxt,
-                    row["Tamp"],
-                    row["Tper"],
-                    row["Tsrt"],
-                    row["Tend"],
-                )
+                annealing_schedule(0.0, maxt, row["Tamp"], row["Tper"], row["Tsrt"], row["Tend"])
                 for row in temperature_parameters
             ],
             dtype=float,
         )
-        for index in np.where(active)[0]:
-            temperature_histories[int(index)].append(
-                float(target_temperatures[int(index)])
+        friction_per_fs = float(
+            sampler_config.get("friction_per_fs", DEFAULT_FRICTION_PER_FS)
+        )
+        if not np.isfinite(friction_per_fs) or friction_per_fs < 0:
+            raise ValueError("friction_per_fs must be a finite nonnegative value.")
+        if runner_factory is None:
+            runner_factory = AlchemiDynamicsRunner
+        runner = runner_factory(
+            model=model,
+            atoms_list=atoms_list,
+            dt_fs=dt,
+            temperature_K=initial_temperatures,
+            friction_per_fs=friction_per_fs,
+            random_seed=random_seed,
+            device=device,
+        )
+
+        for index, result in enumerate(topology_results):
+            if result.valid:
+                continue
+            runner.freeze_graph(index)
+        temperature_histories: list[list[float]] = [[] for _ in molecule_objects]
+        gap_seeking_states: list[dict[str, Any]] = []
+        for _ in molecule_objects:
+            gap_seeking_states.append(
+                {
+                    "enabled": bool(gap_seeking_settings.get("enabled", False)),
+                    "mode": gap_seeking_settings.get("mode"),
+                    "current_mode": "direct",
+                    "switched": False,
+                    "pair": None,
+                    "trigger_gap_eV": None,
+                    "trigger_step": None,
+                    "trigger_time_ps": None,
+                    "trigger_gap_threshold_eV": gap_seeking_settings.get(
+                        "trigger_gap_threshold_eV"
+                    ),
+                    "sigma": gap_seeking_settings.get("sigma"),
+                    "alpha_eV": gap_seeking_settings.get("alpha_eV"),
+                    "events": [],
+                }
             )
-        runner.set_temperature(target_temperatures)
-        runner.run(ncheck)
+        candidates: list[dict[str, Any]] = []
+        n_outer = int(np.ceil((1000.0 * maxt) / (dt * ncheck)))
+        # Preserve molecular MLMD's legacy clock: advance once, then label the
+        # first uncertainty check and thermostat update as time zero.
+        if np.any(active):
+            runner.run(1)
+        for iteration in range(n_outer):
+            if not np.any(active):
+                break
+            time_ps = float(iteration * ncheck * dt / 1000.0)
+            for batch_index in np.where(active)[0]:
+                index = int(batch_index)
+                runner.sync_graph_to_atoms(index, atoms_list[index])
+                topology_result = validate_fixed_topology(
+                    atoms_list[index],
+                    reference_topology,
+                )
+                topology_results[index] = topology_result
+                if not topology_result.valid:
+                    audit.record(index, "rejected", atoms_list[index], runner.nsteps, time_ps,
+                                 reason=topology_result.reason)
+                    active[index] = False
+                    runner.freeze_graph(index)
+                    topology_rejections.append(
+                        {
+                            "parent_molecule_id": (
+                                molecule_objects[index].get_moleculeid()
+                            ),
+                            "batch_index": index,
+                            "stage": "ncheck",
+                            "step": int(runner.nsteps),
+                            "time_ps": float(time_ps),
+                            "reason": topology_result.reason,
+                            "violations": [
+                                dict(violation)
+                                for violation in topology_result.violations
+                            ],
+                        }
+                    )
+                    continue
+            if not np.any(active):
+                break
+            runner.evaluate()
+            diagnostics_by_index: dict[int, dict[str, Any]] = {}
+            for batch_index in np.where(active)[0]:
+                index = int(batch_index)
+                topology_result = topology_results[index]
+                diagnostics = dict(runner.diagnostics_for_graph(index))
+                diagnostics_by_index[index] = diagnostics
+                flags = uncertainty_flags(
+                    diagnostics,
+                    Escut=float(sampler_config["Escut"]),
+                    Fscut=float(sampler_config["Fscut"]),
+                )
+                distance = _minimum_distance(atoms_list[index])
+                if distance < float(sampler_config.get("distcut", 1.2)):
+                    audit.record(index, "rejected", atoms_list[index], runner.nsteps, time_ps,
+                                 diagnostics, "distance_cutoff")
+                    active[index] = False
+                    runner.freeze_graph(index)
+                    continue
+                try:
+                    rejected = physical_force_exceeds(diagnostics, sampler_config.get("max_force_cutoff"))
+                except (ValueError, TypeError):
+                    audit.record(index, "rejected", atoms_list[index], runner.nsteps, time_ps,
+                                 diagnostics, "invalid_physical_force_output")
+                    raise
+                if rejected:
+                    audit.record(index, "rejected", atoms_list[index], runner.nsteps, time_ps,
+                                 diagnostics, "physical_force_cutoff")
+                    active[index] = False
+                    runner.freeze_graph(index)
+                    continue
+                audit.record(index, "last_valid", atoms_list[index], runner.nsteps, time_ps, diagnostics)
+                if time_ps < min_time:
+                    continue
+                if not flags["uncertain"]:
+                    continue
 
-    if policy == "stop":
-        candidates.sort(key=lambda item: int(item["record"]["batch_index"]))
-    else:
-        candidates = _prune_candidates(
-            candidates,
-            return_top_k,
-            max_candidates_per_replica,
-        )
+                record = _candidate_record(
+                    diagnostics=diagnostics,
+                    flags=flags,
+                    molecule=molecule_objects[index],
+                    batch_index=index,
+                    step=int(runner.nsteps),
+                    time_ps=time_ps,
+                    distance=distance,
+                    sampler_config=sampler_config,
+                    policy=policy,
+                    temperature_parameters=temperature_parameters[index],
+                    temperature_history=temperature_histories[index],
+                    selected_state_value=selected_state_value,
+                    gap_seeking_state=gap_seeking_states[index],
+                    score=score,
+                )
+                if reference_topology is not None:
+                    record.update(topology_metadata(topology_result))
+                candidates.append(
+                    {
+                        "record": record,
+                        "atoms": atoms_list[index].copy(),
+                        "parent_metadata": dict(molecule_objects[index].get_metadata()),
+                    }
+                )
+                if policy == "stop":
+                    active[index] = False
+                    runner.freeze_graph(index)
+                else:
+                    candidates[:] = _prune_candidates(
+                        candidates,
+                        return_top_k,
+                        max_candidates_per_replica,
+                    )
 
-    outputs: list[MoleculesObject] = []
-    topology_summary = (
-        {
-            "topology_rejected_replica_count": len(topology_rejections),
-            "topology_rejections": [
-                dict(rejection) for rejection in topology_rejections
-            ],
-        }
-        if reference_topology is not None
-        else {}
-    )
-    if reference_topology is not None and not candidates:
-        print(
-            "ALCHEMI topology summary: "
-            f"{len(topology_rejections)} replica(s) rejected; "
-            "no valid uncertainty candidates returned."
-        )
-    for rank, candidate in enumerate(candidates):
-        parent_id = str(candidate["record"]["parent_molecule_id"])
-        molecule = MoleculesObject(candidate["atoms"], f"{parent_id}-cand-{rank:04d}")
-        metadata = dict(candidate["parent_metadata"])
-        metadata.update(candidate["record"])
-        metadata.update(
+            if not np.any(active):
+                break
+            switched_this_check = False
+            if bool(gap_seeking_settings.get("enabled", False)):
+                for batch_index in np.where(active)[0]:
+                    index = int(batch_index)
+                    state = gap_seeking_states[index]
+                    if state["switched"]:
+                        continue
+                    trigger = select_gap_seeking_trigger(
+                        diagnostics_by_index[index],
+                        gap_seeking_settings,
+                    )
+                    if trigger is None:
+                        continue
+                    runner.set_lcm_mode(
+                        index,
+                        pair=trigger["pair"],
+                        sigma=float(gap_seeking_settings["sigma"]),
+                        alpha_eV=float(gap_seeking_settings["alpha_eV"]),
+                    )
+                    state.update(
+                        {
+                            "current_mode": "lcm",
+                            "switched": True,
+                            "pair": list(trigger["pair"]),
+                            "trigger_gap_eV": float(trigger["gap_eV"]),
+                            "trigger_step": int(runner.nsteps),
+                            "trigger_time_ps": float(time_ps),
+                        }
+                    )
+                    state["events"].append(
+                        {
+                            "event": "enter_lcm",
+                            "step": int(runner.nsteps),
+                            "time_ps": float(time_ps),
+                            "pair": list(trigger["pair"]),
+                            "gap_key": str(trigger["gap_key"]),
+                            "gap_eV": float(trigger["gap_eV"]),
+                            "abs_gap_eV": float(trigger["abs_gap_eV"]),
+                        }
+                    )
+                    switched_this_check = True
+            if switched_this_check:
+                # NVTLangevin consumes the currently stored force at the start of
+                # its next step, so refresh the batch after changing graph modes.
+                runner.evaluate()
+            target_temperatures = np.asarray(
+                [
+                    annealing_schedule(
+                        time_ps,
+                        maxt,
+                        row["Tamp"],
+                        row["Tper"],
+                        row["Tsrt"],
+                        row["Tend"],
+                    )
+                    for row in temperature_parameters
+                ],
+                dtype=float,
+            )
+            for index in np.where(active)[0]:
+                temperature_histories[int(index)].append(
+                    float(target_temperatures[int(index)])
+                )
+            runner.set_temperature(target_temperatures)
+            runner.run(ncheck)
+
+        if policy == "stop":
+            candidates.sort(key=lambda item: int(item["record"]["batch_index"]))
+        else:
+            candidates = _prune_candidates(
+                candidates,
+                return_top_k,
+                max_candidates_per_replica,
+            )
+
+        outputs: list[MoleculesObject] = []
+        topology_summary = (
             {
-                "candidate_rank": int(rank),
-                "candidate_count": len(candidates),
-                "dynamics_backend": "alchemi_baoab",
-                "model_mode": mode,
-                "calculator_interface": str(
-                    getattr(model, "calculator_interface", "native")
-                ),
-                "calculator_loader": str(
-                    getattr(model, "calculator_loader", type(model).__name__)
-                ),
-                **topology_summary,
-                **(
-                    {"sampler_device": str(device)}
-                    if device is not None
-                    else {}
-                ),
+                "topology_rejected_replica_count": len(topology_rejections),
+                "topology_rejections": [
+                    dict(rejection) for rejection in topology_rejections
+                ],
             }
+            if reference_topology is not None
+            else {}
         )
-        molecule.update_metadata(metadata)
-        outputs.append(molecule)
-    return outputs
+        if reference_topology is not None and not candidates:
+            print(
+                "ALCHEMI topology summary: "
+                f"{len(topology_rejections)} replica(s) rejected; "
+                "no valid uncertainty candidates returned."
+            )
+        for rank, candidate in enumerate(candidates):
+            parent_id = str(candidate["record"]["parent_molecule_id"])
+            molecule = MoleculesObject(candidate["atoms"], f"{parent_id}-cand-{rank:04d}")
+            metadata = dict(candidate["parent_metadata"])
+            metadata.update(candidate["record"])
+            metadata.update(
+                {
+                    **({"force_screen_audit_path": str(audit.path)} if audit.path else {}),
+                    "candidate_rank": int(rank),
+                    "candidate_count": len(candidates),
+                    "dynamics_backend": "alchemi_baoab",
+                    "model_mode": mode,
+                    "calculator_interface": str(
+                        getattr(model, "calculator_interface", "native")
+                    ),
+                    "calculator_loader": str(
+                        getattr(model, "calculator_loader", type(model).__name__)
+                    ),
+                    **topology_summary,
+                    **(
+                        {"sampler_device": str(device)}
+                        if device is not None
+                        else {}
+                    ),
+                }
+            )
+            molecule.update_metadata(metadata)
+            outputs.append(molecule)
+        return outputs
+    finally:
+        audit.write()
 
 
 if _ALCHEMI_IMPORT_ERROR is None:
@@ -1468,6 +1496,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             self,
             *,
             selected_state_value: int = 0,
+            physical_force_states: list[int] | None = None,
             gap_rows: list[dict[str, Any]] | None = None,
             gap_seeking_settings: dict[str, Any] | None = None,
             well_params: dict[str, Any] | None = None,
@@ -1478,6 +1507,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
         ) -> None:
             torch.nn.Module.__init__(self)
             self.selected_state_value = int(selected_state_value)
+            self.physical_force_states = sorted(set(physical_force_states or [self.selected_state_value]))
             self.gap_rows = [dict(row) for row in (gap_rows or [])]
             self.gap_seeking_settings = dict(
                 gap_seeking_settings or {"enabled": False, "rows": []}
@@ -1506,6 +1536,9 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 active_outputs={"energy", "forces"},
             )
             self.last_diagnostics: dict[str, Any] = {}
+
+        def require_physical_states(self, states):
+            self.physical_force_states = sorted(set(int(state) for state in states))
 
         @property
         def embedding_shapes(self) -> dict[str, Any]:
@@ -1632,11 +1665,16 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 raise ValueError(
                     "ALCHEMI force contributions must use the same model count as energies."
                 )
-            if int(forces.numel()) != model_count * total_atoms * 3:
+            allowed_shapes = {(model_count, total_atoms, 3),
+                              (model_count, int(batch.num_graphs),
+                               int(batch.num_nodes_per_graph[0]), 3)}
+            if tuple(forces.shape) not in allowed_shapes:
                 raise ValueError(
                     "ALCHEMI force contributions must have shape [models, total_atoms, 3]."
                 )
             forces = forces.reshape(model_count, total_atoms, 3)
+            if not bool(torch.isfinite(forces).all()) or not bool(torch.isfinite(energy).all()):
+                raise ValueError("Physical energy/force contributions must be finite.")
             return energy, forces
 
         @staticmethod
@@ -1714,6 +1752,9 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     "force_contributions": forces,
                 },
             )
+            missing = sorted(set(self.physical_force_states) - set(state_contributions))
+            if missing:
+                raise KeyError(f"Physical force screening requires state_contributions for states {missing}.")
             state_results: dict[int, dict[str, Any]] = {}
             for state_value, values in state_contributions.items():
                 state_energy, state_forces = self._normalize_contributions(
@@ -1725,7 +1766,12 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     batch, state_energy, state_forces
                 )
                 state = int(state_value)
+                if int(state_energy.shape[0]) != int(energy.shape[0]):
+                    raise ValueError("Physical states must use the same ordered model count.")
                 state_results[state] = state_result
+                diagnostics[f"physical_F{state}_max"] = torch.linalg.vector_norm(
+                    state_result["forces"].reshape(int(batch.num_graphs), -1, 3), dim=2
+                ).amax(dim=1)
                 diagnostics[f"sE{state}"] = state_result["energy"]
                 diagnostics[f"sE{state}_stdev"] = state_result["energy_std"]
                 diagnostics[f"F{state}"] = state_result["forces"].reshape(
@@ -1812,12 +1858,17 @@ if _ALCHEMI_IMPORT_ERROR is None:
                         )
                     diagnostics[key] = value
 
+            diagnostics["Fmeanmax"] = torch.stack([
+                diagnostics[f"physical_F{state}_max"] for state in state_results
+            ]).amax(dim=0)
             num_graphs, num_atoms = self._batch_shape(batch)
             positions_batched = batch.positions.reshape(num_graphs, num_atoms, 3)
             selected_energy = selected["energy"].reshape(num_graphs, 1).clone()
             selected_forces = selected["forces"].reshape(
                 num_graphs, num_atoms, 3
             ).clone()
+            physical_selected_forces = selected_forces.clone()
+            lcm_correction = torch.zeros_like(selected_forces)
             for graph_index, control in sorted(self._lcm_controls.items()):
                 if graph_index >= num_graphs:
                     raise IndexError(
@@ -1851,16 +1902,24 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 )
                 selected_energy[graph_index, 0] = lcm_energy
                 selected_forces[graph_index] = lcm_forces
+                lcm_correction[graph_index] = lcm_forces - 0.5 * (
+                    lower_result["forces"].reshape(num_graphs, num_atoms, 3)[graph_index]
+                    + upper_result["forces"].reshape(num_graphs, num_atoms, 3)[graph_index])
+            diagnostics["lcm_bias_Fmax"] = torch.linalg.vector_norm(
+                selected_forces - physical_selected_forces, dim=2).amax(dim=1)
+            diagnostics["lcm_correction_Fmax"] = torch.linalg.vector_norm(
+                lcm_correction, dim=2).amax(dim=1)
             well_energy, well_forces = self._well_energy_forces(
                 batch, positions_batched
             )
             if well_energy is not None:
                 selected_energy = selected_energy + well_energy
                 selected_forces = selected_forces + well_forces
-            diagnostics["Fmeanmax"] = torch.amax(
-                torch.linalg.vector_norm(selected_forces, dim=2),
-                dim=1,
-            )
+            diagnostics["confinement_Fmax"] = (
+                torch.zeros(num_graphs, device=selected_forces.device) if well_forces is None
+                else torch.linalg.vector_norm(well_forces, dim=2).amax(dim=1))
+            diagnostics["propagation_Fmax"] = torch.linalg.vector_norm(
+                selected_forces, dim=2).amax(dim=1)
             self.last_diagnostics = {
                 key: value.detach() if hasattr(value, "detach") else value
                 for key, value in diagnostics.items()
@@ -1871,7 +1930,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             }
 
         def diagnostics_for_graph(self, graph_index: int) -> dict[str, Any]:
-            values: dict[str, Any] = {}
+            values: dict[str, Any] = {"force_screen_schema": SCHEMA, "force_screen_source": SOURCE}
             for key, tensor in self.last_diagnostics.items():
                 value = tensor[int(graph_index)]
                 if hasattr(value, "detach"):
@@ -1893,6 +1952,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             energy_key: str = "energy",
             force_key: str = "forces",
             selected_state_value: int = 0,
+            physical_force_states: list[int] | None = None,
             gap_rows: list[dict[str, Any]] | None = None,
             gap_seeking_settings: dict[str, Any] | None = None,
             well_params: dict[str, Any] | None = None,
@@ -1909,6 +1969,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 raise ValueError("Native ensemble members require incompatible batch inputs.")
             super().__init__(
                 selected_state_value=selected_state_value,
+                physical_force_states=physical_force_states,
                 gap_rows=gap_rows,
                 gap_seeking_settings=gap_seeking_settings,
                 well_params=well_params,
@@ -1932,7 +1993,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
         def ensemble_forward(self, batch) -> dict[str, Any]:
             energies = []
             forces = []
-            required_lcm_states = {
+            required_lcm_states = set(self.physical_force_states) - {self.selected_state_value} | {
                 int(state)
                 for row in self.gap_seeking_settings.get("rows", [])
                 for state in (row["lower_state"], row["upper_state"])
@@ -1956,6 +2017,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
                             output.get("state_contributions") or {}
                         ).items()
                     }
+                    raw_states.setdefault(self.selected_state_value, {
+                        "energy": output[self.energy_key], "forces": output[self.force_key]})
                     missing = sorted(required_lcm_states - set(raw_states))
                     if missing:
                         raise KeyError(
@@ -2008,6 +2071,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             *,
             model_mode: str,
             selected_state_value: int | None,
+            physical_force_states: list[int] | None = None,
             gap_rows: list[dict[str, Any]] | None = None,
             gap_seeking_settings: dict[str, Any] | None = None,
             well_params: dict[str, Any] | None = None,
@@ -2028,6 +2092,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             selected = 0 if selected_state_value is None else int(selected_state_value)
             super().__init__(
                 selected_state_value=selected,
+                physical_force_states=physical_force_states,
                 gap_rows=gap_rows,
                 gap_seeking_settings=gap_seeking_settings,
                 well_params=well_params,
@@ -2038,7 +2103,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             mode = str(model_mode).strip().lower()
             self.energy_key = "energy" if mode == "ground_state" else f"sE{selected}"
             self.force_key = "forces" if mode == "ground_state" else f"F{selected}"
-            gap_states = {
+            gap_states = set(self.physical_force_states) if mode == "excited_state" else set()
+            gap_states |= {
                 int(state)
                 for row in self.gap_rows
                 for state in (row["lower_state"], row["upper_state"])
@@ -2046,7 +2112,8 @@ if _ALCHEMI_IMPORT_ERROR is None:
             self.gap_energy_keys = {
                 state: f"sE{state}" for state in sorted(gap_states)
             }
-            lcm_states = {
+            lcm_states = set(self.physical_force_states) if mode == "excited_state" else set()
+            lcm_states |= {
                 int(state)
                 for row in self.gap_seeking_settings.get("rows", [])
                 for state in (row["lower_state"], row["upper_state"])
@@ -2058,6 +2125,12 @@ if _ALCHEMI_IMPORT_ERROR is None:
             self.uncertainty_mode = (
                 None if uncertainty_mode is None else str(uncertainty_mode).lower()
             )
+
+        def require_physical_states(self, states):
+            super().require_physical_states(states)
+            if self.energy_key != "energy":
+                self.gap_energy_keys.update({state: f"sE{state}" for state in states})
+                self.gap_force_keys.update({state: f"F{state}" for state in states})
 
         def set_device(self, device: Any) -> None:
             self._device = torch.device(device)
@@ -2245,6 +2318,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             ensemble_graph: Any,
             state_nodes: list[dict[str, Any]],
             selected_state_value: int,
+            physical_force_states: list[int] | None = None,
             gap_rows: list[dict[str, Any]] | None = None,
             gap_seeking_settings: dict[str, Any] | None = None,
             species_key: str,
@@ -2255,6 +2329,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
         ) -> None:
             super().__init__(
                 selected_state_value=selected_state_value,
+                physical_force_states=physical_force_states,
                 gap_rows=gap_rows,
                 gap_seeking_settings=gap_seeking_settings,
                 well_params=well_params,
@@ -2264,6 +2339,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             )
             self.ensemble_graph = ensemble_graph
             self.state_nodes = list(state_nodes)
+            self.require_physical_states([int(row["state"]) for row in self.state_nodes])
             self.species_key = str(species_key)
             self.coordinates_key = str(coordinates_key)
             self._make_predictor()
@@ -2612,6 +2688,7 @@ def load_alchemi_calculator(
         properties_list,
         selected_state_value,
     )
+    physical_states = _physical_force_states(model_mode, selected_state_value, properties_list)
     native_loader_path = sampler_config.get("alchemi_calculator")
     if native_loader_path:
         loader = load_module_from_string(str(native_loader_path))
@@ -2629,6 +2706,7 @@ def load_alchemi_calculator(
             raise TypeError(
                 "alchemi_calculator must return an ALFAlchemiCalculator instance."
             )
+        model.require_physical_states(physical_states)
         model.well_params = None if well_params is None else dict(well_params)
         model.gap_rows = [dict(row) for row in gap_rows]
         model.gap_seeking_settings = dict(gap_seeking_settings)
@@ -2660,6 +2738,7 @@ def load_alchemi_calculator(
         uncertainty_mode = None
     return ALFASEAlchemiModel(
         calculators,
+        physical_force_states=physical_states,
         model_mode=model_mode,
         selected_state_value=selected_state_value,
         gap_rows=gap_rows,
@@ -2723,7 +2802,7 @@ def alchemi_sampling_task(
         properties_list=properties_list,
         device=device,
     )
-    run_options = {"device": device}
+    run_options = {"device": device, "properties_list": properties_list}
     if master_directory is not None:
         run_options["master_directory"] = master_directory
     outputs = run_alchemi_sampling(
