@@ -215,6 +215,11 @@ policy, QM backend, or state count. Geometry files must stay outside the run's
 labeled training store. See ``examples/rdkit_initialization/README.md`` for the
 full method, atom-identity guarantees, configuration fields, and count accounting.
 
+For a complete four-state keto workflow from generated seeds through ordinary
+ALF and a verified GALF handoff, see ``examples/keto_rdkit_alf_galf/README.md``.
+It includes all configuration files, an editable Parsl template, and explicit
+40k handoff / 50k and 60k snapshot commands; automatic stopping is not added.
+
 Related Examples
 ----------------
 
