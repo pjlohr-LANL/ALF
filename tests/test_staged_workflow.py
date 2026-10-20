@@ -1,16 +1,83 @@
-"""Retained-frame snapshots and durable lifecycle recovery."""
+"""Retained-frame budgets, durable publication/replay, and linear workflows."""
 import json
 from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 
 import h5py
 import numpy as np
 import pytest
 from ase import Atoms
+from ase.io import read,write
 
 from alframework.tools.workflow_io import (
     ROW_KEY, PHASE_KEY, ExclusiveLock, atomic_json, fingerprint, freeze_snapshot,
     read_json, scan_store, verify_snapshot,
 )
+from alframework.tools.staged_workflow import definition,prepare_workflow,WorkflowRunner
+
+ROOT=Path(__file__).resolve().parents[1]
+
+
+def fixture_workflow(tmp_path, *, excited=False, stages=2, fail=False):
+    inputs=tmp_path/'inputs'; inputs.mkdir()
+    if excited:
+        atoms=read(ROOT/'examples/keto_rdkit_alf_galf/keto.xyz')
+    else:
+        atoms=Atoms('OH2',positions=[[0,0,0],[.96,0,0],[-.24,.93,0]])
+    reference=inputs/'reference.xyz'; write(reference,atoms)
+    order=np.argsort(atoms.numbers,kind='stable')
+    with h5py.File(inputs/'seed.h5','w') as handle:
+        group=handle.create_group('seed')
+        group['coordinates']=np.stack([atoms.positions[order]]*2)
+        group['species']=np.asarray(atoms.get_chemical_symbols(),dtype='S2')[order]
+        group['topology_atom_ids']=order
+        group['_id']=np.asarray(['same-source-id','same-source-id'],dtype='S20')
+    properties=({'energy':['energy','system',1.],'forces':['forces','atomic',1.]} if not excited else
+                {f'{prefix}{state}':[f'{prefix}{state}',scope,1.] for state in range(4) for prefix,scope in [('sE','system'),('F','atomic')]})
+    if excited:
+        properties.update({f'dE{i}{i+1}':[f'dE{i}{i+1}','system',1.] for i in range(3)})
+    builder={'source_priority':'h5_only','selection_seed':42,'bootstrap_h5_path':str(inputs/'seed.h5'),
+             'bootstrap_h5_count':1,'bootstrap_selection_mode':'sequential'}
+    sampler={'model_mode':'excited_state' if excited else 'ground_state','dt':.1,'maxt':.0002,'Ncheck':1,
+             'min_time':0.,'Escut':.001,'Fscut':.01,'distcut':.7,'min_distance_cutoff':.7,'max_force_cutoff':16.,
+             'srt_temp':[300.,300.],'end_temp':[300.,300.],'amp_temp':[0.,0.],'per_temp':[1.,1.],
+             'end_dens':None,'amp_dens':None,'per_dens':None,'return_top_k':2,'uncertainty_policy':'continue',
+             'score':{'mode':'sum','w_energy':1.,'w_force':1.,'w_gap_uncertainty':0.},
+             'dataset_screening':{'enabled':True,'force':excited,'min_distance':True,'topology':excited}}
+    if excited:
+        sampler.update(state_selection={'mode':'fixed','state':0},alchemi_baoab={'batch_size':2,'partial_policy':'full_only'},
+                       topology_check={'enabled':True,'reference_conformer_path':'reference.xyz','reference_format':'xyz','reference_charge':0,
+                                       'bond_min_scale':.85,'bond_max_scale':1.5,'connectivity_scale':1.25})
+    master={'master_directory':'pwd','h5_path':'h5store/data-{:04d}.h5','model_path':'models/model-{:04d}',
+            'status_path':'status.json','QM_task':'tests.helpers.staged_apps.qm','QM_config_path':'QM.json',
+            'ML_task':'tests.helpers.staged_apps.train','ML_config_path':'ML.json',
+            'builder_task':'alframework.builders.h5_replay_builder.h5_replay_builder_local_task','builder_config_path':'builder.json',
+            'sampler_task':'tests.helpers.staged_apps.sample','sampler_config_path':'sampler.json',
+            'properties_list':properties,'parsl_configuration':'tests.helpers.staged_apps.config',
+            'parsl_debug_configuration':'unused_debug.configuration',
+            'bootstrap_set':2,'parallel_samplers':2,'maximum_builder_structures':2 if excited else 1,
+            'target_queued_QM':2,'minimum_QM':0,'save_h5_threshold':2,'gpus_per_node':0,
+            'run_control':{'poll_interval_seconds':.01}}
+    for filename,value in [('master.json',master),('builder.json',builder),('sampler.json',sampler),
+                           ('QM.json',{'events_dir':'events','reject_seed':True,'fail_first_qm':fail}),('ML.json',{'n_models':4})]:
+        atomic_json(inputs/filename,value)
+    plan=[]
+    for index in range(stages):
+        stage_master=dict(master)
+        stage_sampler=dict(sampler)
+        if excited and index==1:
+            stage_sampler['gap_seeking']={'enabled':True,'mode':'levine_coe_martinez_switch','switch_policy':'stay_fixed',
+                                          'candidate_pairs':'adjacent','trigger_gap_threshold_eV':.1,'alpha_eV':.05,'sigma':3.5}
+        atomic_json(inputs/f'sampler{index}.json',stage_sampler)
+        stage_master['sampler_config_path']=f'sampler{index}.json'
+        atomic_json(inputs/f'master{index}.json',stage_master)
+        plan.append({'name':'galf' if excited and index==1 else f'alf{index}', 'master_config':f'master{index}.json',
+                     'target_total_frames':3+index*2,'checkpoints':[4] if index==1 else [],
+                     'output_paths':{'QM.events_dir':'events'}})
+    path=inputs/'workflow.json'; atomic_json(path,{'stages':plan,'final_training':True})
+    return path
 
 
 def test_snapshot_multiple_groups_alignment_units_metadata_and_duplicates(tmp_path):
@@ -48,6 +115,80 @@ def test_snapshot_multiple_groups_alignment_units_metadata_and_duplicates(tmp_pa
     with ExclusiveLock(tmp_path/'lock'):
         with pytest.raises(RuntimeError,match='Another controller'):
             ExclusiveLock(tmp_path/'lock')
+    assert snapshot['units']=={'energy':{'units':'stored energy units'}}
+    with h5py.File(directory/'data-0010.h5','a') as handle:
+        handle['H02/energy'].attrs['units']='incompatible energy units'
+    with pytest.raises(ValueError,match='Conflicting stored units'):
+        scan_store(pattern,properties)
+
+
+@pytest.mark.parametrize('excited,stages',[(False,1),(False,2),(True,2)],ids=['alf-only','legacy-stages','alf-galf'])
+def test_full_workflow_actual_driver_targets_and_final_model(tmp_path,excited,stages):
+    path=fixture_workflow(tmp_path,excited=excited,stages=stages)
+    root=tmp_path/'run'
+    prepare_workflow(path,root)
+    assert WorkflowRunner(root).run()==0
+    status=read_json(root/'workflow_status.json')
+    assert status['state']=='completed'
+    last=3+(stages-1)*2
+    assert status['final_training']['input_frames']==last
+    model=Path(status['final_training']['directory'])
+    assert read_json(model/'input_frames.json')['frames']==last
+    for index,stage in enumerate(read_json(root/'workflow.json')['stages']):
+        directory=Path(stage['run_directory'])
+        progress=read_json(directory/'control/progress.json')
+        assert progress['state']=='completed' and progress['accepted_frames']>=stage['target_total_frames']
+        manifest=verify_snapshot(directory/'checkpoints'/str(stage['target_total_frames']))
+        assert manifest['frames']==stage['target_total_frames']
+        inputs=read_json(directory/'models/model-0000/input_frames.json')
+        assert inputs['frames']==(1 if index==0 else 3) # First seed converges; second is rejected.
+        if index:
+            small=verify_snapshot(directory/'checkpoints/4')
+            big=verify_snapshot(directory/'checkpoints/5')
+            keys=lambda m:[(r['sha256'],g['group'],row) for r in m['sources'] for g in r['groups'] for row in g['rows']]
+            assert keys(small)==keys(big)[:4]
+        with sqlite3.connect(directory/'control/journal.sqlite') as db:
+            assert db.execute("SELECT COUNT(*) FROM tasks WHERE role='QM' AND state!='consumed'").fetchone()[0]==0
+            if index:
+                acquired=db.execute("SELECT COUNT(*) FROM tasks WHERE role='QM' AND state='consumed'").fetchone()[0]
+                assert progress['accepted_frames']==3+acquired # Independent branches may reuse frame IDs, never workflow row identities.
+
+    if excited:
+        import warnings
+        from hippynn.databases.h5_pyanitools import PyAniDirectoryDB
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore',message='Skipping key')
+            database=PyAniDirectoryDB(directory=str(root/'stages/01-galf/checkpoints/5/h5store'),
+                inputs=None,targets=None,allow_unfound=True,quiet=True,seed=42)
+        assert database.arr_dict['coordinates'].shape[0]==last
+        assert database.arr_dict['F0'].shape==(last,15,3)
+    before=fingerprint(model/'input_frames.json')
+    assert WorkflowRunner(root).run()==0
+    assert fingerprint(model/'input_frames.json')==before
+
+
+def test_validation_rejects_incompatible_labels_and_mutation(tmp_path):
+    path=fixture_workflow(tmp_path)
+    config=read_json(path)
+    config['stages'][1]['target_total_frames']=3
+    atomic_json(path,config)
+    with pytest.raises(ValueError,match='strictly increase'):
+        definition(path)
+    config['stages'][1]['target_total_frames']=5
+    atomic_json(path,config)
+    stage=path.parent/'QM.json'
+    original=read_json(stage)
+    other={**original,'method':'different'}
+    atomic_json(path.parent/'otherQM.json',other)
+    master=read_json(path.parent/'master1.json'); master['QM_config_path']='otherQM.json'
+    atomic_json(path.parent/'master1.json',master)
+    with pytest.raises(ValueError,match='incompatible'):
+        definition(path)
+    master['QM_config_path']='QM.json'
+    master['QM_task']='tests.helpers.staged_apps.other_label_method'
+    atomic_json(path.parent/'master1.json',master)
+    with pytest.raises(ValueError,match='incompatible'):
+        definition(path)
 
 
 class ImmediateApp:
@@ -199,3 +340,98 @@ def test_training_result_and_partial_attempt_recovery(tmp_path):
         pass
     with pytest.raises(RuntimeError,match='outside the configured shard pattern'):
         journal_control(tmp_path/'partial')
+
+
+def test_pause_drains_and_resume_reuses_committed_work(tmp_path):
+    import threading,time
+    path=fixture_workflow(tmp_path,stages=1)
+    root=tmp_path/'run'; prepare_workflow(path,root)
+    runner=WorkflowRunner(root)
+    def pause_at_first_shard():
+        deadline=time.monotonic()+20
+        shard=root/'stages/00-alf0/h5store/data-0000.h5'
+        while not shard.exists() and time.monotonic()<deadline:
+            time.sleep(.002)
+        runner.interrupt()
+    thread=threading.Thread(target=pause_at_first_shard,daemon=True); thread.start()
+    assert runner.run()==130
+    thread.join(timeout=1)
+    progress=read_json(root/'stages/00-alf0/control/progress.json')
+    assert progress['state']=='paused'
+    with sqlite3.connect(root/'stages/00-alf0/control/journal.sqlite') as db:
+        completed=dict(db.execute("SELECT key,attempts FROM tasks WHERE role='QM' AND state='consumed'"))
+    assert WorkflowRunner(root).run()==0
+    with sqlite3.connect(root/'stages/00-alf0/control/journal.sqlite') as db:
+        assert all(dict(db.execute('SELECT key,attempts FROM tasks'))[key]==attempts for key,attempts in completed.items())
+    assert read_json(root/'workflow_status.json')['state']=='completed'
+
+
+@pytest.mark.parametrize('role',['QM','builder'])
+def test_backend_failure_blocks_advancement_and_explicit_resume_retries(tmp_path,role):
+    path=fixture_workflow(tmp_path,fail=role=='QM')
+    if role=='builder':
+        for index in range(2):
+            master=read_json(path.parent/f'master{index}.json')
+            master['builder_task']='tests.helpers.staged_apps.builder'
+            atomic_json(path.parent/f'master{index}.json',master)
+    root=tmp_path/'run'; prepare_workflow(path,root)
+    with pytest.raises(RuntimeError,match='Stage alf0 failed'):
+        WorkflowRunner(root).run()
+    assert not (root/'stages/01-alf1/control/progress.json').exists()
+    assert read_json(root/'workflow_status.json')['state']=='failed'
+    with pytest.raises(RuntimeError,match='Stage alf1 failed'):
+        WorkflowRunner(root).run()
+    assert WorkflowRunner(root).run()==0
+    state=read_json(root/'stages/00-alf0/control/progress.json')
+    assert state['possible_recomputations']>=1
+    assert state['tasks'][role]['attempt_outcomes']['failed']>=1
+    assert state['tasks'][role]['attempt_outcomes']['succeeded']>=1
+
+
+@pytest.mark.parametrize('fault',['handoff','final-training'])
+def test_interrupted_handoff_and_final_training_resume(tmp_path,monkeypatch,fault):
+    import shutil
+    from alframework.tools import staged_workflow as module
+    path=fixture_workflow(tmp_path)
+    if fault=='final-training':
+        atomic_json(path.parent/'ML.json',{'n_models':4,'fail_final_once':True})
+    root=tmp_path/'run'; prepare_workflow(path,root)
+    if fault=='handoff':
+        def partial_copy(checkpoint,stage):
+            manifest=verify_snapshot(checkpoint)
+            first=manifest['artifacts'][0]
+            destination=Path(stage['run_directory'])/first['relative_path']
+            shutil.copy2(first['path'],destination)
+            raise RuntimeError('Injected handoff interruption')
+        monkeypatch.setattr(module,'inherit_checkpoint',partial_copy)
+    with pytest.raises(RuntimeError,match='Injected handoff|Final training failed'):
+        WorkflowRunner(root).run()
+    before=read_json(root/'stages/00-alf0/control/progress.json')['tasks']['QM']['attempts']
+    monkeypatch.undo()
+    assert WorkflowRunner(root).run()==0
+    assert read_json(root/'stages/00-alf0/control/progress.json')['tasks']['QM']['attempts']==before
+    final=read_json(root/'workflow_status.json')['final_training']
+    assert final['input_frames']==5
+    if fault=='final-training':
+        assert final['model_index']==1
+        assert (root/'final_training/models/model-0000/partial').exists()
+    artifact=Path(final['artifacts'][0]['path'])
+    artifact.write_bytes(b'changed completed model')
+    with pytest.raises(RuntimeError,match='fingerprint changed'):
+        WorkflowRunner(root).run()
+
+
+def test_cli_validation_status_and_pinned_resume(tmp_path,capsys):
+    from alframework.tools.staged_workflow import main
+    path=fixture_workflow(tmp_path,stages=1)
+    root=tmp_path/'run'
+    assert main(['--config',str(path),'--run-dir',str(root),'--validate'])==0
+    assert not root.exists()
+    assert json.loads(capsys.readouterr().out)['valid']
+    prepare_workflow(path,root)
+    assert main(['--run-dir',str(root),'--status'])==0
+    report=json.loads(capsys.readouterr().out)
+    assert report['workflow']['state']=='prepared' and report['stages']=={}
+    value=read_json(path); value['final_training']=False; atomic_json(path,value)
+    with pytest.raises(RuntimeError,match='definition changed'):
+        main(['--config',str(path),'--run-dir',str(root),'--resume'])

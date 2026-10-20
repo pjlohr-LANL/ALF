@@ -193,10 +193,21 @@ def validate_reference_layout(manifest,reference_numbers):
                 # Untagged legacy rows stay untagged; no identity permutation is fabricated.
         verify(record)
 
+def attribute_value(value):
+    if isinstance(value,np.ndarray):
+        return attribute_value(value.tolist())
+    if isinstance(value,np.generic):
+        return attribute_value(value.item())
+    if isinstance(value,(list,tuple)):
+        return [attribute_value(item) for item in value]
+    return value.decode() if isinstance(value,bytes) else value
+
+
 def scan_store(pattern, properties, *, count=None, closed_before=None):
     if count is not None and (isinstance(count,bool) or not isinstance(count,int) or count < 1):
         raise ValueError('Snapshot count must be a positive integer.')
     selected, available, invalid, sources = 0, 0, 0, []
+    units = {}
     for index, path in shards(pattern, closed_before):
         record = fingerprint(path)
         groups = []
@@ -207,6 +218,15 @@ def scan_store(pattern, properties, *, count=None, closed_before=None):
                 if not isinstance(group,h5py.Group) or 'coordinates' not in group:
                     raise ValueError(f'Unexpected non-molecular H5 entry: {path}:{name}')
                 rows = group_valid_rows(group, properties)
+                for schema in properties.values():
+                    dataset=group[schema[0]]
+                    for attribute in ('unit','units'):
+                        if attribute in dataset.attrs:
+                            value=attribute_value(dataset.attrs[attribute])
+                            recorded=units.setdefault(schema[0],{})
+                            if recorded and next(iter(recorded.values()))!=value:
+                                raise ValueError(f'Conflicting stored units for {schema[0]}: {path}:{name}')
+                            recorded[attribute]=value
                 n = len(group['coordinates'])
                 available += len(rows)
                 invalid += n-len(rows)
@@ -233,7 +253,7 @@ def scan_store(pattern, properties, *, count=None, closed_before=None):
         raise ValueError(f'Need {count} finite retained frames; found {selected}.')
     phases = [phase for record in sources for group in record['groups'] for phase in group['phases']]
     return {'schema':'alf.snapshot.v1','frames':selected,'available_frames':available,'nonfinite_frames':invalid,
-            'overshoot':available-selected,'properties':properties,'sources':sources,
+            'overshoot':available-selected,'properties':properties,'units':units,'sources':sources,
             'phase_counts':{phase:phases.count(phase) for phase in sorted(set(phases))}}
 
 
