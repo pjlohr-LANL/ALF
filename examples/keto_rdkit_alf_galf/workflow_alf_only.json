@@ -1,0 +1,11 @@
+{
+  "final_training": true,
+  "stages": [
+    {
+      "name": "alf",
+      "master_config": "master_alf.json",
+      "target_total_frames": 60000,
+      "checkpoints": [50000]
+    }
+  ]
+}

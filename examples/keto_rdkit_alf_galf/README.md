@@ -10,8 +10,9 @@ KDG ladder → geometry screens → stratified FPS → single-point QM labels
   → fresh ensemble → GALF → frozen first 50k and 60k (including inherited data)
 ```
 
-These are explicit stages. ALF does not stop or switch automatically at a frame
-budget. No monitoring command submits tasks or stops a running driver.
+The staged runner can automate budgets, handoff, and endpoint training using
+`workflow_alf_galf.json` or `workflow_alf_only.json`. The explicit manual commands
+below remain available; standalone `launch.sh` runs indefinitely.
 
 ## Software and resources
 
@@ -51,6 +52,53 @@ activate the same environment on workers. Set GPU directives according to your
 site; this template deliberately does not assume a particular TRES syntax.
 Run only one driver per run directory. A persistent `tmux` session or a suitable
 site-specific driver allocation must outlive the worker allocations.
+
+## Automated staged execution
+
+Prepare the inputs and geometry seeds explicitly, then configure the copied
+Parsl file in the input directory:
+
+```bash
+python "$EXAMPLE/prepare.py" init --output-dir "$RUN_ROOT/inputs"
+python -m alframework.tools.rdkit_initialization \
+    --config "$RUN_ROOT/inputs/seed_config.json" \
+    --output-dir "$RUN_ROOT/inputs/seeds"
+python -m alframework.tools.staged_workflow \
+    --config "$RUN_ROOT/inputs/workflow_alf_galf.json" \
+    --run-dir "$RUN_ROOT/staged" --validate
+python -m alframework.tools.staged_workflow \
+    --config "$RUN_ROOT/inputs/workflow_alf_galf.json" \
+    --run-dir "$RUN_ROOT/staged"
+```
+
+Run the final command inside a persistent driver session. The workflow labels
+seeds, runs ALF to a seed-inclusive 40k checkpoint, drains outstanding work,
+trains a fresh four-member GALF ensemble on exactly 40k, and continues to exact
+50k/60k checkpoints. Completion also requires a final four-member ensemble
+trained on the selected 60k dataset. It writes independent stage directories;
+models and ALF status are not inherited.
+
+Use `workflow_alf_only.json` for a single ALF stage with 50k/60k checkpoints and
+a final 60k ensemble. A dataset-only workflow can set `final_training` false.
+No GALF code is selected by the ALF-only configuration.
+
+```bash
+python -m alframework.tools.staged_workflow --run-dir "$RUN_ROOT/staged" --status
+python -m alframework.tools.staged_workflow \
+    --config "$RUN_ROOT/inputs/workflow_alf_galf.json" \
+    --run-dir "$RUN_ROOT/staged" --resume
+```
+
+SIGINT/SIGTERM requests a drain and pause; the next stage waits until resume.
+Keep the pinned input/configuration files unchanged. Committed labels and
+harvested results are reused; interrupted model attempts are preserved. The
+runner refuses competing controllers and incompatible inherited labels.
+
+These budgets apply to exact selected datasets. Raw stores retain overshoot
+from submitted work, and QM cost is recorded separately. The final model uses
+the exact checkpoint, rather than the overshooting raw store. See the
+[generic staged-workflow guide](../../docs/staged_workflows.md) for accounting,
+resource requirements, supported configuration changes, and recovery details.
 
 ## 1. Prepare and label fresh seeds
 
@@ -215,8 +263,8 @@ run information remain under each run root. Keep source and snapshot manifests
 alongside the data for reproducibility.
 
 Use the same run master for an ordinary resume. Do not copy status between
-runs. The unchanged driver does not provide transactional recovery for
-interrupted bootstrap, in-flight work, or partially written model directories.
+runs. Standalone manual mode does not use the staged journal for transactional
+recovery of bootstrap, in-flight work, or partially written model directories.
 Inspect those artifacts before restarting; do not launch a second driver or
 assume a model directory alone proves training completed. The checker rejects
 an unpromoted initial model directory rather than permitting accidental reuse.

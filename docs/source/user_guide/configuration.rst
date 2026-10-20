@@ -150,6 +150,40 @@ A typical ALF run follows this lifecycle:
 7. Retrain or fine-tune the model ensemble and update the current model id.
 8. Repeat sampling, QM labeling, and retraining until the run is stopped.
 
+Optional Staged Workflows
+-------------------------
+
+Use ``alframework.tools.staged_workflow`` to coordinate a linear sequence of
+ordinary ALF configurations with cumulative retained-frame budgets:
+
+.. code-block:: bash
+
+   python -m alframework.tools.staged_workflow \
+       --config workflow.json --run-dir experiment --validate
+   python -m alframework.tools.staged_workflow \
+       --config workflow.json --run-dir experiment
+   python -m alframework.tools.staged_workflow --run-dir experiment --status
+   python -m alframework.tools.staged_workflow \
+       --config workflow.json --run-dir experiment --resume
+
+Each stage names a master configuration and ``target_total_frames``. Targets
+include seed and inherited labels and must increase across stages. ALF-only
+uses one stage; GALF is configured through the next stage's ordinary sampler.
+Seed generation remains a separate preparation command.
+
+At a target, acquisition drains, accepted overshoot remains in the raw store,
+and an exact checkpoint enters the next stage. Every stage trains fresh.
+``final_training`` defaults to true and requires a complete final ensemble
+trained from the exact endpoint checkpoint. These are dataset budgets, not
+hard QM-attempt or runtime limits. The standalone ALF command remains unchanged
+when ``run_control`` is absent.
+
+The controller owns configuration materialization, locks, durable task and H5
+records, transitions, and explicit resume. The driver only delegates optional
+lifecycle boundaries. See ``docs/staged_workflows.md`` and
+``examples/keto_rdkit_alf_galf/README.md`` for complete definitions, recovery
+semantics, and ALF-only / ALF-to-GALF examples.
+
 Stage Config Files
 ------------------
 

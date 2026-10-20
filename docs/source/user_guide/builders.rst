@@ -218,7 +218,11 @@ full method, atom-identity guarantees, configuration fields, and count accountin
 For a complete four-state keto workflow from generated seeds through ordinary
 ALF and a verified GALF handoff, see ``examples/keto_rdkit_alf_galf/README.md``.
 It includes all configuration files, an editable Parsl template, and explicit
-40k handoff / 50k and 60k snapshot commands; automatic stopping is not added.
+40k handoff / 50k and 60k snapshot commands. Optional ``workflow_alf_only.json``
+and ``workflow_alf_galf.json`` definitions automate retained-frame budgets and
+clean stage transitions through ``alframework.tools.staged_workflow``; seed
+generation remains explicit. See :doc:`configuration` and
+``docs/staged_workflows.md`` for status, resume, and exact endpoint training.
 
 Related Examples
 ----------------

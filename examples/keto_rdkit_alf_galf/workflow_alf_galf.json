@@ -1,0 +1,16 @@
+{
+  "final_training": true,
+  "stages": [
+    {
+      "name": "alf",
+      "master_config": "master_alf.json",
+      "target_total_frames": 40000
+    },
+    {
+      "name": "galf",
+      "master_config": "master_galf.json",
+      "target_total_frames": 60000,
+      "checkpoints": [50000]
+    }
+  ]
+}

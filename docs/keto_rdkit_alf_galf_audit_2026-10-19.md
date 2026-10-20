@@ -1,5 +1,9 @@
 # Staged keto RDKit → ALF → GALF example audit — 2026-10-19
 
+This records the original manual example implementation. The later optional
+generic staged runner automates budgets and handoffs while preserving those
+manual commands; see the [staged-workflow audit](staged_workflow_audit_2026-10-19.md).
+
 Implementation checkout: `/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF`, branch
 `production_excited_states`. Starting tip: `3753b25`; example/preparation/tests
 commit: `70e1d2a`. Upstream main remains pinned at

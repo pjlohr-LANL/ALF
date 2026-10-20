@@ -1,10 +1,13 @@
 # Production excited-state integration audit — 2026-10-19
 
-Current production-checkout validation after adding the staged four-state keto
-RDKit → ALF → GALF example: **429 fork tests passed** and **47 unchanged main
-tests passed**. The example uses explicit preparation, handoff, and snapshot
-commands without changing the core driver or production runtime modules. See
-the [keto example audit](keto_rdkit_alf_galf_audit_2026-10-19.md).
+Current production-checkout validation after adding generic retained-frame
+workflow stages: **447 fork tests passed** and **47 unchanged main tests passed**.
+The optional runner owns budgets, exact snapshots, journaled recovery, and fresh
+endpoint training. Generic lifecycle hooks are opt-in; standalone runs and the
+manual keto commands retain their behavior. See the
+[staged-workflow audit](staged_workflow_audit_2026-10-19.md).
+The earlier manual keto example passed 429 tests, recorded in its
+[keto example audit](keto_rdkit_alf_galf_audit_2026-10-19.md).
 The preceding optional seed-preparation implementation passed 414 fork tests;
 its [RDKit implementation audit](rdkit_initialization_audit_2026-10-19.md)
 records method parity and validation separately.
@@ -79,7 +82,7 @@ including changes predating this integration.
 
 | Existing file | Delta (added/removed) | Why it remains necessary |
 |---|---:|---|
-| `alframework/__main__.py` | 199 / 39 | Generic batching and strict-full buffering; replica-based queue capacity; task argument/config reload support; nested result flattening; storage acceptance hooks and summaries; a tools-owned debug-validation call. The storage trigger uses `>=` so an exact threshold can retrain. |
+| `alframework/__main__.py` | 283 / 69 | Generic batching and strict-full buffering; replica-based queue capacity; task argument/config reload support; nested result flattening; storage acceptance hooks and summaries; a tools-owned debug-validation call; optional lifecycle delegation for staged draining and transactional storage. The storage trigger uses `>=` so an exact threshold can retrain. |
 | `alframework/builders/builders.py` | 5 / 0 | Optional explicit PBC override for molecular CFG inputs; omitted settings retain main behavior. |
 | `alframework/tools/tools.py` | 88 / 1 | `pair_atomic` storage and electronic-state pair metadata; validated, opt-in topology ID persistence. Main's sorting contract is restored; stable ties are deterministic. |
 | `setup.py` | 17 / 1 | Optional excited-state, HIPPYNN, and GPU-dynamics dependencies, keeping base installs usable. |
@@ -88,7 +91,8 @@ The core driver retains generic routing, status, capacity, and storage hooks;
 it does not choose excited-state energies, construct LCM forces, define force
 screening, or load a GPU backend. Existing ground-state samplers/calculators,
 QM/ML task queues, and molecule object definitions are unchanged from main.
-The driver delta is smaller by 22 lines than the audited fork base. Future
+The earlier validation-only cleanup reduced the driver delta; optional generic
+stage lifecycle hooks now add routing boundaries. Future
 upstream merges still require reviewing these generic orchestration changes;
 passing upstream tests is compatibility evidence, not a guarantee of future
 conflict-free merges.

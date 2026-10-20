@@ -120,3 +120,18 @@ def test_example_resources_are_independent_and_start_no_allocations(directory, m
     assert providers
     assert len({id(provider) for provider in providers}) == len(providers)
     assert all(provider.init_blocks == provider.min_blocks == 0 for provider in providers)
+
+
+@pytest.mark.parametrize('filename,modes',[
+    ('workflow_alf_only.json',[False]),('workflow_alf_galf.json',[False,True])])
+def test_keto_staged_workflow_strategy_contract(filename,modes):
+    from alframework.tools.staged_workflow import definition,source_master
+    plan=definition(EXAMPLES/'keto_rdkit_alf_galf'/filename)
+    actual=[]
+    for stage in plan['stages']:
+        master,configs,_=source_master(stage['master_config'])
+        actual.append(configs['sampler']['gap_seeking']['enabled'])
+        assert not configs['ML']['gap_targets']['enabled']
+        assert configs['sampler']['score']['w_gap_uncertainty']==0.
+    assert actual==modes
+    assert plan['final_training']
