@@ -21,6 +21,7 @@ import parsl
 # Check to see if parsl is available
 import alframework
 #from alframework.parsl_resource_configs.darwin import config_atdm_ml
+from alframework.tools.run_control import create_run_control
 from alframework.tools.tools import parsl_task_queue
 from alframework.tools.tools import store_current_data
 from alframework.tools.tools import load_config_file
@@ -75,6 +76,21 @@ ML_config = load_config_file(master_config['ML_config_path'], master_config['mas
 # All configs
 all_configs = [master_config, builder_config, sampler_config, QM_config, ML_config]
 
+lifecycle = create_run_control(master_config, all_configs)
+if lifecycle and (args.test_builder or args.test_qm or args.test_sampler or
+                  (args.test_ml and lifecycle.mode != 'final_training')):
+    lifecycle.close()
+    raise ValueError('Run component debug checks with a standalone master, outside staged execution.')
+
+
+def save_driver_status():
+    if lifecycle:
+        lifecycle.save(status)
+    else:
+        with open(master_config['status_path'], 'w') as outfile:
+            json.dump(status, outfile, indent=2)
+
+
 # Define queues:
 QM_task_queue = parsl_task_queue()
 ML_task_queue = parsl_task_queue()
@@ -113,12 +129,16 @@ for config in all_configs:
 #############################
 # Builder
 builder_task = load_module_from_string(master_config['builder_task'])
+if lifecycle:
+    builder_task = lifecycle.wrap('builder', builder_task)
 for cur_Exec in builder_task.executors:
     if cur_Exec.replace('_executor', '_standby_executor') in executor_list:
         builder_task.executors.append(cur_Exec.replace('_executor', '_standby_executor'))
 
 # Sampler
 sampler_task = load_module_from_string(master_config['sampler_task'])
+if lifecycle:
+    sampler_task = lifecycle.wrap('sampler', sampler_task)
 for cur_Exec in sampler_task.executors:
     if cur_Exec.replace('_executor', '_standby_executor') in executor_list:
         sampler_task.executors.append(cur_Exec.replace('_executor', '_standby_executor'))
@@ -139,6 +159,9 @@ def submit_sampler_batch(molecule_objects):
 
 def route_molecule_to_sampler(molecule):
     """Buffer a batched input or immediately submit a legacy sampler task."""
+    if lifecycle and lifecycle.draining:
+        lifecycle.unused(molecule)
+        return
     for submission_group in sampler_submission_groups(
         molecule,
         sampler_config,
@@ -175,12 +198,16 @@ def refresh_sampler_driver_status():
 
 # QM
 qm_task = load_module_from_string(master_config['QM_task'])
+if lifecycle:
+    qm_task = lifecycle.wrap('QM', qm_task)
 for cur_Exec in qm_task.executors:
     if cur_Exec.replace('_executor', '_standby_executor') in executor_list:
         qm_task.executors.append(cur_Exec.replace('_executor', '_standby_executor'))
 
 #ML
 ml_task = load_module_from_string(master_config['ML_task'])
+if lifecycle:
+    ml_task = lifecycle.wrap('ML', ml_task)
 for cur_Exec in ml_task.executors:
     if cur_Exec.replace('_executor', '_standby_executor') in executor_list:
         ml_task.executors.append(cur_Exec.replace('_executor', '_standby_executor'))
@@ -210,9 +237,12 @@ else:
     status['lifetime_failed_ML_tasks'] = 0
     status['lifetime_failed_QM_tasks'] = 0
 
+if lifecycle:
+    lifecycle.bind(status, {'builder': builder_task_queue, 'sampler': sampler_task_queue,
+                           'QM': QM_task_queue, 'ML': ML_task_queue}, sampler_batch_buffer)
+
 refresh_sampler_driver_status()
-with open(master_config['status_path'], "w") as outfile:
-    json.dump(status, outfile, indent=2)
+save_driver_status()
 
 ######################################
 # Step 4: Check if testing requested #
@@ -318,14 +348,19 @@ if args.test_qm:
     
 #train_ANI_model_task(configuration,data_directory,model_path,model_index,remove_existing=False):
 if args.test_ml:
+    if lifecycle:
+        lifecycle.train_only(ml_task, status)
+        parsl.dfk().cleanup()
+        parsl.clear()
+        lifecycle.finish(status)
+        raise SystemExit(0)
     #configuration,data_directory,model_path,model_index,remove_existing=False
     task_input = build_input_dict(ml_task.func,
                                   [{"ML_config": ML_config}, *all_configs, status],
                                   raise_on_fail=True)
     ML_task_queue.add_task(ml_task(**task_input))
     status['current_training_id'] = status['current_training_id'] + 1
-    with open(master_config['status_path'], "w") as outfile:
-        json.dump(status, outfile, indent=2)
+    save_driver_status()
     ml_result = ML_task_queue.task_list[0].result()
     queue_output = ML_task_queue.get_task_results()
     returned_models = queue_output[0]
@@ -335,8 +370,7 @@ if args.test_ml:
         if all(network[0]) and (network[1] > status['current_model_id']):
             print('New Model: {:04d}'.format(network[1]))
             status['current_model_id'] = network[1]
-    with open(master_config['status_path'], "w") as outfile:
-        json.dump(status, outfile, indent=2)
+    save_driver_status()
     testing=True
     
 if testing:
@@ -347,13 +381,18 @@ if testing:
 ########################
     
 #If there is no data and no models, start boostrap jobs
-if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
+if lifecycle.bootstrap_required if lifecycle else status['current_h5_id'] == 0 and status['current_model_id'] < 0:
     print("Building Bootstrap Set")
-    while QM_task_queue.get_exec_done_number() < master_config['bootstrap_set']:
-        if QM_task_queue.get_queued_number() < master_config['target_queued_QM']:
+    while lifecycle.bootstrap_wait() if lifecycle else QM_task_queue.get_exec_done_number() < master_config['bootstrap_set']:
+        if (not lifecycle or lifecycle.allow_acquisition) and QM_task_queue.get_queued_number() < master_config['target_queued_QM']:
             while builder_task_queue.get_number() * master_config.get('maximum_builder_structures', 1) < master_config['parallel_samplers']:
+                if lifecycle and status['current_molecule_id'] >= master_config['bootstrap_set']:
+                    break
+                bootstrap_width = master_config.get('maximum_builder_structures', 1)
+                if lifecycle:
+                    bootstrap_width = min(bootstrap_width, master_config['bootstrap_set'] - status['current_molecule_id'])
                 moleculeids = ['mol-boot-{:010d}'.format(it_ind) for it_ind in
-                               range(status['current_molecule_id'], status['current_molecule_id'] + master_config.get('maximum_builder_structures', 1))
+                               range(status['current_molecule_id'], status['current_molecule_id'] + bootstrap_width)
                                ]
                 task_input = build_input_dict(builder_task.func,
                                               [{"moleculeid": 'mol-boot-{:010d}'.format(status['current_molecule_id']),
@@ -362,9 +401,9 @@ if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
                                                *all_configs, status],
                                               raise_on_fail=True)
                 builder_task_queue.add_task(builder_task(**task_input))
-                status['current_molecule_id'] = status['current_molecule_id'] + master_config.get('maximum_builder_structures',1)
+                status['current_molecule_id'] = status['current_molecule_id'] + bootstrap_width
         
-        if builder_task_queue.get_exec_done_number() > master_config['minimum_QM']:
+        if (builder_task_queue.get_completed_number() if lifecycle else builder_task_queue.get_exec_done_number()) > (0 if lifecycle else master_config['minimum_QM']):
             builder_results, failed = builder_task_queue.get_task_results()
             status['lifetime_failed_builder_tasks'] = status['lifetime_failed_builder_tasks'] + failed
             for structure in builder_results:
@@ -390,10 +429,9 @@ if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
         print("QM status:")
         QM_task_queue.print_status()
     
-        with open(master_config['status_path'], "w") as outfile:
-            json.dump(status, outfile, indent=2)
+        save_driver_status()
             
-        time.sleep(60)
+        time.sleep(lifecycle.poll_interval if lifecycle else 60)
 
     print("Saving Bootstrap and training model")
     results_list, failed = QM_task_queue.get_task_results()
@@ -403,7 +441,7 @@ if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
         for task_output in results_list
         for molecule in flatten_molecule_output(task_output)
     ]
-    stored, results_list, screening_summary = screen_and_store_dataset(
+    stored, results_list, screening_summary = (lifecycle.store if lifecycle else screen_and_store_dataset)(
         master_config['h5_path'].format(status['current_h5_id']),
         results_list,
         master_config['properties_list'],
@@ -417,21 +455,23 @@ if status['current_h5_id'] == 0 and status['current_model_id'] < 0:
             "All bootstrap QM results were rejected by dataset screening; "
             "no HDF5 shard or model will be created."
         )
-        with open(master_config['status_path'], "w") as outfile:
-            json.dump(status, outfile, indent=2)
-        exit()
-    status['current_h5_id'] = status['current_h5_id'] + 1
+        save_driver_status()
+        if lifecycle:
+            if lifecycle.accepted == 0 and not lifecycle.pause_requested and not lifecycle.failure:
+                lifecycle.failure = 'Bootstrap retained no valid labeled frames.'
+        else:
+            exit()
+    if stored:
+        status['current_h5_id'] = status['current_h5_id'] + 1
     
-if status['current_model_id'] < 0:
+if status['current_model_id'] < 0 and (not lifecycle or not lifecycle.draining):
     task_input = build_input_dict(ml_task.func,
                                   [{"ML_config": ML_config}, *all_configs, status],
                                   raise_on_fail=True)
-    ML_task_queue.add_task(ml_task(**task_input))
-    
-    status['current_training_id'] = status['current_training_id'] + 1
-    
-    with open(master_config['status_path'], "w") as outfile:
-        json.dump(status, outfile, indent=2)
+    if not lifecycle or ML_task_queue.get_number() == 0:
+        ML_task_queue.add_task(ml_task(**task_input))
+        status['current_training_id'] = status['current_training_id'] + 1
+    save_driver_status()
     network = ML_task_queue.task_list[0].result()
     if all(network[0]):
         status['current_model_id'] = network[1]
@@ -446,10 +486,14 @@ if status['current_model_id'] < 0:
 ##################################
 master_loop_iter = 1
 while True:
-    #Re-load configurations, but watch for stupid errors
+    if lifecycle:
+        for record in lifecycle.state['configuration']:
+            from alframework.tools.workflow_io import verify
+            verify(record)
+    # Standalone runs retain live reload; controlled stages use pinned configuration.
     try:
         # Load the master configuration:
-        master_config_new = load_config_file(args.master)
+        master_config_new = master_config if lifecycle else load_config_file(args.master)
         if 'master_directory' not in master_config:
             master_config_new['master_directory'] = None
 
@@ -500,7 +544,8 @@ while True:
         refresh_sampler_driver_status()
 	
     # Run more builders
-    if (QM_task_queue.get_queued_number() < master_config['target_queued_QM']) and \
+    if (not lifecycle or lifecycle.allow_acquisition) and \
+            (QM_task_queue.get_queued_number() < master_config['target_queued_QM']) and \
             (QM_task_queue.get_number() < master_config.get('maximum_completed_QM', 1e12)):
         while sampler_has_builder_capacity(
             current_sampler_capacity_status(),
@@ -518,7 +563,7 @@ while True:
             status['current_molecule_id'] = status['current_molecule_id'] + master_config.get('maximum_builder_structures',1)
             
     # Builders go stright into samplers
-    if builder_task_queue.get_exec_done_number() > 0:
+    if (builder_task_queue.get_completed_number() if lifecycle else builder_task_queue.get_exec_done_number()) > 0:
         structure_list, failed = builder_task_queue.get_task_results()
         status['lifetime_failed_builder_tasks'] = status['lifetime_failed_builder_tasks'] + failed
         # Flatten builder lists before routing structures through the sampler.
@@ -531,7 +576,7 @@ while True:
         sampler_task_queue.task_list,
         sampler_task_replica_counts,
         completed_only=True,
-    ) > master_config['minimum_QM']:
+    ) > (0 if lifecycle and lifecycle.draining else master_config['minimum_QM']):
         previous_sampler_tasks = list(sampler_task_queue.task_list)
         sampler_results, failed = sampler_task_queue.get_task_results()
         remaining_sampler_task_ids = {
@@ -551,7 +596,8 @@ while True:
                     QM_task_queue.add_task(qm_task(**task_input))
 
     # Train more models
-    if (QM_task_queue.get_completed_number() >= master_config['save_h5_threshold']) and (ML_task_queue.get_number() < 1):
+    if ((QM_task_queue.get_completed_number() >= master_config['save_h5_threshold']) or
+            (lifecycle and lifecycle.draining and QM_task_queue.get_completed_number() > 0)) and (ML_task_queue.get_number() < 1):
         #print(QM_task_queue.task_list[0].result())
     	  #store_current_data(h5path, system_data, properties):
         results_list, failed = QM_task_queue.get_task_results()
@@ -561,7 +607,7 @@ while True:
             for task_output in results_list
             for molecule in flatten_molecule_output(task_output)
         ]
-        stored, results_list, screening_summary = screen_and_store_dataset(
+        stored, results_list, screening_summary = (lifecycle.store if lifecycle else screen_and_store_dataset)(
             master_config['h5_path'].format(status['current_h5_id']),
             results_list,
             master_config['properties_list'],
@@ -575,14 +621,16 @@ while True:
                 "All completed QM results were rejected by dataset screening; "
                 "skipping HDF5 save and ML training."
             )
-            with open(master_config['status_path'], "w") as outfile:
-                json.dump(status, outfile, indent=2)
+            save_driver_status()
             continue
         #with open('temp-{:04d}.pkl'.format(status['current_h5_id']),'wb') as pickle_file:
         #    pickle.dump(results_list,pickle_file)
 #        with open('data-bk-{:04d}.pickle'.format(status['current_h5_id']),'wb') as pkbk: 
 #            pickle.dump(results_list,pkbk)
         status['current_h5_id'] = status['current_h5_id'] + 1
+        if lifecycle and lifecycle.draining:
+            save_driver_status()
+            continue
         task_input = build_input_dict(ml_task.func,
                                       [{"ML_config": ML_config}, *all_configs, status],
                                       raise_on_fail=True)
@@ -623,9 +671,15 @@ while True:
     ML_task_queue.print_status()
     sys.stdout.flush()
     
-    with open(master_config['status_path'], "w") as outfile:
-        json.dump(status, outfile, indent=2)
+    save_driver_status()
     
+    if lifecycle and lifecycle.finish_ready():
+        parsl.dfk().cleanup()
+        parsl.clear()
+        terminal = lifecycle.finish(status)
+        if terminal == 'failed':
+            raise RuntimeError('Controlled stage failed; inspect control/progress.json before resume.')
+        break
     master_loop_iter += 1
-    time.sleep(60)
+    time.sleep(lifecycle.poll_interval if lifecycle else 60)
 	

@@ -27,6 +27,7 @@ def checked_import(name, *args, **kwargs):
     return original_import(name, *args, **kwargs)
 builtins.__import__ = checked_import
 from alframework.tools import sampling_validation, force_screen, dataset_screening, rdkit_initialization
+from alframework.tools import workflow_io, run_control
 try:
     rdkit_initialization._rdkit()
 except ImportError as exc:
