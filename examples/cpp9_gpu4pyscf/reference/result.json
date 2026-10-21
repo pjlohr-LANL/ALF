@@ -1,0 +1,224 @@
+{
+  "all_localizations": [
+    {
+      "attachment_ring_weights": [
+        0.09924361836570006,
+        0.08784859825947344,
+        0.10058556950262862,
+        0.12047847530648786,
+        0.12051944850347074,
+        0.12555475448966152,
+        0.1131441873422851,
+        0.11315842920663131,
+        0.11946691902366144
+      ],
+      "category": "delocalized",
+      "detachment_ring_weights": [
+        0.09974140630837379,
+        0.08923521970459349,
+        0.10145159272045291,
+        0.11818437440328054,
+        0.12221198639632616,
+        0.12358218858288833,
+        0.11514904744595646,
+        0.11408204884824899,
+        0.11636213558987933
+      ],
+      "participation_fraction": 0.9896515826153404,
+      "participation_rings": 8.906864243538063,
+      "ring_weights": [
+        0.09949251233703693,
+        0.08854190898203346,
+        0.10101858111154077,
+        0.11933142485488421,
+        0.12136571744989845,
+        0.12456847153627493,
+        0.11414661739412077,
+        0.11362023902744015,
+        0.11791452730677038
+      ]
+    },
+    {
+      "attachment_ring_weights": [
+        0.12346279448725526,
+        0.040856793506852146,
+        0.07749702426765588,
+        0.16377479394404618,
+        0.14422362871740985,
+        0.06724771408798673,
+        0.041429415115141324,
+        0.13481126510880248,
+        0.2066965707648502
+      ],
+      "category": "delocalized",
+      "detachment_ring_weights": [
+        0.12573818225268305,
+        0.03975726047136928,
+        0.07810393085064243,
+        0.16239008198740107,
+        0.14793244109848136,
+        0.06520510531614547,
+        0.04053147149658571,
+        0.13649718981263714,
+        0.2038443367140544
+      ],
+      "participation_fraction": 0.8066675911557571,
+      "participation_rings": 7.260008320401814,
+      "ring_weights": [
+        0.12460048836996915,
+        0.04030702698911071,
+        0.07780047755914915,
+        0.16308243796572364,
+        0.1460780349079456,
+        0.0662264097020661,
+        0.04098044330586352,
+        0.1356542274607198,
+        0.2052704537394523
+      ]
+    },
+    {
+      "attachment_ring_weights": [
+        0.09763654137461744,
+        0.16586040649256692,
+        0.151045990413632,
+        0.0719252471444952,
+        0.061607409259492665,
+        0.16570381186352315,
+        0.16945127327494466,
+        0.07657770835698048,
+        0.04019161181974741
+      ],
+      "category": "delocalized",
+      "detachment_ring_weights": [
+        0.09692741714884717,
+        0.1721461624984348,
+        0.15365138780161244,
+        0.0672152003791284,
+        0.059541100521331755,
+        0.16421491688565398,
+        0.1752004322946146,
+        0.07589178713230821,
+        0.0352115953380686
+      ],
+      "participation_fraction": 0.8298921095733083,
+      "participation_rings": 7.469028986159774,
+      "ring_weights": [
+        0.09728197926173231,
+        0.16900328449550087,
+        0.15234868910762223,
+        0.0695702237618118,
+        0.06057425489041221,
+        0.16495936437458858,
+        0.17232585278477963,
+        0.07623474774464434,
+        0.037701603578908005
+      ]
+    }
+  ],
+  "arrays": "/vast/home/pjlohr/github/Projects/ml_4_excited_states/TDDFT/benchmark_results/cpp_state_geometry/17250216/cpp9/6-31g/s0/start_0/final_arrays.npz",
+  "atomic_orbitals": 558,
+  "attempts": [],
+  "auxiliary_functions": 4608,
+  "basis": "6-31g",
+  "converged": true,
+  "df_storage": "auto",
+  "excitation_energies_ev": [
+    3.68776151569748,
+    4.286810625217071,
+    4.388298433017888
+  ],
+  "final_matched_overlap": null,
+  "final_root_ambiguous": false,
+  "gpu_memory": {
+    "error": null,
+    "interval_ms": 100,
+    "peak_max_device_gib": 19.908203125,
+    "per_device_peak_mib": {
+      "GPU-1765f1e8-4983-8433-d8e5-e496ea3c5b2a": 20386.0
+    },
+    "raw_file": "/vast/home/pjlohr/github/Projects/ml_4_excited_states/TDDFT/benchmark_results/cpp_state_geometry/17250216/cpp9/6-31g/s0/start_0/gpu_memory_auto.csv",
+    "sample_count": 1910,
+    "success": true
+  },
+  "gradient_max_ev_per_angstrom": 0.0020439423797936375,
+  "gradient_rms_ev_per_angstrom": 0.0005522840349113715,
+  "ground_energy_hartree": -2077.702199766316,
+  "optimization_evaluations": 18,
+  "optimized_geometry": "/vast/home/pjlohr/github/Projects/ml_4_excited_states/TDDFT/benchmark_results/cpp_state_geometry/17250216/cpp9/6-31g/s0/start_0/optimized.xyz",
+  "oscillator_strengths": [
+    0.006501179082995626,
+    2.484912735014347,
+    2.335755823514273
+  ],
+  "resumed_from_coordinate_checkpoint": false,
+  "ring": "cpp9",
+  "runtime_metadata": {
+    "cupy": "13.4.1",
+    "devices": [
+      {
+        "logical_index": 0,
+        "name": "NVIDIA A100-SXM4-40GB",
+        "total_memory_gib": 39.4935302734375
+      }
+    ],
+    "gpu4pyscf": "1.8.0",
+    "pyscf": "2.14.0"
+  },
+  "selected_state": 0,
+  "start_index": 0,
+  "structure": {
+    "inter_ring_bond_lengths_angstrom": [
+      1.4871583135251556,
+      1.4870802062359723,
+      1.4900549401567096,
+      1.4879372493963867,
+      1.487509835152099,
+      1.4904031426989366,
+      1.4865022191177517,
+      1.4913339326555377,
+      1.48871808117867
+    ],
+    "inter_ring_bond_mean_angstrom": 1.4885219911241352,
+    "quinoidality_mean_angstrom": 0.00076815531280578,
+    "ring_bond_length_alternation_angstrom": [
+      0.0011089848200733776,
+      0.0008613049315471244,
+      0.0008738271088608585,
+      0.0004535342445053381,
+      0.001861631928306906,
+      0.0006986690014929575,
+      0.000351574211314043,
+      0.0004054998038507396,
+      0.00029837176530067566
+    ],
+    "torsion_max_degrees": 58.35182679209339,
+    "torsion_mean_degrees": 49.449499283763686,
+    "torsion_min_degrees": 43.2061825556014,
+    "torsion_std_degrees": 4.981343159378055,
+    "torsions_degrees": [
+      53.99373167488419,
+      55.78768171954769,
+      45.866078672812655,
+      47.55509512575967,
+      48.751884037292015,
+      46.10248588218585,
+      58.35182679209339,
+      43.2061825556014,
+      45.430527093696234
+    ]
+  },
+  "success": true,
+  "target": "s0",
+  "target_energy_hartree": -2077.702199766316,
+  "target_localization": null,
+  "task_id": "cpp9_6-31g_s0_start0",
+  "task_type": "optimization",
+  "timings": {
+    "energy_or_scf_tda_seconds": 220.42715421086177,
+    "gradient_seconds": 220.42715421086177,
+    "note": "For S0, the gradient scanner combines the electronic and gradient work; do not add those two S0 fields.",
+    "recorded_evaluation_seconds": 220.4273696700111
+  },
+  "visible_device_count": 1,
+  "wall_seconds": 281.46091315406375
+}

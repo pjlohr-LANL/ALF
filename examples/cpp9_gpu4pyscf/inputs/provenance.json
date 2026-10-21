@@ -1,0 +1,69 @@
+{
+  "origin": "cpp9_trial_001 (production trial; no run outputs or models copied)",
+  "origin_ALF_commit": "452c650a2a9824981e808b3440098e7e1d04d4d0",
+  "frames": 1000,
+  "atoms": 90,
+  "composition": "C54H36",
+  "unlabeled": true,
+  "seed": 42,
+  "components": [
+    {
+      "name": "narrow",
+      "count": 500,
+      "rotation_degrees": [
+        -15,
+        15
+      ],
+      "rattle_rms_angstrom": [
+        0,
+        0.015
+      ]
+    },
+    {
+      "name": "broad",
+      "count": 500,
+      "rotation_degrees": [
+        -30,
+        30
+      ],
+      "rattle_rms_angstrom": [
+        0,
+        0.03
+      ]
+    }
+  ],
+  "selection": "Existing shuffled mixed_1000 pool, stored row order; no regeneration or new QM.",
+  "source_bootstrap_sha256": "f30cb8b702b278f4a2a12f6da232e66abc1200452257da810318e92c507ab888",
+  "source_QM_adapter_sha256": "bee731fe005cd9a30ad08d08825747ef20e41f97862f919245998c00fbab964d",
+  "source_workflow_sha256": "8f3e162bf9eb282da9c315dfafb58058a17536b562743da3f0ac9f7be5428220",
+  "source_validation": {
+    "status": "passed",
+    "frames": 1000,
+    "shape": [
+      1000,
+      90,
+      3
+    ],
+    "composition": "C54H36",
+    "tier_counts": [
+      500,
+      500
+    ],
+    "seed": 42,
+    "all_geometry_screens_passed": true,
+    "unique_structures": 1000,
+    "unique_source_ids": 1000,
+    "unlabeled": true,
+    "NPZ_HDF5_exact_match": true,
+    "XYZ_roundtrip_passed": true,
+    "anchor_matches_trial": true,
+    "energy_reference_hartree": -2077.702199766316,
+    "energy_offset_eV": -56537.15659244438,
+    "conversion_alignment": {
+      "original_sampling_hartree_to_ev": 27.211386245988,
+      "original_sampling_energy_offset_eV": -56537.15706198014,
+      "reason": "Use labeling backend pyscf.data.nist.HARTREE2EV consistently with the trial."
+    }
+  },
+  "limitation": "Local coverage-oriented geometries, not a Boltzmann ensemble or comprehensive conformational search."
+}

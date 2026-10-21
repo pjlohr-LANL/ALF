@@ -1,0 +1,6 @@
+{
+  "source": "/vast/home/pjlohr/ALF_LANL/ALF_fork/ALF/alframework/qm_interfaces/gpu4pyscf_interface.py",
+  "sha256": "552328a96821791dd21bb616799d6af60fa64dc473a644b7ff8895510fb6ab64",
+  "ALF_commit": "452c650a2a9824981e808b3440098e7e1d04d4d0",
+  "optical_reference": "/vast/home/pjlohr/github/Projects/ml_4_excited_states/TDDFT/07_gpu4pyscf_backend.py"
+}

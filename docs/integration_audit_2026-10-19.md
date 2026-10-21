@@ -1,5 +1,10 @@
 # Production excited-state integration audit — 2026-10-19
 
+The subsequent [portable CPP9 example audit](cpp9_example_audit_2026-10-21.md)
+records the October 21 example-only addition, relocation checks, and validation
+across the existing PySCF and PySEQM environments. Results below retain their
+original October 19 context.
+
 Current production-checkout validation after adding generic retained-frame
 workflow stages: **447 fork tests passed** and **47 unchanged main tests passed**.
 The optional runner owns budgets, exact snapshots, journaled recovery, and fresh

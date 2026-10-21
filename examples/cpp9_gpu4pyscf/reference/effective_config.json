@@ -1,0 +1,19 @@
+{
+  "auxbasis": null,
+  "basis": "varied",
+  "charge": 0,
+  "cphf_conv_tol": 1e-08,
+  "density_fit": true,
+  "energy_offset_eV": 0.0,
+  "grids_level": 3,
+  "max_memory_mb": null,
+  "multiplicity": 1,
+  "nroots": 3,
+  "num_threads": 8,
+  "scf_conv_tol": 1e-10,
+  "scf_max_cycle": 100,
+  "tda_conv_tol": 1e-06,
+  "tda_max_cycle": 300,
+  "verbosity": 0,
+  "xc": "cam-b3lyp"
+}
