@@ -391,9 +391,12 @@ class RunControl:
             self.bootstrap_required=False
             self.state['bootstrap_required']=False
             return False
+        # Use the same durable journal for completion and exhaustion. A native
+        # future may finish after the result-harvest pass above; polling it again
+        # here would falsely declare exhaustion before its result is journaled.
+        pending=self.db.execute("SELECT COUNT(*) FROM tasks WHERE role='QM' AND phase='seed' AND state='submitted'").fetchone()[0]
         if (self.status['current_molecule_id']>=self.master['bootstrap_set'] and
-                self.queues['builder'].get_number()==0 and
-                self.queues['QM'].get_number()==self.queues['QM'].get_completed_number()):
+                self.queues['builder'].get_number()==0 and pending==0):
             self.failure='Bootstrap builders exhausted the selected seed quota before producing all labeling tasks.'
             return False
         return True

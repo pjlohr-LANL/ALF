@@ -342,7 +342,10 @@ def test_training_result_and_partial_attempt_recovery(tmp_path):
         journal_control(tmp_path/'partial')
 
 
-def test_pause_drains_and_resume_reuses_committed_work(tmp_path):
+@pytest.mark.parametrize('ignored_interrupt',[False,True],ids=['normal-signals','SIGINT-overridden'])
+def test_pause_drains_and_resume_reuses_committed_work(tmp_path,monkeypatch,ignored_interrupt):
+    if ignored_interrupt:
+        monkeypatch.setenv('ALF_TEST_IGNORE_DRIVER_SIGINT','1')
     import threading,time
     path=fixture_workflow(tmp_path,stages=1)
     root=tmp_path/'run'; prepare_workflow(path,root)
@@ -435,3 +438,96 @@ def test_cli_validation_status_and_pinned_resume(tmp_path,capsys):
     value=read_json(path); value['final_training']=False; atomic_json(path,value)
     with pytest.raises(RuntimeError,match='definition changed'):
         main(['--config',str(path),'--run-dir',str(root),'--resume'])
+
+
+def test_bootstrap_completion_between_polls_does_not_report_exhausted_seed(tmp_path):
+    """A QM result can finish after journaling but before the queue status poll."""
+    control,master,queues,status,buffer=journal_control(tmp_path/'bootstrap-race',target=3)
+    def label(molecule_object):
+        molecule_object.store_results({'energy':1.,'forces':np.zeros((2,3))})
+        molecule_object.set_converged_flag(True)
+        return molecule_object
+    class BoundaryApp(ImmediateApp):
+        def __call__(self,**kwargs):
+            class Future:
+                polls=0
+                def task_status(self):
+                    self.polls+=1
+                    return 'running' if self.polls==1 else 'exec_done'
+                def running(self):return self.polls<2
+                def result(self):return label(**kwargs)
+            return Future()
+    for role in queues:control.wrap(role,ImmediateApp(label))
+    control.bind(status,queues,buffer)
+    master['bootstrap_set']=2
+    control.bootstrap_required=True;control.state['bootstrap_required']=True
+    status['current_molecule_id']=2
+    first=control.submit('QM',ImmediateApp(label),{'molecule_object':candidate('first')})
+    last=control.submit('QM',BoundaryApp(label),{'molecule_object':candidate('last')})
+    queues['QM'].add_task(first);queues['QM'].add_task(last)
+    try:
+        for _ in range(3):
+            wait=control.bootstrap_wait()
+            assert control.failure is None, 'Task completed between status polls; quota is not exhausted'
+            if not wait:break
+        assert not wait and not control.bootstrap_required
+        assert control.db.execute("SELECT COUNT(*) FROM tasks WHERE role='QM' AND state='ready'").fetchone()[0]==2
+    finally:control.close()
+
+
+def test_bootstrap_real_shortfall_still_reports_exhausted_seed(tmp_path):
+    control,master,queues,status,buffer=journal_control(tmp_path/'bootstrap-shortfall',target=3)
+    def label(molecule_object):return molecule_object
+    for role in queues:control.wrap(role,ImmediateApp(label))
+    control.bind(status,queues,buffer)
+    master['bootstrap_set']=2;control.bootstrap_required=True;status['current_molecule_id']=2
+    future=control.submit('QM',ImmediateApp(label),{'molecule_object':candidate('only-one')})
+    queues['QM'].add_task(future)
+    try:
+        assert control.bootstrap_wait() is False
+        assert 'exhausted' in control.failure
+    finally:control.close()
+
+
+def test_resume_after_bootstrap_store_failure_reuses_all_seed_labels(tmp_path):
+    """Recover enol's exact boundary: seed results stored, initial ML not started."""
+    from alframework.tools.run_control import create_run_control,JournalApp
+    from alframework.tools.tools import load_config_file,parsl_task_queue
+    from alframework.tools.sampler_batching import SamplerBatchBuffer
+    from alframework.tools.molecules_class import MoleculesObject
+    path=fixture_workflow(tmp_path,stages=1)
+    root=tmp_path/'run';prepare_workflow(path,root)
+    stage=root/'stages/00-alf0'
+    master=load_config_file(str(stage/'master_config.json'))
+    configs=[master]+[load_config_file(master[f'{role}_config_path'],str(stage)) for role in ('builder','sampler','QM','ML')]
+    control=create_run_control(master,configs)
+    queues={role:parsl_task_queue() for role in ('builder','sampler','QM','ML')}
+    status={'current_model_id':-1,'current_training_id':0,'current_h5_id':0,'current_molecule_id':2,
+            **{f'lifetime_failed_{role}_tasks':0 for role in ('builder','sampler','QM','ML')}}
+    def label(molecule_object):
+        molecule_object.store_results({'energy':1.,'forces':np.zeros((3,3))})
+        molecule_object.set_converged_flag(molecule_object.get_moleculeid().endswith('0'))
+        return molecule_object
+    for role in queues:control.wrap(role,ImmediateApp(label))
+    control.bind(status,queues,SamplerBatchBuffer())
+    atoms=read(path.parent/'reference.xyz');results=[]
+    for i in range(2):
+        molecule=MoleculesObject(atoms.copy(),f'mol-boot-{i:010d}')
+        molecule.update_metadata({'_workflow_origin':f'builder:{i}','_workflow_phase':'seed'})
+        future=JournalApp(control,'QM',ImmediateApp(label))(molecule_object=molecule)
+        results.extend([future.result()])
+    # Preserve the old fault and unfinished bootstrap flag as found in the pilot.
+    control.failure='Bootstrap builders exhausted the selected seed quota before producing all labeling tasks.'
+    assert control.bootstrap_required
+    stored,_,_=control.store(master['h5_path'].format(0),results,master['properties_list'],configs[2],master_directory=str(stage))
+    assert stored and control.accepted==1
+    status['current_h5_id']=1;control.save(status);control.abort()
+    with sqlite3.connect(stage/'control/journal.sqlite') as db:
+        before=dict(db.execute("SELECT key,attempts FROM tasks WHERE role='QM'"))
+    assert WorkflowRunner(root).run()==0
+    with sqlite3.connect(stage/'control/journal.sqlite') as db:
+        after=dict(db.execute("SELECT key,attempts FROM tasks WHERE role='QM'"))
+        assert all(after[key]==attempts for key,attempts in before.items())
+        assert db.execute("SELECT COUNT(*) FROM tasks WHERE role='QM' AND phase='seed'").fetchone()[0]==2
+    assert read_json(stage/'models/model-0000/input_frames.json')['frames']==1
+    assert verify_snapshot(stage/'checkpoints/3')['frames']==3

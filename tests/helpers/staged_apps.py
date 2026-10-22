@@ -1,5 +1,7 @@
 """Local-only tasks for staged integration tests; never used by examples."""
 import json
+import os
+import signal
 from pathlib import Path
 import time
 
@@ -8,6 +10,11 @@ import numpy as np
 from parsl import python_app
 from parsl.config import Config
 from parsl.executors import ThreadPoolExecutor
+
+# Emulate a runtime dependency replacing the driver's interrupt disposition
+# after RunControl has registered its handlers. This helper is test-only.
+if os.environ.get('ALF_TEST_IGNORE_DRIVER_SIGINT') == '1':
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 config=Config(executors=[ThreadPoolExecutor(label=f'alf_{role}_executor',max_threads=2)
                         for role in ('builder','sampler','QM','ML')],strategy='none',run_dir='runinfo')

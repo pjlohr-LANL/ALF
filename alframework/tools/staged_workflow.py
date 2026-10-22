@@ -266,7 +266,9 @@ class WorkflowRunner:
     def interrupt(self,*unused):
         self.pause=True
         if self.child is not None and self.child.poll() is None and not self.training:
-            self.child.send_signal(signal.SIGINT)
+            # Numerical runtimes can replace SIGINT after the lifecycle is
+            # initialized. SIGTERM uses RunControl's explicit drain handler.
+            self.child.send_signal(signal.SIGTERM)
 
     def execute(self,master, *, training=False):
         self.training=training
