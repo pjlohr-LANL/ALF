@@ -1963,7 +1963,9 @@ def test_calculator_loader_uses_ase_fallback_and_requires_a_loader(monkeypatch):
         )
 
 
-def test_installed_alchemi_cpu_dynamics_smoke():
+@pytest.mark.parametrize('initial_speed',[0.,0.05])
+@pytest.mark.parametrize('thermostat_enabled',[False,True])
+def test_installed_alchemi_cpu_dynamics_smoke(initial_speed,thermostat_enabled):
     try:
         import torch
         from nvalchemi.models.base import BaseModelMixin, ModelConfig
@@ -2016,20 +2018,42 @@ def test_installed_alchemi_cpu_dynamics_smoke():
                 for key, value in self.last_diagnostics.items()
             }
 
+    initial_atoms=[_molecule("first").get_atoms(), _molecule("second").get_atoms()]
+    for atoms in initial_atoms:
+        atoms.set_velocities(np.full((len(atoms),3),initial_speed))
     runner = AlchemiDynamicsRunner(
         model=HarmonicModel(),
-        atoms_list=[_molecule("first").get_atoms(), _molecule("second").get_atoms()],
+        atoms_list=initial_atoms,
         dt_fs=0.1,
-        temperature_K=np.asarray([10.0, 20.0]),
-        friction_per_fs=0.01,
+        temperature_K=np.asarray([10.0, 20.0]) if thermostat_enabled else np.zeros(2),
+        friction_per_fs=0.01 if thermostat_enabled else 0.,
         random_seed=4,
         device=torch.device("cpu"),
     )
+    # Both kernels and ASE use A/sqrt(amu*A^2/eV); applying units.fs here
+    # changes kinetic energy by a factor ~103.6 after synchronization.
+    from nvalchemi.dynamics._units import FS_PER_INTERNAL_TIME
+    assert FS_PER_INTERNAL_TIME*units.fs==pytest.approx(1.)
+    np.testing.assert_allclose(runner.batch.velocities.detach().cpu().numpy(),initial_speed)
+    roundtrip=initial_atoms[0].copy()
+    runner.sync_graph_to_atoms(0,roundtrip)
+    np.testing.assert_allclose(roundtrip.get_velocities(),initial_atoms[0].get_velocities())
+    assert roundtrip.get_kinetic_energy()==pytest.approx(initial_atoms[0].get_kinetic_energy())
     runner.run(1)
     frozen_atoms = _molecule("frozen").get_atoms()
     moving_atoms = _molecule("moving").get_atoms()
     runner.sync_graph_to_atoms(0, frozen_atoms)
     runner.sync_graph_to_atoms(1, moving_atoms)
+    if not thermostat_enabled:
+        # Deterministic BAOAB reduces to velocity Verlet. Check displacement
+        # and velocity against an analytic eV/A, amu, fs one-step reference.
+        initial=initial_atoms[0]
+        h=.1*units.fs
+        acceleration=-initial.positions/initial.get_masses()[:,None]
+        expected=initial.positions+h*initial.get_velocities()+.5*h*h*acceleration
+        expected_velocity=initial.get_velocities()-.5*h*(initial.positions+expected)/initial.get_masses()[:,None]
+        np.testing.assert_allclose(frozen_atoms.positions,expected,atol=1e-7)
+        np.testing.assert_allclose(frozen_atoms.get_velocities(),expected_velocity,atol=1e-7)
     frozen_positions = frozen_atoms.get_positions().copy()
     moving_positions = moving_atoms.get_positions().copy()
     runner.freeze_graph(0)

@@ -1590,7 +1590,9 @@ if _ALCHEMI_IMPORT_ERROR is None:
                     velocity_tensor = torch.zeros_like(positions)
                 else:
                     velocity_tensor = torch.as_tensor(
-                        np.asarray(velocities) * units.fs,
+                        # ASE and ALCHEMI kernels both use sqrt(eV/amu)
+                        # velocities. Only the public dt uses femtoseconds.
+                        np.asarray(velocities),
                         dtype=torch.float32,
                         device=self.device,
                     )
@@ -1673,7 +1675,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             start = int(self.batch.batch_ptr[index].detach().cpu().item())
             end = int(self.batch.batch_ptr[index + 1].detach().cpu().item())
             positions = self.batch.positions[start:end].detach().cpu().numpy()
-            velocities = self.batch.velocities[start:end].detach().cpu().numpy() / units.fs
+            velocities = self.batch.velocities[start:end].detach().cpu().numpy()
             atoms.set_positions(np.asarray(positions, dtype=float))
             atoms.set_velocities(np.asarray(velocities, dtype=float))
 

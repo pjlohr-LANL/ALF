@@ -374,7 +374,11 @@ class WorkflowRunner:
                     code=self.execute(root/'master_config.json')
                     outcome=read_json(progress)['state'] if progress.exists() else 'failed'
                     self.state['stage_states'][stage['name']]=outcome
-                    if self.pause or outcome=='paused':
+                    # A signal can arrive while a worker is failing. A pause
+                    # request must never hide that failure or a killed driver.
+                    # The native driver currently exits zero after a clean
+                    # drain; the staged CLI converts that boundary to 130.
+                    if code in (0,130) and outcome=='paused':
                         self.state['state']='paused'
                         self.save()
                         return 130

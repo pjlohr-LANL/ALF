@@ -352,7 +352,21 @@ class RunControl:
             buffer.__dict__.update(pickle.loads(row['value']).__dict__)
         for row in self.db.execute('SELECT * FROM tasks ORDER BY created').fetchall():
             role=row['role']
-            if row['state'] in {'consumed','delivered'}:
+            if row['state'] in {'consumed','delivered','abandoned'}:
+                continue
+            if (self.accepted>=self.target and role in {'builder','sampler'}
+                    and row['state'] in {'submitted','failed'}):
+                # Completed labels, including any pending QM results, remain
+                # authoritative. Do not restart interrupted acquisition after
+                # the retained-frame budget is already satisfied. Preserve
+                # failed attempts and distinguish this from delivered work.
+                now=time.time()
+                self.state.setdefault('abandoned_acquisition',[]).append({
+                    'key':row['key'],'role':role,'previous_state':row['state'],
+                    'reason':'retained-frame target already met on resume','time':now})
+                self.db.execute("UPDATE attempts SET state='unknown',finished=? WHERE task_key=? AND state='submitted'",(now,row['key']))
+                self.db.execute("UPDATE tasks SET state='abandoned',updated=? WHERE key=?",(now,row['key']))
+                self.db.commit()
                 continue
             kwargs=pickle.loads(row['input'])
             if role=='ML' and row['state'] in {'submitted','failed'}:

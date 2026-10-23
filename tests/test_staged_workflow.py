@@ -531,3 +531,94 @@ def test_resume_after_bootstrap_store_failure_reuses_all_seed_labels(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM tasks WHERE role='QM' AND phase='seed'").fetchone()[0]==2
     assert read_json(stage/'models/model-0000/input_frames.json')['frames']==1
     assert verify_snapshot(stage/'checkpoints/3')['frames']==3
+
+
+@pytest.mark.parametrize('code,outcome',[(1,'failed'),(-15,'paused'),(1,'paused'),(0,'failed')])
+def test_pause_request_does_not_mask_failed_or_killed_driver(tmp_path,monkeypatch,code,outcome):
+    path=fixture_workflow(tmp_path,stages=1)
+    root=tmp_path/'run';prepare_workflow(path,root)
+    runner=WorkflowRunner(root)
+    def interrupted_execute(master):
+        runner.interrupt()
+        atomic_json(Path(master).parent/'control/progress.json',{'state':outcome})
+        return code
+    monkeypatch.setattr(runner,'execute',interrupted_execute)
+    with pytest.raises(RuntimeError,match='Stage alf0 failed'):
+        runner.run()
+    assert read_json(root/'workflow_status.json')['state']=='failed'
+    assert not (root/'final_training').exists()
+
+
+@pytest.mark.parametrize('at_budget',[False,True])
+def test_resume_budget_retires_only_unfinished_acquisition_not_qm(tmp_path,at_budget):
+    """Do not rerun an 80-minute sampler after enough labels are committed."""
+    from alframework.tools.run_control import flatten_molecule_output
+    target=2 if at_budget else 5
+    root=tmp_path/'budget-recovery'
+    control,master,queues,status,buffer=journal_control(root,target=target)
+    calls=[]
+    def label(molecule_object):
+        calls.append(molecule_object.get_metadata()['_workflow_origin'])
+        molecule_object.store_results({'energy':1.,'forces':np.zeros((2,3))})
+        molecule_object.set_converged_flag(True)
+        return molecule_object
+    qm_app=ImmediateApp(label)
+    other_app=ImmediateApp(lambda **kwargs:[])
+    for role in queues:control.wrap(role,qm_app if role=='QM' else other_app)
+    control.bind(status,queues,buffer)
+    results=[control.submit('QM',qm_app,{'molecule_object':candidate(f'seed:{i}')}).result() for i in range(2)]
+    control.store(master['h5_path'].format(0),results,master['properties_list'],{},master_directory=str(root))
+    # One failed sampler, one unknown builder, and two QM results (ready and
+    # unknown) survive the allocation. All existing attempt evidence remains.
+    sampler=control.submit('sampler',other_app,{'molecule_objects':[candidate('parent')]})
+    control.db.execute("UPDATE tasks SET state='failed',error='deadline' WHERE key=?",(sampler.key,))
+    control.db.execute("UPDATE attempts SET state='failed',error='deadline' WHERE task_key=?",(sampler.key,))
+    builder=control.submit('builder',other_app,{'moleculeids':['mol-0000-0000000000']})
+    ready=control.submit('QM',qm_app,{'molecule_object':candidate('pending-ready')});ready.result()
+    pending=control.submit('QM',qm_app,{'molecule_object':candidate('pending-unknown')})
+    control.abort()
+    restored,master,queues,status,buffer=journal_control(root,target=target)
+    for role in queues:restored.wrap(role,qm_app if role=='QM' else other_app)
+    restored.bind(status,queues,buffer)
+    assert restored.task(sampler.key)['state']==('abandoned' if at_budget else 'submitted')
+    assert restored.task(builder.key)['state']==('abandoned' if at_budget else 'submitted')
+    assert restored.db.execute("SELECT error FROM attempts WHERE task_key=? AND number=1",(sampler.key,)).fetchone()[0]=='deadline'
+    assert len(restored.state.get('abandoned_acquisition',[]))==(2 if at_budget else 0)
+    assert queues['sampler'].get_number()==(0 if at_budget else 1)
+    recovered=[m for future in queues['QM'].task_list for m in flatten_molecule_output(future.result())]
+    assert len(recovered)==2 and len(calls)==4
+    restored.store(master['h5_path'].format(1),recovered,master['properties_list'],{},master_directory=str(root))
+    assert restored.accepted==4
+    assert restored.task(ready.key)['state']==restored.task(pending.key)['state']=='consumed'
+    assert scan_store(master['h5_path'],master['properties_list'])['frames']==4
+    restored.close()
+
+
+def test_actual_driver_finishes_budget_recovery_and_exact_final_fit(tmp_path):
+    """Reproduce keto's boundary: enough stored labels, interrupted sampler."""
+    import pickle,time
+    path=fixture_workflow(tmp_path,stages=1)
+    root=tmp_path/'run';prepare_workflow(path,root)
+    assert WorkflowRunner(root).run()==0
+    stage=root/'stages/00-alf0'
+    with sqlite3.connect(stage/'control/journal.sqlite') as db:
+        counts=dict(db.execute("SELECT key,attempts FROM tasks WHERE role='QM'"))
+        payload=db.execute("SELECT input FROM tasks WHERE role='sampler' LIMIT 1").fetchone()[0]
+        now=time.time();key='failed-after-budget'
+        db.execute('INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)',
+                   (key,'sampler',payload,None,'failed',1,'allocation deadline','alf0',now,now))
+        db.execute('INSERT INTO attempts (task_key,number,state,input,error,started,finished) VALUES (?,?,?,?,?,?,?)',
+                   (key,1,'failed',payload,'allocation deadline',now,now))
+    progress=read_json(stage/'control/progress.json');progress.update(state='failed',failure='allocation deadline')
+    atomic_json(stage/'control/progress.json',progress)
+    state=read_json(root/'workflow_status.json');state.pop('final_training')
+    state.update(state='failed',stage_states={'alf0':'failed'})
+    atomic_json(root/'workflow_status.json',state)
+    (root/'final_training').rename(root/'prior_test_final_training')
+    assert WorkflowRunner(root).run()==0
+    with sqlite3.connect(stage/'control/journal.sqlite') as db:
+        assert db.execute('SELECT state,attempts FROM tasks WHERE key=?',(key,)).fetchone()==('abandoned',1)
+        assert dict(db.execute("SELECT key,attempts FROM tasks WHERE role='QM'"))==counts
+        assert db.execute('SELECT state FROM attempts WHERE task_key=?',(key,)).fetchone()[0]=='failed'
+    assert read_json(root/'workflow_status.json')['final_training']['input_frames']==3
+    assert read_json(root/'final_training/models/model-0000/input_frames.json')['frames']==3
