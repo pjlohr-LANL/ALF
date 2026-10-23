@@ -23,6 +23,10 @@ config=Config(executors=[ThreadPoolExecutor(label=f'alf_{role}_executor',max_thr
 @python_app(executors=['alf_sampler_executor'])
 def sample(molecule_object=None,molecule_objects=None,current_model_id=0,model_path=None,sampler_config=None,properties_list=None,master_directory=None):
     assert Path(model_path.format(current_model_id)).is_dir()
+    marker=Path(master_directory)/'sampler_failure_seen'
+    if sampler_config.get('fail_first_sampler') and not marker.exists():
+        marker.write_text('injected sampler failure')
+        raise RuntimeError('Injected sampler backend failure')
     molecules=molecule_objects if molecule_objects is not None else [molecule_object]
     if sampler_config.get('gap_seeking',{}).get('enabled'):
         from alframework.samplers.alchemi_sampling import run_alchemi_sampling

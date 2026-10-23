@@ -239,7 +239,8 @@ else:
 
 if lifecycle:
     lifecycle.bind(status, {'builder': builder_task_queue, 'sampler': sampler_task_queue,
-                           'QM': QM_task_queue, 'ML': ML_task_queue}, sampler_batch_buffer)
+                           'QM': QM_task_queue, 'ML': ML_task_queue}, sampler_batch_buffer,
+                   sampler_replica_counts=sampler_task_replica_counts)
 
 refresh_sampler_driver_status()
 save_driver_status()

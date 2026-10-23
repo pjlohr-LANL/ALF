@@ -622,3 +622,22 @@ def test_actual_driver_finishes_budget_recovery_and_exact_final_fit(tmp_path):
         assert db.execute('SELECT state FROM attempts WHERE task_key=?',(key,)).fetchone()[0]=='failed'
     assert read_json(root/'workflow_status.json')['final_training']['input_frames']==3
     assert read_json(root/'final_training/models/model-0000/input_frames.json')['frames']==3
+
+
+@pytest.mark.parametrize('batched',[False,True],ids=['legacy-single','strict-full-batch'])
+def test_actual_driver_restores_sampler_input_width_below_budget(tmp_path,batched):
+    path=fixture_workflow(tmp_path,excited=batched,stages=1)
+    sampler=path.parent/'sampler0.json'
+    config=read_json(sampler);config['fail_first_sampler']=True;atomic_json(sampler,config)
+    root=tmp_path/'run';prepare_workflow(path,root)
+    with pytest.raises(RuntimeError,match='Stage alf0 failed'):
+        WorkflowRunner(root).run()
+    stage=root/'stages/00-alf0'
+    with sqlite3.connect(stage/'control/journal.sqlite') as db:
+        seed=dict(db.execute("SELECT key,attempts FROM tasks WHERE role='QM' AND phase='seed'"))
+        assert db.execute("SELECT COUNT(*) FROM tasks WHERE role='sampler' AND state='failed'").fetchone()[0]>0
+    assert WorkflowRunner(root).run()==0
+    with sqlite3.connect(stage/'control/journal.sqlite') as db:
+        assert dict(db.execute("SELECT key,attempts FROM tasks WHERE role='QM' AND phase='seed'"))==seed
+        assert db.execute("SELECT COUNT(*) FROM attempts a JOIN tasks t ON a.task_key=t.key WHERE t.role='sampler' AND a.number>1 AND a.state='succeeded'").fetchone()[0]>0
+    assert read_json(root/'workflow_status.json')['final_training']['input_frames']==3

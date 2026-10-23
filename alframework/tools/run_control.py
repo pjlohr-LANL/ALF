@@ -329,7 +329,7 @@ class RunControl:
         if not directory.is_dir():
             raise RuntimeError('Trainer reported success without an output model directory.')
 
-    def bind(self,status,queues,buffer):
+    def bind(self,status,queues,buffer, *, sampler_replica_counts=None):
         self.queues,self.buffer=queues,buffer
         self.status=status
         model_id=-1
@@ -377,7 +377,14 @@ class RunControl:
                 self.db.commit()
             if row['state'] in {'submitted','failed'}:
                 self.state['possible_recomputations']+=int(row['attempts']>0)
-            queues[role].add_task(self.submit(role,self.apps[role],kwargs,recovery_key=row['key']))
+            future=self.submit(role,self.apps[role],kwargs,recovery_key=row['key'])
+            queues[role].add_task(future)
+            if role=='sampler' and sampler_replica_counts is not None:
+                # Recovery submits outside submit_sampler_batch(). Register
+                # the original input width before the driver polls capacity;
+                # output candidates (including empty output) are unrelated.
+                molecules=kwargs.get('molecule_objects')
+                sampler_replica_counts[id(future)]=len(molecules) if molecules is not None else 1
         # Reconcile the allocator against durable submissions, not a possibly older status file.
         prefix='mol-boot-' if status['current_model_id']<0 else f"mol-{status['current_model_id']:04d}-"
         indices=[]
