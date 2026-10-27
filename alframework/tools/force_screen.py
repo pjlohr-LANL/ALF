@@ -77,6 +77,7 @@ class ForceScreenAudit:
         diagnostics = diagnostics or {}
         return {"atomic_numbers": atoms.numbers.tolist(),
                 "positions": atoms.positions.tolist(), "step": int(step),
+                "cell": atoms.cell.array.tolist(), "pbc": atoms.pbc.tolist(),
                 "time_ps": float(time_ps), "reason": reason,
                 "physical_forces": {key: np.asarray(value).tolist()
                                     for key, value in diagnostics.items()
@@ -107,30 +108,45 @@ def validated_force_cutoff(cutoff, *, positive=False):
     return value
 
 
-def physical_force_diagnostics(state_results, num_graphs):
+def _force_maximum(forces, batch_ptr=None):
+    """Reduce packed atoms or legacy uniform [systems, atoms, 3] forces."""
+    import torch
+
+    if batch_ptr is None:
+        return torch.linalg.vector_norm(forces, dim=2).amax(dim=1)
+    values = torch.linalg.vector_norm(forces.reshape(-1, 3), dim=1)
+    counts = batch_ptr[1:] - batch_ptr[:-1]
+    indices = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=values.device), counts
+    )
+    result = values.new_zeros(counts.numel())
+    return result.scatter_reduce_(0, indices, values, reduce="amax", include_self=True)
+
+
+def physical_force_diagnostics(state_results, num_graphs, *, batch_ptr=None):
     """Max atom norm of each physical ensemble mean, then max over states."""
     import torch
 
-    maxima = {f"physical_F{state}_max": torch.linalg.vector_norm(
-        result["forces"].reshape(num_graphs, -1, 3), dim=2).amax(dim=1)
+    maxima = {f"physical_F{state}_max": _force_maximum(
+        result["forces"].reshape(num_graphs, -1, 3) if batch_ptr is None else result["forces"], batch_ptr)
         for state, result in state_results.items()}
     return {**maxima, "Fmeanmax": torch.stack(list(maxima.values())).amax(dim=0)}
 
 
-def lcm_force_diagnostics(lcm_forces, selected_physical_forces, lcm_correction):
+def lcm_force_diagnostics(lcm_forces, selected_physical_forces, lcm_correction, *, batch_ptr=None):
     """Separate total LCM bias from the correction to pair-average forces."""
     import torch
 
-    return {"lcm_bias_Fmax": torch.linalg.vector_norm(
-                lcm_forces - selected_physical_forces, dim=2).amax(dim=1),
-            "lcm_correction_Fmax": torch.linalg.vector_norm(lcm_correction, dim=2).amax(dim=1)}
+    return {"lcm_bias_Fmax": _force_maximum(lcm_forces - selected_physical_forces, batch_ptr),
+            "lcm_correction_Fmax": _force_maximum(lcm_correction, batch_ptr)}
 
 
-def propagation_force_diagnostics(propagation_forces, well_forces):
+def propagation_force_diagnostics(propagation_forces, well_forces, *, batch_ptr=None):
     """Propagation includes artificial forces; its maximum is not eligibility."""
     import torch
 
     return {"confinement_Fmax": (
-                torch.zeros(propagation_forces.shape[0], device=propagation_forces.device)
-                if well_forces is None else torch.linalg.vector_norm(well_forces, dim=2).amax(dim=1)),
-            "propagation_Fmax": torch.linalg.vector_norm(propagation_forces, dim=2).amax(dim=1)}
+                torch.zeros(propagation_forces.shape[0] if batch_ptr is None else batch_ptr.numel() - 1,
+                            device=propagation_forces.device)
+                if well_forces is None else _force_maximum(well_forces, batch_ptr)),
+            "propagation_Fmax": _force_maximum(propagation_forces, batch_ptr)}

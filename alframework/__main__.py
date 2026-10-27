@@ -41,10 +41,14 @@ from alframework.tools.sampler_batching import sampler_batch_size
 from alframework.tools.sampler_batching import sampler_capacity_status
 from alframework.tools.sampler_batching import sampler_has_builder_capacity
 from alframework.tools.sampler_batching import sampler_submission_groups
+from alframework.tools.sampler_batching import sampler_ready_groups
+from alframework.tools.sampler_batching import sampler_loop_delay
+from alframework.tools.sampler_batching import sampler_partial_policy
 from alframework.tools.sampler_batching import sampler_task_replicas
 from alframework.tools.sampler_batching import sampler_task_feed
 from alframework.tools.sampler_batching import sampler_uses_batches
 from alframework.tools.sampler_batching import validate_batching_config_reload
+from alframework.tools.batched_config import batching_settings, dynamics_settings, portable_batching
 #import logging
 #logging.basicConfig(level=logging.DEBUG)
 
@@ -145,7 +149,7 @@ for cur_Exec in sampler_task.executors:
 
 
 def submit_sampler_batch(molecule_objects):
-    """Submit either a legacy single input or a strict-full sampler batch."""
+    """Submit a legacy single input or a compatible full/partial batch."""
     feed = sampler_task_feed(molecule_objects, sampler_config)
     task_input = build_input_dict(
         sampler_task.func,
@@ -189,6 +193,13 @@ def current_sampler_capacity_status():
 def refresh_sampler_driver_status():
     """Refresh all sampler fields exposed in ALF's status file."""
     status['sampler_batching'] = sampler_batch_buffer.status()
+    if portable_batching(sampler_config):
+        settings = batching_settings(sampler_config)
+        status['sampler_batching'].update(
+            batch_size=settings['batch_size'], partial_policy=settings['partial_policy'],
+            max_wait_seconds=settings['max_wait_seconds'],
+            backend=dynamics_settings(sampler_config)['backend'],
+        )
     status['sampler_capacity'] = current_sampler_capacity_status()
     calculator_status = configured_sampler_calculator_status(sampler_config)
     if calculator_status is None:
@@ -276,15 +287,13 @@ if args.test_sampler:
         raise RuntimeError("Need to train model before testing sampling")
     print(master_config['model_path'].format(status['current_model_id']))
     if sampler_uses_batches(sampler_config):
-        if sampler_batch_size(sampler_config) != 1:
+        if sampler_partial_policy(sampler_config) == "full_only" and sampler_batch_size(sampler_config) != 1:
             raise ValueError(
                 "--test_sampler uses one builder result; set "
-                "alchemi_baoab.batch_size to 1 in the debug sampler config."
+                "batching.batch_size (or legacy alchemi_baoab.batch_size) "
+                "to 1 in the debug sampler config."
             )
-        sampler_feed = {
-            "molecule_objects": [test_configuration],
-            "sampler_config": sampler_config,
-        }
+        sampler_feed = sampler_task_feed([test_configuration], sampler_config)
     else:
         sampler_feed = {
             "molecule_object": test_configuration,
@@ -572,12 +581,25 @@ while True:
             for substructure in flatten_molecule_output(structure):
                 route_molecule_to_sampler(substructure)
 
+    # Timeout partial buckets even when no builder result completed this poll.
+    # A controlled stage that is draining must not acquire additional frames.
+    if not lifecycle or lifecycle.allow_acquisition:
+        for submission_group in sampler_ready_groups(sampler_batch_buffer, sampler_config):
+            submit_sampler_batch(submission_group)
+
     # Run more QM
-    if sampler_task_replicas(
+    completed_sampler_replicas = sampler_task_replicas(
         sampler_task_queue.task_list,
         sampler_task_replica_counts,
         completed_only=True,
-    ) > (0 if lifecycle and lifecycle.draining else master_config['minimum_QM']):
+    )
+    sampler_outputs_ready = completed_sampler_replicas > (0 if lifecycle and lifecycle.draining else master_config['minimum_QM'])
+    if (portable_batching(sampler_config) and completed_sampler_replicas
+            and all(task.done() for task in sampler_task_queue.task_list)):
+        # A final partial batch may never reach minimum_QM. Harvest it and
+        # release its input capacity even if it returned no candidates.
+        sampler_outputs_ready = True
+    if sampler_outputs_ready:
         previous_sampler_tasks = list(sampler_task_queue.task_list)
         sampler_results, failed = sampler_task_queue.get_task_results()
         remaining_sampler_task_ids = {
@@ -660,7 +682,7 @@ while True:
     sampler_task_queue.print_status()
     refresh_sampler_driver_status()
     if sampler_uses_batches(sampler_config):
-        print("sampler strict-full buffer:")
+        print("sampler batch buffer:")
         print(status['sampler_batching'])
         print("sampler replica capacity:")
         print(status['sampler_capacity'])
@@ -682,5 +704,8 @@ while True:
             raise RuntimeError('Controlled stage failed; inspect control/progress.json before resume.')
         break
     master_loop_iter += 1
-    time.sleep(lifecycle.poll_interval if lifecycle else 60)
+    time.sleep(sampler_loop_delay(
+        sampler_config, lifecycle.poll_interval if lifecycle else 60,
+        sampler_batch_buffer if not lifecycle or lifecycle.allow_acquisition else None,
+    ))
 	

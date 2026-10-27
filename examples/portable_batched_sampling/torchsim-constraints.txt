@@ -1,0 +1,7 @@
+# Validated CPU TorchSim profile. Install the platform-specific torch build first.
+# ROCm deployments record their actual PyTorch/driver versions in acceptance JSON.
+torch==2.9.0
+torch-sim-atomistic==0.6.2
+nvalchemi-toolkit-ops==0.4.0
+warp-lang==1.13.0
+tables==3.11.1

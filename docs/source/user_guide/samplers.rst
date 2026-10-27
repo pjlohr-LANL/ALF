@@ -220,6 +220,57 @@ Reactive sampler fields
         - Multiplier applied to ``Fscut`` for maximum force uncertainty. The
           default is ``3.0``.
 
+Portable batched sampling
+-------------------------
+
+``alframework.samplers.batched_sampling.batched_sampling_task`` runs ALF's shared
+acquisition policies with either ALCHEMI or TorchSim. The native HIPPYNN loader
+supports systems with different atom counts and compositions in one batch,
+provided their model, selected electronic state, and periodic boundary
+conditions are compatible. Each system retains its own atom order and cell.
+
+The following fragment selects the portable interface; retain the usual
+temperature, uncertainty, timestep, and trajectory settings:
+
+.. code-block:: json
+
+   {
+     "batched_calculator": "alframework.ml_interfaces.batched_inference.load_hippynn_batched_model",
+     "batching": {
+       "batch_size": 50,
+       "partial_policy": "timeout",
+       "max_wait_seconds": 5.0
+     },
+     "dynamics": {
+       "backend": "torchsim",
+       "strict_gpu": true,
+       "allow_cpu_debug": false
+     }
+   }
+
+``batch_size`` is an upper bound with ``partial_policy: "timeout"``. Full batches
+are submitted immediately; incomplete compatible batches are submitted when
+their oldest member reaches the timeout. ``full_only`` requires exact batches.
+Existing ``alchemi_baoab`` configurations retain their previous strict-full
+behavior. Replica capacity counts actual input widths, including partial tasks
+that return no candidates and tasks recovered after a controlled restart.
+
+Fully periodic ground-state checkpoints must include a trained cell input,
+identified by ``ML_config.cell_key``. The existing ``end_dens``, ``amp_dens``, and
+``per_dens`` settings enable independent isotropic density schedules. Excited-state
+support remains molecular, including state selection and gap/LCM controls.
+
+Use separate worker environments for the two engines. TorchSim requires Python
+3.12+ and ``pip install -e '.[torchsim_dynamics]'`` with the appropriate PyTorch
+CUDA or ROCm build. The existing ``gpu_dynamics`` extra supplies ALCHEMI. Choose
+``dynamics.backend: "alchemi"`` for that environment. CPU checks require explicit
+``dynamics.allow_cpu_debug: true``.
+
+See ``examples/portable_batched_sampling/README.md`` for complete configuration
+fragments, environment constraints, and the checkpoint-based acceptance and
+throughput harness. Hardware acceptance should be run on NVIDIA and on the
+intended AMD platform; CPU conformance alone does not establish GPU performance.
+
 ALCHEMI batched sampling
 ------------------------
 

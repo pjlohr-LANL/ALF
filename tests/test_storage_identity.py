@@ -123,7 +123,8 @@ def test_sampler_normalizes_supplied_ids_before_topology_check(monkeypatch):
     from tests.helpers.fakes import (
         _topology_molecule, _reference_topology, _enable_topology, _config, FakeModel, FakeRunner)
     from alframework.samplers import alchemi_sampling as mod
-    monkeypatch.setattr(mod, 'load_reference_topology', lambda *a, **k: _reference_topology())
+    from alframework.samplers import batched_sampling as shared_sampling
+    monkeypatch.setattr(shared_sampling, 'load_reference_topology', lambda *a, **k: _reference_topology())
     mol = _topology_molecule('tagged')
     original = mol.get_atoms().positions.copy()
     atoms = mol.get_atoms()[[2,0,1]]

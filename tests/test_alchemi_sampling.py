@@ -9,6 +9,7 @@ from alframework.samplers.ASE_ensemble_constructor import (
     Well_Potential,
 )
 import alframework.samplers.alchemi_sampling as alchemi_module
+import alframework.samplers.batched_sampling as shared_sampling
 from alframework.samplers.alchemi_sampling import (
     ALFASEAlchemiModel,
     ALFAlchemiCalculator,
@@ -809,7 +810,7 @@ def test_topology_gate_freezes_initial_invalid_replica_before_dynamics(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        alchemi_module,
+        shared_sampling,
         "load_reference_topology",
         lambda *args, **kwargs: _reference_topology(),
     )
@@ -853,7 +854,7 @@ def test_topology_gate_skips_dynamics_when_every_replica_is_invalid(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        alchemi_module,
+        shared_sampling,
         "load_reference_topology",
         lambda *args, **kwargs: _reference_topology(),
     )
@@ -887,7 +888,7 @@ def test_topology_gate_rejects_frame_before_uncertainty_and_lcm(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        alchemi_module,
+        shared_sampling,
         "load_reference_topology",
         lambda *args, **kwargs: _reference_topology(),
     )
@@ -939,7 +940,7 @@ def test_topology_rejection_preserves_earlier_valid_top_k_candidate(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        alchemi_module,
+        shared_sampling,
         "load_reference_topology",
         lambda *args, **kwargs: _reference_topology(),
     )
@@ -993,7 +994,7 @@ def test_temperature_schedule_matches_legacy_timing_per_replica(monkeypatch):
         {"Tamp": 20.0, "Tper": 0.4, "Tsrt": 200.0, "Tend": 260.0},
     ]
     monkeypatch.setattr(
-        alchemi_module,
+        shared_sampling,
         "_temperature_parameters",
         lambda sampler_config, count, random_seed: temperature_parameters,
     )

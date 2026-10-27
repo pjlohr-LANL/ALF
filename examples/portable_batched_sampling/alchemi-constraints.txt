@@ -1,0 +1,5 @@
+# Validated CPU ALCHEMI profile. Install the platform-specific torch build first.
+torch==2.9.0
+nvalchemi-toolkit==0.1.0
+nvalchemi-toolkit-ops==0.3.1
+warp-lang==1.13.0

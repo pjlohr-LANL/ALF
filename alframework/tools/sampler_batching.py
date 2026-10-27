@@ -1,9 +1,9 @@
 """Batching helpers for sampler tasks.
 
 The active-learning driver remains agnostic to the sampler implementation.  A
-sampler opts into batching by defining an ``alchemi_baoab`` configuration
-block; existing samplers continue to receive one ``MoleculesObject`` at a
-time.
+sampler opts into portable batching through ``batching`` and ``dynamics``.
+Legacy ``alchemi_baoab`` configurations retain exact-layout, strict-full
+batching; other existing samplers receive one ``MoleculesObject`` at a time.
 """
 
 from __future__ import annotations
@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from alframework.tools.molecules_class import MoleculesObject
+from alframework.tools.batched_config import (
+    batching_settings, configured_native_loader, dynamics_settings, portable_batching,
+)
 
 
 _MOLECULE_ID_INTEGER_RE = re.compile(r"(\d+)(?!.*\d)")
@@ -25,7 +28,7 @@ _MISSING = object()
 def sampler_uses_batches(sampler_config: dict[str, Any]) -> bool:
     """Return whether the configured sampler consumes molecule lists."""
 
-    return isinstance(sampler_config.get("alchemi_baoab"), dict)
+    return portable_batching(sampler_config) or isinstance(sampler_config.get("alchemi_baoab"), dict)
 
 
 def sampler_batch_size(sampler_config: dict[str, Any]) -> int:
@@ -33,16 +36,15 @@ def sampler_batch_size(sampler_config: dict[str, Any]) -> int:
 
     if not sampler_uses_batches(sampler_config):
         return 1
-    raw = sampler_config["alchemi_baoab"]
-    size = int(raw.get("batch_size", 1))
-    if size < 1:
-        raise ValueError("alchemi_baoab.batch_size must be at least one.")
-    policy = str(raw.get("partial_policy", "full_only")).strip().lower()
-    if policy != "full_only":
-        raise ValueError(
-            "Only alchemi_baoab.partial_policy='full_only' is currently supported."
-        )
-    return size
+    return batching_settings(sampler_config)["batch_size"]
+
+
+def sampler_partial_policy(sampler_config: dict[str, Any]) -> str:
+    return batching_settings(sampler_config)["partial_policy"]
+
+
+def sampler_max_wait_seconds(sampler_config: dict[str, Any]) -> float:
+    return batching_settings(sampler_config)["max_wait_seconds"]
 
 
 def _nonnegative_integer(value: Any, *, name: str) -> int:
@@ -185,11 +187,7 @@ def sampler_batching_signature(
         )
     if batched:
         batch_size = sampler_batch_size(sampler_config)
-        partial_policy = str(
-            sampler_config["alchemi_baoab"].get(
-                "partial_policy", "full_only"
-            )
-        ).strip().lower()
+        partial_policy = sampler_partial_policy(sampler_config)
         selection = _configured_state_selection(sampler_config)
         state_selection = (
             None
@@ -203,7 +201,7 @@ def sampler_batching_signature(
         batch_size = 1
         partial_policy = None
         state_selection = None
-    return {
+    signature = {
         "sampler_task": str(master_config.get("sampler_task", "")),
         "batched": bool(batched),
         "batch_size": int(batch_size),
@@ -211,6 +209,18 @@ def sampler_batching_signature(
         "model_mode": mode,
         "state_selection": state_selection,
     }
+    if portable_batching(sampler_config):
+        signature.update(
+            portable=True,
+            backend=dynamics_settings(sampler_config)["backend"],
+            calculator_loader=configured_native_loader(sampler_config) or sampler_config.get("ase_calculator"),
+            max_wait_seconds=sampler_max_wait_seconds(sampler_config),
+        )
+    else:
+        signature.update(portable=False, backend="alchemi" if batched else None,
+                         calculator_loader=(configured_native_loader(sampler_config) or sampler_config.get("ase_calculator")) if batched else None,
+                         max_wait_seconds=None)
+    return signature
 
 
 def changed_batching_signature_fields(
@@ -365,13 +375,16 @@ def configured_sampler_calculator_status(
 
     if not sampler_uses_batches(sampler_config):
         return None
-    native_loader = sampler_config.get("alchemi_calculator")
+    native_loader = configured_native_loader(sampler_config)
     if native_loader:
-        return {"interface": "native", "loader": str(native_loader)}
-    ase_loader = sampler_config.get("ase_calculator")
-    if ase_loader:
-        return {"interface": "ase_fallback", "loader": str(ase_loader)}
-    return {"interface": "unconfigured", "loader": ""}
+        status = {"interface": "native", "loader": str(native_loader)}
+    elif sampler_config.get("ase_calculator"):
+        status = {"interface": "ase_fallback", "loader": str(sampler_config["ase_calculator"])}
+    else:
+        status = {"interface": "unconfigured", "loader": ""}
+    if portable_batching(sampler_config):
+        status["backend"] = dynamics_settings(sampler_config)["backend"]
+    return status
 
 
 def _molecule_sequence_index(molecule: MoleculesObject) -> int:
@@ -442,7 +455,7 @@ def selected_state(
         return state
 
     raise ValueError(
-        "Excited-state ALCHEMI batching requires molecule metadata to contain "
+        "Excited-state batching requires molecule metadata to contain "
         "'selected_state' or sampler_config.state_selection to define a "
         "fixed or batch-cycle policy."
     )
@@ -451,11 +464,12 @@ def selected_state(
 def sampler_batch_key(
     molecule: MoleculesObject,
     sampler_config: dict[str, Any],
-) -> tuple[tuple[int, ...], int | None]:
+) -> tuple[Any, ...]:
     """Build the compatibility key for one batched sampler input.
 
-    Exact atom order is deliberately retained because HIPPYNN's padded batch
-    inputs and state-specific dynamics must have the same layout in a batch.
+    Portable batches share a model interface, PBC, and selected state, while
+    preserving each member's atom order. Legacy keys keep their original shape
+    so previously journaled buffers remain usable without reinterpretation.
     """
 
     if not isinstance(molecule, MoleculesObject):
@@ -473,6 +487,10 @@ def sampler_batch_key(
         raise ValueError(
             "model_mode must be either 'ground_state' or 'excited_state'."
         )
+    if portable_batching(sampler_config):
+        return ("portable", mode, tuple(bool(value) for value in atoms.get_pbc()), state,
+                dynamics_settings(sampler_config)["backend"],
+                configured_native_loader(sampler_config) or str(sampler_config.get("ase_calculator", "")))
     return atomic_numbers, state
 
 
@@ -503,10 +521,13 @@ def sampler_task_feed(
     molecules = list(molecule_objects)
     if sampler_uses_batches(sampler_config):
         expected = sampler_batch_size(sampler_config)
-        if len(molecules) != expected:
+        if not molecules or len(molecules) > expected or (
+            sampler_partial_policy(sampler_config) == "full_only" and len(molecules) != expected
+        ):
             raise ValueError(
-                "Strict-full sampler tasks require exactly "
-                f"{expected} molecules; received {len(molecules)}."
+                ("Strict-full sampler tasks require exactly " if sampler_partial_policy(sampler_config) == "full_only"
+                 else "Partial sampler tasks require between one and ")
+                + f"{expected} molecules; received {len(molecules)}."
             )
         return {
             "molecule_objects": molecules,
@@ -527,12 +548,10 @@ class _BufferedMolecule:
 
 
 class SamplerBatchBuffer:
-    """In-memory strict-full batching buffer used by the ALF driver."""
+    """Compatibility batching buffer, optionally persisted by run control."""
 
     def __init__(self) -> None:
-        self._buckets: dict[
-            tuple[tuple[int, ...], int | None], list[_BufferedMolecule]
-        ] = defaultdict(list)
+        self._buckets: dict[tuple[Any, ...], list[_BufferedMolecule]] = defaultdict(list)
 
     def __len__(self) -> int:
         return sum(len(bucket) for bucket in self._buckets.values())
@@ -552,18 +571,26 @@ class SamplerBatchBuffer:
             )
         )
 
-    def pop_ready(self, batch_size: int) -> list[list[MoleculesObject]]:
-        """Remove and return every complete compatibility batch."""
+    def pop_ready(self, batch_size: int, *, partial_policy: str = "full_only",
+                  max_wait_seconds: float = 5.0, now: float | None = None) -> list[list[MoleculesObject]]:
+        """Return full batches and any partial bucket whose oldest item expired."""
 
         size = int(batch_size)
         if size < 1:
             raise ValueError("batch_size must be at least one.")
+        if partial_policy not in {"full_only", "timeout"}:
+            raise ValueError("partial_policy must be 'full_only' or 'timeout'.")
+        current_time = time.time() if now is None else float(now)
         ready: list[list[MoleculesObject]] = []
         for key in sorted(self._buckets, key=repr):
             bucket = self._buckets[key]
             while len(bucket) >= size:
                 ready.append([entry.molecule for entry in bucket[:size]])
                 del bucket[:size]
+            if (bucket and partial_policy == "timeout"
+                    and current_time - min(entry.buffered_at for entry in bucket) >= max_wait_seconds):
+                ready.append([entry.molecule for entry in bucket])
+                bucket.clear()
         self._buckets = defaultdict(
             list, {key: bucket for key, bucket in self._buckets.items() if bucket}
         )
@@ -575,17 +602,25 @@ class SamplerBatchBuffer:
         current_time = time.time() if now is None else float(now)
         buckets = []
         oldest_timestamp: float | None = None
-        for (atomic_numbers, state), entries in sorted(
+        for key, entries in sorted(
             self._buckets.items(), key=lambda item: repr(item[0])
         ):
             if not entries:
                 continue
             oldest = min(entry.buffered_at for entry in entries)
             oldest_timestamp = oldest if oldest_timestamp is None else min(oldest_timestamp, oldest)
+            if key[0] == "portable":
+                _, mode, pbc, state, backend, loader = key
+                compatibility = {"pbc": list(pbc), "selected_state": state,
+                                 "model_mode": mode, "backend": backend,
+                                 "calculator_loader": loader,
+                                 "atom_counts": sorted({len(entry.molecule.get_atoms()) for entry in entries})}
+            else:
+                atomic_numbers, state = key
+                compatibility = {"atomic_numbers": list(atomic_numbers), "selected_state": state}
             buckets.append(
                 {
-                    "atomic_numbers": list(atomic_numbers),
-                    "selected_state": state,
+                    **compatibility,
                     "count": len(entries),
                     "oldest_age_seconds": max(0.0, current_time - oldest),
                 }
@@ -622,6 +657,27 @@ def sampler_submission_groups(
     if not sampler_uses_batches(sampler_config):
         return [[molecule]]
     sampler_batch_buffer.add(molecule, sampler_config)
-    return sampler_batch_buffer.pop_ready(
-        sampler_batch_size(sampler_config)
-    )
+    return sampler_ready_groups(sampler_batch_buffer, sampler_config)
+
+
+def sampler_ready_groups(sampler_batch_buffer: SamplerBatchBuffer,
+                         sampler_config: dict[str, Any], *, now: float | None = None) -> list[list[MoleculesObject]]:
+    """Poll all buffered input, including when no new builder result arrives."""
+
+    if not sampler_uses_batches(sampler_config):
+        return []
+    settings = batching_settings(sampler_config)
+    return sampler_batch_buffer.pop_ready(settings["batch_size"],
+        partial_policy=settings["partial_policy"], max_wait_seconds=settings["max_wait_seconds"], now=now)
+
+
+def sampler_loop_delay(sampler_config: dict[str, Any], default: float,
+                       sampler_batch_buffer: SamplerBatchBuffer | None = None, *, now: float | None = None) -> float:
+    """Cap driver polling by the oldest waiting partial batch's deadline."""
+
+    if not sampler_batch_buffer or sampler_partial_policy(sampler_config) != "timeout":
+        return default
+    current_time = time.time() if now is None else float(now)
+    oldest = sampler_batch_buffer.status(now=current_time)["oldest_age_seconds"]
+    remaining = sampler_max_wait_seconds(sampler_config) - oldest
+    return min(default, max(0.001, remaining))

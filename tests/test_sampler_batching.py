@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+
+
 from ase import Atoms
 from ase.io import write
 
@@ -18,9 +20,14 @@ from alframework.tools.sampler_batching import (
     sampler_submission_groups,
     sampler_task_feed,
     sampler_task_replicas,
+    sampler_ready_groups,
+    sampler_loop_delay,
     selected_state,
     validate_batching_config_reload,
     validate_state_selection,
+)
+from alframework.tools.batched_config import (
+    batching_settings, dynamics_settings, configured_native_loader, configured_native_options,
 )
 from alframework.tools.tools import parsl_task_queue
 from tests.helpers.fakes import FakeTask
@@ -410,6 +417,10 @@ def test_batching_signature_normalizes_state_selection_and_calculator():
         "partial_policy": "full_only",
         "model_mode": "excited_state",
         "state_selection": {"mode": "fixed", "states": [1]},
+        "portable": False,
+        "backend": "alchemi",
+        "calculator_loader": "package.native_loader",
+        "max_wait_seconds": None,
     }
     assert configured_sampler_calculator_status(config) == {
         "interface": "native",
@@ -580,3 +591,118 @@ def test_batching_mode_and_state_changes_are_accepted_when_epoch_is_empty(
     )
 
     assert changed
+
+
+def _portable_config(**settings):
+    return {"model_mode": "ground_state", "dynamics": {"backend": "torchsim"},
+            "batching": {"batch_size": 3, **settings}}
+
+
+def test_portable_configuration_defaults_and_legacy_conflicts():
+    config = {"dynamics": {"backend": "torchsim"}, "batching": {}}
+    assert batching_settings(config) == {"batch_size": 1, "partial_policy": "timeout",
+                                         "max_wait_seconds": 5., "portable": True}
+    assert dynamics_settings(config) == {"backend": "torchsim"}
+    assert dynamics_settings({"alchemi_baoab": {"random_seed": 8}}) == {"random_seed": 8, "backend": "alchemi"}
+    with pytest.raises(ValueError, match="dynamics.backend"):
+        dynamics_settings({"batching": {}})
+    with pytest.raises(ValueError, match="Conflicting.*batch_size"):
+        batching_settings({**config, "batching": {"batch_size": 2}, "alchemi_baoab": {"batch_size": 3}})
+    with pytest.raises(ValueError, match="Conflicting.*friction"):
+        dynamics_settings({"dynamics": {"backend": "alchemi", "friction_per_fs": 1.},
+                           "alchemi_baoab": {"friction_per_fs": 2.}})
+    with pytest.raises(ValueError, match="Conflicting.*loaders"):
+        configured_native_loader({"batched_calculator": "new.load", "alchemi_calculator": "old.load"})
+    with pytest.raises(ValueError, match="Conflicting.*options"):
+        configured_native_options({"batched_calculator_options": {"key": 1},
+                                   "alchemi_calculator_options": {"key": 2}})
+    assert configured_native_options({"batched_calculator_options": {"new": 1},
+                                      "alchemi_calculator_options": {"old": 2}}) == {"new": 1, "old": 2}
+
+
+@pytest.mark.parametrize('settings', [
+    {"batch_size": True}, {"batch_size": 1.5}, {"batch_size": 0},
+    {"max_wait_seconds": float('nan')}, {"max_wait_seconds": -1},
+    {"max_wait_seconds": True}, {"partial_policy": "unsupported"},
+])
+def test_portable_batching_rejects_invalid_settings(settings):
+    with pytest.raises(ValueError):
+        batching_settings(_portable_config(**settings))
+
+
+def test_portable_batch_packs_sizes_orders_and_compositions_but_separates_pbc():
+    config = _portable_config()
+    buffer = SamplerBatchBuffer()
+    first, second, third = (_molecule("first", "OH"), _molecule("second", "HO"), _molecule("third", "H"))
+    periodic = _molecule("periodic", "H")
+    periodic.get_atoms().set_cell(np.eye(3) * 5.)
+    periodic.get_atoms().set_pbc(True)
+    for molecule in (first, periodic, second, third):
+        buffer.add(molecule, config)
+    assert sampler_ready_groups(buffer, config) == [[first, second, third]]
+    summary = buffer.status()
+    assert summary['buffered_structures'] == 1
+    assert summary['buckets'][0]['pbc'] == [True] * 3
+    assert summary['buckets'][0]['atom_counts'] == [1]
+    np.testing.assert_array_equal(second.get_atoms().numbers, [1, 8])
+
+
+def test_partial_timeout_is_polled_without_new_builder_results_and_caps_sleep():
+    config = _portable_config()
+    buffer = SamplerBatchBuffer()
+    waiting = _molecule("waiting")
+    buffer.add(waiting, config, buffered_at=10.)
+    assert sampler_ready_groups(buffer, config, now=14.9) == []
+    assert sampler_loop_delay(config, 60., buffer, now=13.) == pytest.approx(2.)
+    assert sampler_ready_groups(buffer, config, now=15.) == [[waiting]]
+    assert sampler_loop_delay(config, 60., buffer, now=15.) == 60.
+    assert sampler_task_feed([waiting], config)['molecule_objects'] == [waiting]
+    with pytest.raises(ValueError, match="between one"):
+        sampler_task_feed([], config)
+
+
+def test_complete_batch_resets_remaining_members_timeout():
+    config = _portable_config(batch_size=2)
+    buffer = SamplerBatchBuffer()
+    molecules = [_molecule(str(i)) for i in range(3)]
+    for molecule, timestamp in zip(molecules, (1., 2., 9.)):
+        buffer.add(molecule, config, buffered_at=timestamp)
+    assert sampler_ready_groups(buffer, config, now=10.) == [molecules[:2]]
+    assert sampler_ready_groups(buffer, config, now=14.) == [molecules[2:]]
+
+
+@pytest.mark.parametrize('field,update', [
+    ('backend', {"dynamics": {"backend": "alchemi"}}),
+    ('calculator_loader', {"batched_calculator": "other.loader"}),
+    ('max_wait_seconds', {"batching": {"batch_size": 3, "max_wait_seconds": 10.}}),
+])
+def test_portable_backend_loader_and_deadline_reload_preserve_waiting_input(field, update):
+    current = _portable_config()
+    proposed = {**current, **update}
+    buffer = SamplerBatchBuffer()
+    waiting = _molecule('waiting')
+    buffer.add(waiting, current)
+    with pytest.raises(ValueError, match=field):
+        validate_batching_config_reload({}, current, {}, proposed, buffer)
+    assert list(buffer.molecules()) == [waiting]
+
+
+@pytest.mark.parametrize('portable', [False, True], ids=['legacy-buffer', 'portable-buffer'])
+def test_pickled_buffers_keep_members_order_and_original_deadlines(portable):
+    import pickle
+    config = _portable_config() if portable else {'alchemi_baoab': {'batch_size': 3}}
+    buffer = SamplerBatchBuffer()
+    buffer.add(_molecule('saved'), config, buffered_at=10.)
+    restored = pickle.loads(pickle.dumps(buffer))
+    assert restored.status(now=20.) == buffer.status(now=20.)
+    assert [m.get_moleculeid() for m in restored.molecules()] == ['saved']
+    assert len(sampler_ready_groups(restored, config, now=20.)) == int(portable)
+
+
+def test_null_native_loader_options_retain_legacy_compatibility():
+    from alframework.tools.batched_config import configured_native_loader, configured_native_options
+    config = {"alchemi_calculator": "example.loader", "alchemi_calculator_options": None}
+    assert configured_native_loader(config) == "example.loader"
+    assert configured_native_options(config) == {}
+    config.update(batched_calculator="example.loader", batched_calculator_options={"device_option": 2})
+    assert configured_native_options(config) == {"device_option": 2}

@@ -124,7 +124,8 @@ def test_audit_has_actual_rejected_frame_and_previous_valid_without_candidates(t
 
 def test_topology_rejection_audit_survives_zero_candidates(tmp_path, monkeypatch):
     import alframework.samplers.alchemi_sampling as mod
-    monkeypatch.setattr(mod, 'load_reference_topology', lambda *a, **k: _reference_topology())
+    from alframework.samplers import batched_sampling as shared_sampling
+    monkeypatch.setattr(shared_sampling, 'load_reference_topology', lambda *a, **k: _reference_topology())
     config = _enable_topology(_config(batch_size=1))
     config['force_screen_audit_dir'] = str(tmp_path)
     assert run_alchemi_sampling([_topology_molecule('bad', [[0,0,0],[.5,0,0],[2,0,0]])],

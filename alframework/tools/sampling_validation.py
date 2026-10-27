@@ -508,12 +508,18 @@ def _validate_sampling_inputs(
     sampler_config: dict[str, Any],
     properties_list: dict[str, Any] | None = None,
 ) -> tuple[str, int | None]:
+    from alframework.tools.batched_config import batching_settings, dynamics_settings
+    settings = batching_settings(sampler_config)
+    portable = settings["portable"]
+    if portable:
+        dynamics_settings(sampler_config)
     if not isinstance(molecule_objects, list) or not molecule_objects:
         raise ValueError("molecule_objects must be a non-empty list.")
     if not all(isinstance(item, MoleculesObject) for item in molecule_objects):
         raise TypeError("molecule_objects may contain only MoleculesObject instances.")
     expected_size = sampler_batch_size(sampler_config)
-    if len(molecule_objects) != expected_size:
+    if (len(molecule_objects) > expected_size or
+            (settings["partial_policy"] == "full_only" and len(molecule_objects) != expected_size)):
         raise ValueError(
             "Strict-full ALCHEMI sampling expected exactly "
             f"{expected_size} molecules but received {len(molecule_objects)}."
@@ -531,21 +537,36 @@ def _validate_sampling_inputs(
 
     reference_numbers: tuple[int, ...] | None = None
     states: set[int] = set()
+    boundary_conditions: set[tuple[bool, ...]] = set()
     for molecule in molecule_objects:
         atoms = molecule.get_atoms()
         if atoms is None:
             raise ValueError("ALCHEMI cannot sample a molecule whose atoms are None.")
+        if not len(atoms) or not np.isfinite(atoms.positions).all():
+            raise ValueError("Sampling requires nonempty systems with finite positions.")
+        if not np.isfinite(atoms.get_masses()).all() or np.any(atoms.get_masses() <= 0):
+            raise ValueError("Sampling requires finite positive atomic masses.")
+        if atoms.constraints:
+            raise NotImplementedError("Batched sampling does not yet support atom constraints.")
+        boundary_conditions.add(tuple(bool(value) for value in atoms.pbc))
         if bool(np.any(atoms.get_pbc())):
-            raise NotImplementedError("ALCHEMI sampling currently supports only nonperiodic systems.")
+            if not portable:
+                raise NotImplementedError("ALCHEMI sampling currently supports only nonperiodic systems.")
+            if not np.all(atoms.pbc) or mode != "ground_state":
+                raise NotImplementedError("Periodic batched sampling supports fully periodic ground states only.")
+            if not np.isfinite(atoms.cell).all() or not np.isfinite(atoms.get_volume()) or atoms.get_volume() <= 0:
+                raise ValueError("Periodic sampling requires a finite nonsingular cell.")
         numbers = tuple(int(value) for value in atoms.get_atomic_numbers())
         if reference_numbers is None:
             reference_numbers = numbers
-        elif numbers != reference_numbers:
+        elif not portable and numbers != reference_numbers:
             raise ValueError(
                 "Every molecule in an ALCHEMI batch must have identical atom order."
             )
         if mode == "excited_state":
             states.add(selected_state(molecule, sampler_config))
+    if len(boundary_conditions) > 1:
+        raise ValueError("Every system in a batch must use the same periodic boundary conditions.")
     if len(states) > 1:
         raise ValueError("Every molecule in an excited-state batch must select the same state.")
     if mode == "excited_state" and properties_list is not None and states:
@@ -571,11 +592,14 @@ def _validate_sampling_inputs(
         configured_score(sampler_config, None, selected_for_validation)
 
     for density_key in ("end_dens", "amp_dens", "per_dens"):
-        if sampler_config.get(density_key) is not None:
+        if not portable and sampler_config.get(density_key) is not None:
             raise NotImplementedError(
                 "ALCHEMI sampling does not yet support density or cell schedules; "
                 f"set {density_key} to null."
             )
+    if portable and sampler_config.get("end_dens") is not None:
+        if boundary_conditions != {(True, True, True)}:
+            raise ValueError("Density schedules require fully periodic ground-state systems.")
     if "max_force_cutoff" in sampler_config:
         validated_force_cutoff(sampler_config["max_force_cutoff"], positive=True)
     return mode, (next(iter(states)) if states else None)
@@ -634,9 +658,10 @@ def normalize_contributions(batch, energy_values, force_values):
         raise ValueError(
             "ALCHEMI force contributions must use the same model count as energies."
         )
-    allowed_shapes = {(model_count, total_atoms, 3),
-                      (model_count, int(batch.num_graphs),
-                       int(batch.num_nodes_per_graph[0]), 3)}
+    allowed_shapes = {(model_count, total_atoms, 3)}
+    if bool(torch.all(batch.num_nodes_per_graph == batch.num_nodes_per_graph[0])):
+        allowed_shapes.add((model_count, int(batch.num_graphs),
+                            int(batch.num_nodes_per_graph[0]), 3))
     if tuple(forces.shape) not in allowed_shapes:
         raise ValueError(
             "ALCHEMI force contributions must have shape [models, total_atoms, 3]."
@@ -648,8 +673,9 @@ def normalize_contributions(batch, energy_values, force_values):
 
 
 def validate_sampler_debug_output(molecule, sampler_config):
+    from alframework.tools.batched_config import dynamics_settings
     metadata = molecule.get_metadata()
-    backend = dict(sampler_config.get("alchemi_baoab", {}))
+    backend = dynamics_settings(sampler_config)
     if backend.get("strict_gpu", False) and not backend.get("allow_cpu_debug", False):
         assert str(metadata.get("sampler_device", "")).startswith("cuda:"), (
             "Strict-GPU sampler testing must return CUDA device metadata.")
@@ -706,8 +732,8 @@ def validate_temperature_period(period, replica_index):
 
 
 def validate_dynamics_parameters(dt, maxt, ncheck, min_time):
-    if dt <= 0 or maxt <= 0 or ncheck < 1 or min_time < 0:
-        raise ValueError("dt and maxt must be positive; Ncheck >= 1 and min_time >= 0.")
+    if not np.isfinite([dt, maxt, min_time]).all() or dt <= 0 or maxt <= 0 or ncheck < 1 or min_time < 0:
+        raise ValueError("dt and maxt must be finite and positive; Ncheck >= 1 and min_time finite and nonnegative.")
 
 
 def validate_friction(friction_per_fs):

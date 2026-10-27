@@ -36,6 +36,14 @@ gpu_dynamics_requirements = [
     "nvalchemi-toolkit>=0.1.0,<0.2",
 ]
 
+# Keep this optional stack separate from a validated ALCHEMI worker environment.
+# The pinned engine requires Python >=3.12; base ALF's Python support is unchanged.
+torchsim_dynamics_requirements = [
+    "hippynn",
+    "torch",
+    "torch-sim-atomistic==0.6.2",
+]
+
 topology_requirements = [
     "rdkit",
 ]
@@ -52,6 +60,7 @@ setuptools.setup(
         "full": full_requirements,
         "tests": test_requirements,
         "gpu_dynamics": gpu_dynamics_requirements,
+        "torchsim_dynamics": torchsim_dynamics_requirements,
         "topology": topology_requirements,
     },
     license="BSD 3-Clause License",
