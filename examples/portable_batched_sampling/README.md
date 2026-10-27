@@ -63,7 +63,7 @@ sampler's acquisition and physical-force thresholds. Override them with
 `--parity-rtol` and `--parity-atol`; each artifact records the actual values,
 inference dtype, and maximum observed energy, force, and diagnostic errors.
 The original `atol=1e-6` exposed ordinary float32 roundoff on a trained
-four-state checkpoint: the largest force discrepancy was about `1.4e-6`
+four-state checkpoint: a force component differed by about `1.4e-6`
 eV/Å, while the same calculation in float64 agreed below `7e-15` eV/Å.
 
 An explicit CPU mechanics check requires no trained model:

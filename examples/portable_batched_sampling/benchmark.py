@@ -218,6 +218,7 @@ def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iteration
         density_checked = True
     return {
         "systems": len(atoms_list), "atoms": sum(len(atoms) for atoms in atoms_list),
+        "inference_dtype": str(batch.positions.dtype),
         "inference_iterations": iterations, "inference_seconds": inference_seconds,
         "inference_systems_per_second": len(atoms_list) * iterations / inference_seconds,
         "runner_initialization_seconds": initialization_seconds,
@@ -292,7 +293,7 @@ def main(argv=None):
         "source": source_revision(),
         "parameters": {"dt_fs": args.dt_fs, "temperature_K": args.temperature_K,
                        "warmup_steps": args.warmup, "selected_state": args.selected_state,
-                       "inference_dtype": str(next(iter(model.parameters()), torch.empty((), dtype=torch.float32)).dtype),
+                       "inference_dtype": records[0]["inference_dtype"],
                        "parity_rtol": args.parity_rtol, "parity_atol": args.parity_atol},
         "configuration": getattr(args, "_configuration", None),
         "structures": fingerprint(args.structures) if args.structures else None,

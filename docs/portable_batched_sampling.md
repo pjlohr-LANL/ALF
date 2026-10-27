@@ -85,10 +85,16 @@ freezing and periodic cell scaling passed. JSON artifacts record the source
 revision/dirty status, configuration, checkpoint and structure fingerprints,
 package versions, timing, and hardware-validation flag.
 
-No GPU was visible during this validation. NVIDIA throughput, Darwin MI250X
-acceptance, and production MI350-family acceptance remain to be run using
-trained checkpoints and representative structures. Follow the example harness
-instructions, retain the resulting JSON, and compare energy/force/uncertainty
-parity, candidate provenance, physical-force rejection, thermal behavior,
-throughput, and peak GPU memory before production rollout. Stochastic
-trajectories across engines or GPU families need not be bitwise identical.
+Subsequent Darwin GPU validation passed nine acceptance cases each for
+TorchSim on MI250X/MI250, ALCHEMI on A100, and TorchSim on A100. This includes
+all four surfaces of a trained keto-pilot checkpoint, periodic mechanics,
+candidate provenance, physical-force rejection, and LCM behavior. Float32
+acceptance uses explicit `rtol=1e-5, atol=1e-5`; the maximum accepted force
+discrepancy was `2.15e-6` eV/Å. The full CPU suites passed again after the
+GPU-discovered ALCHEMI adapter correction.
+
+See [the Darwin GPU validation report](portable_gpu_validation_20261027.md)
+for exact revisions, software versions, original tolerance failures and
+float64 diagnosis, throughput versus batch size, memory, and artifact locations.
+MI350-family execution, trained periodic model acceptance, and longer thermal
+and trajectory-stability evaluation remain necessary before production rollout.
