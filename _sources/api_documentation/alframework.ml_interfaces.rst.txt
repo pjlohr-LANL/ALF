@@ -1,0 +1,16 @@
+alframework.ml\_interfaces package
+==================================
+
+.. automodule:: alframework.ml_interfaces
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+Submodules
+----------
+
+.. toctree::
+   :maxdepth: 5
+
+   alframework.ml_interfaces.hippynn_interface
+   alframework.ml_interfaces.neurochem_interface

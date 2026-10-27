@@ -1,0 +1,16 @@
+alframework.parsl\_resource\_configs package
+============================================
+
+.. automodule:: alframework.parsl_resource_configs
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+Submodules
+----------
+
+.. toctree::
+   :maxdepth: 5
+
+   alframework.parsl_resource_configs.chicoma
+   alframework.parsl_resource_configs.darwin
