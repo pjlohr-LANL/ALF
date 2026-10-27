@@ -12,6 +12,7 @@ import copy
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import json
+import math
 from pathlib import Path
 import platform
 import subprocess
@@ -121,7 +122,7 @@ def synthetic_structures(periodic=False):
     return structures
 
 
-def verify_individual_predictions(model, atoms_list, device):
+def verify_individual_predictions(model, atoms_list, device, *, rtol, atol):
     import torch
     from alframework.ml_interfaces.batched_inference import PackedBatch
 
@@ -132,21 +133,28 @@ def verify_individual_predictions(model, atoms_list, device):
     diagnostics = [copy.deepcopy(model.diagnostics_for_graph(i)) for i in range(len(atoms_list))]
     ptr = batch.batch_ptr.tolist()
     max_energy_error = max_force_error = 0.
+    max_diagnostic_errors = dict.fromkeys(("Es", "Fs", "Fsmax", "Fmeanmax"), 0.)
     for index, atoms in enumerate(atoms_list):
         prediction = model(PackedBatch.from_atoms([atoms], device=device))
         single_energy = prediction["energy"].detach().reshape(-1)[0]
         single_forces = prediction["forces"].detach().reshape(-1, 3)
-        torch.testing.assert_close(energies[index], single_energy, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(forces[ptr[index]:ptr[index+1]], single_forces, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(energies[index], single_energy, rtol=rtol, atol=atol)
+        torch.testing.assert_close(forces[ptr[index]:ptr[index+1]], single_forces, rtol=rtol, atol=atol)
         single_diagnostics = model.diagnostics_for_graph(0)
         for key in ("Es", "Fs", "Fsmax", "Fmeanmax"):
-            np.testing.assert_allclose(diagnostics[index][key], single_diagnostics[key], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(diagnostics[index][key], single_diagnostics[key], rtol=rtol, atol=atol)
+            max_diagnostic_errors[key] = max(
+                max_diagnostic_errors[key],
+                float(np.max(np.abs(np.asarray(diagnostics[index][key]) - np.asarray(single_diagnostics[key])))),
+            )
         max_energy_error = max(max_energy_error, abs(float(energies[index] - single_energy)))
         max_force_error = max(max_force_error, float((forces[ptr[index]:ptr[index+1]] - single_forces).abs().max()))
-    return {"max_energy_error_eV": max_energy_error, "max_force_error_eV_per_A": max_force_error}
+    return {"max_energy_error_eV": max_energy_error, "max_force_error_eV_per_A": max_force_error,
+            "max_diagnostic_errors": max_diagnostic_errors}
 
 
-def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iterations, dt_fs, temperature_K):
+def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iterations, dt_fs,
+             temperature_K, parity_rtol, parity_atol):
     import torch
     from alframework.ml_interfaces.batched_inference import PackedBatch
 
@@ -161,7 +169,7 @@ def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iteration
     def peak():
         return torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
 
-    parity = verify_individual_predictions(model, atoms_list, device)
+    parity = verify_individual_predictions(model, atoms_list, device, rtol=parity_rtol, atol=parity_atol)
     batch = PackedBatch.from_atoms(atoms_list, device=device)
     for _ in range(warmup):
         model(batch)
@@ -232,6 +240,10 @@ def main(argv=None):
     parser.add_argument("--inference-iterations", type=int, default=10)
     parser.add_argument("--dt-fs", type=float, default=.1)
     parser.add_argument("--temperature-K", type=float, default=20.)
+    parser.add_argument("--parity-rtol", type=float, default=1e-5,
+                        help="Relative tolerance for float32 batch-versus-individual acceptance (default: 1e-5)")
+    parser.add_argument("--parity-atol", type=float, default=1e-5,
+                        help="Absolute tolerance in each checked quantity's units (default: 1e-5)")
     parser.add_argument("--master", help="Existing ALF master configuration for a real HIPPYNN checkpoint")
     parser.add_argument("--ensemble-directory", help="Directory containing model-* HIPPYNN members")
     parser.add_argument("--selected-state", type=int)
@@ -245,6 +257,8 @@ def main(argv=None):
         parser.error("Real checkpoint acceptance requires --structures from its intended model domain")
     if min(args.batch_sizes) < 1 or args.steps < 1 or args.warmup < 0 or args.inference_iterations < 1:
         parser.error("Batch sizes, steps, and inference iterations must be positive; warmup must be nonnegative")
+    if any(not math.isfinite(value) or value < 0 for value in (args.parity_rtol, args.parity_atol)):
+        parser.error("Parity tolerances must be finite and nonnegative")
     import torch
 
     device = torch.device(args.device)
@@ -268,7 +282,8 @@ def main(argv=None):
         atoms_list = [structures[index % len(structures)].copy() for index in range(size)]
         records.append(run_case(model, atoms_list, Runner, device=device, steps=args.steps,
                                 warmup=args.warmup, iterations=args.inference_iterations,
-                                dt_fs=args.dt_fs, temperature_K=args.temperature_K))
+                                dt_fs=args.dt_fs, temperature_K=args.temperature_K,
+                                parity_rtol=args.parity_rtol, parity_atol=args.parity_atol))
     result = {
         "schema": "alf.portable_batched_acceptance.v1", "backend": args.backend,
         "model": "hippynn_checkpoint" if args.master else "synthetic_harmonic",
@@ -276,7 +291,9 @@ def main(argv=None):
         "hardware_validation": device.type == "cuda", "environment": environment(torch, device),
         "source": source_revision(),
         "parameters": {"dt_fs": args.dt_fs, "temperature_K": args.temperature_K,
-                       "warmup_steps": args.warmup, "selected_state": args.selected_state},
+                       "warmup_steps": args.warmup, "selected_state": args.selected_state,
+                       "inference_dtype": str(next(iter(model.parameters()), torch.empty((), dtype=torch.float32)).dtype),
+                       "parity_rtol": args.parity_rtol, "parity_atol": args.parity_atol},
         "configuration": getattr(args, "_configuration", None),
         "structures": fingerprint(args.structures) if args.structures else None,
         "checkpoint_files": [fingerprint(path) for path in sorted(Path(args.ensemble_directory).glob("model-*/*.pt"))] if args.ensemble_directory else [],

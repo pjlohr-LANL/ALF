@@ -55,6 +55,17 @@ compares batch predictions with individual predictions, exercises independent
 replica freezing and periodic cell scaling, and records throughput and peak
 allocated Torch memory. It does not submit scheduler jobs or QM calculations.
 
+Float32 prediction and uncertainty comparisons use `rtol=1e-5` and `atol=1e-5`:
+`abs(batch - individual) <= atol + rtol * abs(individual)`. The absolute
+tolerance is in eV for energies and energy uncertainty, and eV/Å for forces
+and force statistics. These are acceptance tolerances, independent of the
+sampler's acquisition and physical-force thresholds. Override them with
+`--parity-rtol` and `--parity-atol`; each artifact records the actual values,
+inference dtype, and maximum observed energy, force, and diagnostic errors.
+The original `atol=1e-6` exposed ordinary float32 roundoff on a trained
+four-state checkpoint: the largest force discrepancy was about `1.4e-6`
+eV/Å, while the same calculation in float64 agreed below `7e-15` eV/Å.
+
 An explicit CPU mechanics check requires no trained model:
 
 ```bash
