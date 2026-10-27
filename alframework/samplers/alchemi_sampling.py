@@ -147,7 +147,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
     class _AlchemiModelAdapter(ALFAlchemiCalculator):
         """Expose a backend-neutral calculator to ALCHEMI's model protocol."""
 
-        def __init__(self, model):
+        def __init__(self, model, atoms_list):
             super().__init__(selected_state_value=model.selected_state_value,
                 physical_force_states=model.physical_force_states, gap_rows=model.gap_rows,
                 gap_seeking_settings=model.gap_seeking_settings, well_params=model.well_params,
@@ -155,13 +155,38 @@ if _ALCHEMI_IMPORT_ERROR is None:
                 calculator_loader=model.calculator_loader)
             self.wrapped = model
             self.supports_pbc = model.supports_pbc
+            self.register_buffer("_input_cells", torch.as_tensor(
+                np.stack([atoms.cell.array for atoms in atoms_list]), dtype=torch.float32))
+            self.register_buffer("_input_pbc", torch.as_tensor(
+                np.stack([atoms.pbc for atoms in atoms_list]), dtype=torch.bool))
 
         def set_device(self, device):
             super().set_device(device)
             self.wrapped.set_device(device)
 
         def ensemble_forward(self, batch):
-            return self.wrapped.ensemble_forward(batch)
+            from alframework.ml_interfaces.batched_inference import PackedBatch
+            cells = getattr(batch, "cell", None)
+            pbc = getattr(batch, "pbc", None)
+            if not hasattr(self, "_packed"):
+                if cells is None:
+                    cells = self._input_cells
+                if pbc is None:
+                    pbc = self._input_pbc
+                self._packed = PackedBatch(
+                    positions=batch.positions, atomic_numbers=batch.atomic_numbers,
+                    atomic_masses=batch.atomic_masses, velocities=batch.velocities,
+                    cell=cells, pbc=pbc, batch_ptr=batch.batch_ptr)
+            else:
+                # Membership is fixed during a task. Refresh engine buffers
+                # while keeping the calculator on the shared packed protocol.
+                self._packed.positions = batch.positions
+                self._packed.velocities = batch.velocities
+                if cells is not None:
+                    self._packed.cell = cells
+                if pbc is not None:
+                    self._packed.pbc = pbc
+            return self.wrapped.ensemble_forward(self._packed)
 
     class AlchemiDynamicsRunner:
         """Small fixed-batch wrapper around ALCHEMI's BAOAB integrator."""
@@ -181,7 +206,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 
             if not isinstance(model, BaseModelMixin):
-                model = _AlchemiModelAdapter(model)
+                model = _AlchemiModelAdapter(model, atoms_list)
             self.model = model
             self.device = torch.device(device)
             self.model.set_device(self.device)

@@ -34,7 +34,7 @@ def systems(periodic=True):
 
 def harmonic_model():
     torch = pytest.importorskip("torch")
-    from alframework.ml_interfaces.batched_inference import BatchedEnsembleCalculator, batch_slices
+    from alframework.ml_interfaces.batched_inference import BatchedEnsembleCalculator
 
     class Harmonic(BatchedEnsembleCalculator):
         def __init__(self):
@@ -42,8 +42,9 @@ def harmonic_model():
             self.supports_pbc = True
 
         def ensemble_forward(self, batch):
-            energy = torch.stack([.5 * batch.positions[part].square().sum()
-                                  for part in batch_slices(batch)])
+            self.last_cells = batch.cell.detach().clone()
+            energy = batch.positions.new_zeros(batch.num_graphs)
+            energy.index_add_(0, batch.system_idx, .5 * batch.positions.square().sum(dim=1))
             return {"energy_contributions": torch.stack((energy, energy + 4.)),
                     "force_contributions": torch.stack((-batch.positions, -batch.positions))}
     return Harmonic()
@@ -54,9 +55,11 @@ def test_actual_alchemi_ragged_analytic_step_and_cell_updates(periodic):
     pytest.importorskip("nvalchemi")
     from alframework.samplers.alchemi_sampling import AlchemiDynamicsRunner
     atoms = systems(periodic)
-    runner = AlchemiDynamicsRunner(model=harmonic_model(), atoms_list=atoms, dt_fs=.1,
+    model = harmonic_model()
+    runner = AlchemiDynamicsRunner(model=model, atoms_list=atoms, dt_fs=.1,
                                    temperature_K=np.zeros(2), friction_per_fs=0.,
                                    random_seed=4, device="cpu")
+    np.testing.assert_allclose(model.last_cells.cpu().numpy(), np.stack([item.cell.array for item in atoms]))
     runner.run(1)
     for index, initial in enumerate(atoms):
         result = initial.copy()
