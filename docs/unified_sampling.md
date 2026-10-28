@@ -1,54 +1,115 @@
-# Unified sampling methods and execution drivers
+# Independent ALF execution, sampling, acquisition, and training
 
-The unified `alframework.samplers.sampling.sampling_task` separates scientific
-sampling and acquisition choices from execution and model inference. MLMD and
-UDD use the same acquisition and screening components through ASE, TorchSim,
-or ALCHEMI. Existing task entrypoints keep their compatibility behavior.
+The unified task retains ALF's existing master/sampler/ML configuration files,
+Parsl tasks, `MoleculesObject` values, and import-string extension points.
+Implementation remains in the existing `samplers`, `ml_interfaces`, and `tools`
+packages. Upstream ALF is a read-only reference for this fork.
 
-The ALF driver resolves input cardinality from the execution driver: ASE
-receives one system per task, while batched execution groups compatible systems
-up to the configured width. Presence of an inference or dynamics configuration
-block alone does not turn an ASE task into a batch.
+| Component | Configuration | Responsibility |
+| --- | --- | --- |
+| Driver | `driver.strategy` | Submit single trajectories or compatible groups |
+| Engine | `driver.engine` | Integration, units, state synchronization, supported operations |
+| Sampling | `sampling.propagator`, `sampling.biases` | Exploration and trajectory-local force controls |
+| Acquisition | `acquisition.strategy`, `trajectory_policy`, `selection` | Eligibility, scores, stopping requests, frame selection |
+| Inference | `inference.interface`, `loader`, `options` | Physical predictions and model capabilities |
+| Training | Existing `ML_task` and `ML_config` | Fit models and report completed artifacts |
 
 ## Configuration
 
-Set `sampling.method` to `mlmd` or `udd`; choose `acquisition.method` and its
-`policy` independently. `uncertainty` is the built-in acquisition method, with
-`stop` and `continue` policies. Existing thresholds, scores, and candidate
-limits retain their meaning under either driver.
+Select `alframework.samplers.sampling.sampling_task` as the master's
+`sampler_task`. A sampler configuration can select:
 
-Set `dynamics.driver` to `ase` or `batched`. Batched execution requires an
-explicit `dynamics.backend` of `torchsim` or `alchemi`. ASE execution ignores
-inactive batching/backend settings, so changing the driver retains the method
-and acquisition selections. The new task defaults to MLMD, uncertainty
-acquisition, stop, and ASE when these selections are omitted.
+```json
+{
+  "driver": {"strategy": "batched", "engine": "torchsim"},
+  "sampling": {
+    "propagator": "langevin",
+    "biases": [{"strategy": "udd", "weight": 0.45, "epsilon": 1e-12}]
+  },
+  "acquisition": {
+    "strategy": "summed",
+    "trajectory_policy": "continue",
+    "selection": {"mode": "cohort_top_k", "cohort_size": 50, "k": 16}
+  },
+  "batching": {
+    "batch_size": 8,
+    "partial_policy": "timeout",
+    "max_wait_seconds": 5.0
+  }
+}
+```
 
-`inference.interface` selects native ensemble inference or ASE compatibility;
-`inference.loader` and `inference.options` identify the model loader. Existing
-`batched_calculator`, `alchemi_calculator`, `ase_calculator`, and corresponding
-options are accepted as aliases when they agree with explicit new settings.
-Contradictory duplicate selections fail validation.
+Retain timestep, duration, uncertainty cutoffs, summed-score weights,
+temperature/density schedules, state selection, and inference settings. This
+fragment describes 50 logical trajectories, executed in physical tasks of at
+most eight systems, with at most 16 selected frames across the cohort. The
+numbers illustrate syntax, not model-specific scientific recommendations.
 
-The base ASE/ASE-calculator route does not require Torch or a GPU dynamics
-package. Native HIPPYNN and batched engines import their optional stacks only
-on the selected worker route. ASE inference under batched dynamics remains a
-sequential compatibility path and is recorded as such.
+`driver.strategy` is `single` or `batched`; `driver.engine` is `ase`,
+`torchsim`, or `alchemi`. Singleton execution uses the selected supported
+engine. Batched dynamics uses TorchSim or ALCHEMI; unsupported combinations
+fail explicitly. Physical batch width does not change the acquisition budget.
+An empty `sampling.biases` list gives unbiased Langevin exploration.
 
-See [the complete examples](../examples/unified_sampling/README.md) for the
-public task configuration, analytic ASE fixture, native HIPPYNN configuration,
-and acceptance commands.
+Released task entrypoints and calculator fields remain compatibility paths.
+An old task-local `return_top_k` is not silently converted into a cohort-wide
+budget. New examples make the scientific choices explicit.
 
-## Scientific behavior
+Single/ASE execution with an ASE calculator requires no Torch or GPU dynamics
+package. Native models may require their own optional stacks. An ASE inference
+adapter under batched dynamics still evaluates inference sequentially and is
+identified as a compatibility route in metadata.
 
-New unified configurations use the current portable screening, acquisition,
-ranking, state-selection, and provenance behavior for both execution drivers.
-This includes rejecting invalid geometry before acquisition and keeping the
-same uncertainty checks and schedule timing. Switching a driver changes the
-numerical engine rather than selecting different acquisition rules.
+See [the complete examples](../examples/unified_sampling/README.md).
 
-UDD preserves the existing signed bias exactly. With member energies `E_m`,
-member forces `F_m`, population energy standard deviation `sigma_E`, and
-configured weight `w`:
+## Acquisition and logical cohorts
+
+Both built-in strategies retain the existing energy/force uncertainty trigger.
+`uncertainty` ranks by the normalized worst violation; `summed` ranks eligible
+frames using the existing weighted energy, force, and optional gap score.
+A high summed score alone does not establish eligibility. Screening consumes
+unbiased physical predictions before acquisition.
+
+- `first_trigger` stops each trajectory at its first eligible frame and returns
+  that frame for QM without waiting for a cohort.
+- `cohort_top_k` ranks across one full logical cohort. Its trajectory policy
+  can be `stop` at the first eligible frame or `continue` collecting frames.
+  Both `cohort_size` and `k` are required.
+
+Each cohort has one immutable model generation and one selected electronic
+state. State cycling advances by logical cohort, not GPU task. Trajectory
+identities, candidate identities, and ranking ties are independent of physical
+grouping and task completion order. Zero-candidate and physically rejected
+trajectories still finish their membership; operational failures remain
+recoverable work rather than silently excluded members.
+
+ALF requires the full configured membership. There is no admission timeout or
+automatic partial-cohort selection. Admission and execution proceed
+incrementally so cohorts larger than worker capacity can make progress.
+Selection returns up to K eligible frames across the pool without requiring
+any particular trajectory to contribute. Top-K does not guarantee structural
+diversity. Scalar local pruning is permitted only when it preserves exact
+global ranking; future selectors must declare their retention requirements.
+
+The coordinator persists candidate arrivals before acknowledging sampler
+results and records selected identities and QM handoffs. Finishing trajectories
+release physical sampler capacity independently of candidate storage.
+Unfinished cohorts survive restart with their original inputs/model/state.
+Existing graceful shutdown is retained; no new pause controls or partial-cohort
+selection are introduced merely because the process stops.
+
+## Physical inference and sampling forces
+
+Evaluators supply physical member energies `[models, systems]`, forces
+`[models, total_atoms, 3]`, optional corresponding state outputs, and declared
+signals. Only a model adapter interprets its checkpoint layout. Evaluators do
+not own acquisition thresholds, UDD state, LCM switches, or confinement.
+A sampling force pipeline produces propagation forces from physical outputs.
+Native predictions/transforms stay on their original device; only needed
+coordinator observations are converted. New model families need not inherit
+a Torch- or HIPPYNN-specific scientific-controller class.
+
+UDD preserves the existing signed formula, using population standard deviation:
 
 ```text
 E_propagated = mean(E_m) + w * sigma_E + E_confinement
@@ -56,66 +117,74 @@ F_bias = w * mean((E_m - mean(E_m)) * (F_m - mean(F_m))) / sigma_E
 F_propagated = mean(F_m) + F_bias + F_confinement
 ```
 
-The force bias is zero when `sigma_E <= udd_bias_eps`. Each system uses its
-own ensemble moments; padding never contributes to those reductions.
-Confinement does not contribute to ensemble uncertainty. Unbiased physical
-state forces and uncertainty remain available for acquisition and screening.
-A positive `w` adds an uncertainty energy penalty under the existing sign
-convention. No change of bias sign is introduced by the refactor.
+The force bias is zero when `sigma_E <= epsilon`. Each system has its own
+moments; padding and confinement do not contribute. A positive weight retains
+the existing uncertainty-energy penalty convention. UDD requires actual ordered
+member energies/forces; aggregate uncertainty alone is insufficient. Physical
+screening and acquisition remain unbiased.
 
-Molecular excited-state and LCM behavior remain available with MLMD through
-both execution drivers. UDD may bias a selected physical surface when its
-member energies and forces are exposed. UDD together with LCM switching is
-rejected until that composition has a separate scientific definition.
+Existing molecular LCM construction and switching order are preserved.
+UDD combined with LCM is explicitly unsupported in this milestone. Temperature
+and density timing, initial velocities, independent stopping, isotropic cell
+scaling, and force refresh retain their established behavior. Batched periodic
+support covers fully periodic ground states with capable models; ASE boundary
+and constraint capabilities are checked separately.
 
-Temperature and density schedules remain independent per system. Density
-scaling is isotropic, preserves velocities and cell shape, and refreshes
-geometry-dependent forces. Batched periodic support covers fully periodic
-ground-state checkpoints with the required cell inputs. ASE boundary and
-constraint capabilities are validated separately from batched-only limits.
+## Extension and training handoff
 
-## Extension and compatibility
+Use small callables and import paths following upstream ALF. Sampling programs
+may request grouped evaluations and report optimization progress without an
+MD clock. Acquisition strategies declare observations, eligibility, ranking,
+and retention requirements. A geometry-only example demonstrates independence
+from uncertainty thresholds; production distance/diversity methods are future
+work.
 
-Method and acquisition plugins may be selected by import path. A method owns
-its algorithm state and declares the capabilities it requires. The extension
-interface permits grouped evaluations and optimization progress without
-requiring an MD clock. This provides a route for later NEB/dimer integration;
-it does not automatically make arbitrary existing Python samplers batched.
+A propagator import path names a zero-argument factory or class with
+`create_program(context)`; its program implements `run()`. The context exposes
+`evaluate_group`, `acquire`, and `finalize`, retaining standard molecule outputs
+and provenance. The `ScaledProposalMethod` example uses proposal indices rather
+than inventing an MD clock.
 
-A method import path identifies a zero-argument factory or class implementing
-`create_program(context)`. Its program implements `run()` and returns normal
-ALF molecule outputs. It declares `required_capabilities`, such as
-`grouped_evaluation` or `dynamics`, so unsupported combinations fail before
-the program runs. The context exposes:
+A bias import path names a zero-argument factory or class with
+`apply(state, physical, propagation, options)`. It returns complete propagation
+`energy` and `forces`, plus optional per-system diagnostics. It must preserve
+the system/atom shapes and native device/dtype. Plugins execute in configured
+order after built-in UDD/LCM controls and before confinement. Their state lives
+in the sampling pipeline, never in the evaluator.
 
-- `evaluate_group(atoms_list)`: ordered ensemble predictions and per-system
-  diagnostics for a group of proposed configurations.
-- `acquire(SamplingObservation(...))`: shared screening and acquisition for
-  one proposal, returning a candidate, stopping decision, or rejection.
-- `finalize(candidates)`: final acquisition selection and normal ALF output
-  construction with provenance.
+An acquisition import path provides `decide(observation, context)` returning
+an `AcquisitionDecision`, and `select(candidates, context, final=False)`.
+`CoordinateExtentAcquisition` demonstrates a translation-invariant geometry
+gate with no energy/force uncertainty cutoffs. Scalar cohort selection requires
+the explicit retention contract `scalar_top_k`. A future selector needing
+additional candidate payloads must not be silently subjected to scalar pruning.
 
-`SamplingObservation` contains the parent system index and molecule, proposed
-atoms, diagnostics, a progress step, and a method-specific progress dictionary.
-An optimization method can report `optimization_iteration`; a trajectory can
-report `time_ps`. The non-MD
-[`ScaledProposalMethod` example](../examples/unified_sampling/plugins.py)
-demonstrates grouped inference and candidate handling without an MD clock.
+`ML_task`, `ML_config`, trainer implementations, and return conventions remain
+independent. A model-reference compatibility handoff describes an opaque
+artifact location, generation, inference adapter, options, and capabilities.
+Only the adapter interprets HIPPYNN graphs or another family’s files. New
+training and inference adapters must not require edits to driver, sampling,
+or acquisition strategies.
 
-An acquisition import path identifies a zero-argument factory or class with
-`decide(observation, context) -> AcquisitionDecision` and
-`select(candidates, context, final=False) -> candidates`. Decisions carry
-capture/stopping flags and method-specific metadata. The built-in uncertainty
-policy provides the existing threshold and ranking behavior.
+Reactive NEB/dimer entrypoints retain their existing ASE workflows. Full
+reactive batching, NPT, periodic excited states, new production model families,
+structural diversity, UDD–LCM composition, and MI350 execution remain separate
+milestones.
 
-Unsupported method, model, and driver combinations fail explicitly rather
-than selecting a different algorithm or silently falling back to ASE.
-Existing reactive entrypoints continue to run their established ASE optimizer
-workflows. Full reactive batching, NPT, periodic excited states, and MI350
-hardware acceptance remain separate milestones.
+## Validation
 
-Task snapshots and reload safeguards include the resolved method, acquisition,
-driver, engine, and inference identity. Replica accounting uses actual task
-widths, including partial batches and empty results. Existing stage files,
-legacy buffer formats, and recovery journal payloads remain readable without
-rewriting pinned configurations.
+Report CPU correctness, GPU acceptance, and potential accuracy separately.
+The checkpointed draft passed 572 tests in the ALCHEMI environment and 585 in
+TorchSim before this further separation. Those counts are a baseline, not a
+claim that the new cohort implementation has passed hardware testing.
+
+Acceptance replays identical observations with task widths 1, 2, 8, 32, and 50
+and reversed completion order, checking identical membership, state assignment,
+scores, and selected IDs. It covers incomplete admission, empty results,
+failures, restart at ingestion/selection/QM handoff, model promotion, storage,
+retraining, and retained-label budgets.
+
+The standalone harnesses record source identity, versions, model fingerprints,
+driver/engine, force controls, errors, throughput, memory, and hardware identity.
+Float32 parity uses the approved `rtol=1e-5, atol=1e-5`, separately from
+acquisition thresholds. CPU artifacts do not establish GPU acceptance.

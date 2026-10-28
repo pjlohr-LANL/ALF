@@ -81,7 +81,9 @@ def synthetic_model(device, *, sampling_method="mlmd"):
 
 
 def load_checkpoint(args, device):
-    from alframework.ml_interfaces.batched_inference import load_hippynn_batched_model
+    from alframework.ml_interfaces.model_reference import ModelReference
+    from alframework.ml_interfaces.sampling_inference import load_physical_evaluator
+    from alframework.tools.batched_config import inference_settings
 
     master_path = Path(args.master).resolve()
     master = json.loads(master_path.read_text())
@@ -106,14 +108,18 @@ def load_checkpoint(args, device):
             selected = int(sampler_config["selected_state"])
         else:
             raise ValueError("Specify --selected-state when benchmarking a cycling excited-state configuration.")
-    model = load_hippynn_batched_model(
-        str(Path(args.ensemble_directory).resolve()), model_mode=mode,
-        selected_state_value=selected, ML_config=ml_config,
-        properties_list=master["properties_list"], sampler_config=sampler_config,
-        device=device, **dict(sampler_config.get("inference", {}).get("options") or
-                              sampler_config.get("batched_calculator_options") or {}),
+    inference = inference_settings(sampler_config)
+    reference = ModelReference(
+        artifact_location=str(Path(args.ensemble_directory).resolve()),
+        generation=getattr(args, "model_generation", "acceptance-artifact"),
+        adapter=inference["loader"] or "alframework.ml_interfaces.batched_inference.load_hippynn_batched_model",
+        interface=inference["interface"] if inference["loader"] else "native",
+        options=inference["options"],
     )
-    return model
+    args._model_reference = reference.as_dict()
+    return load_physical_evaluator(reference, model_mode=mode,
+        selected_state_value=selected, ML_config=ml_config,
+        properties_list=master["properties_list"], device=device)
 
 
 def synthetic_structures(periodic=False):
@@ -126,6 +132,34 @@ def synthetic_structures(periodic=False):
     for atoms in structures:
         atoms.set_velocities(np.full((len(atoms), 3), .01))
     return structures
+
+
+def execution_model(model, *, driver, engine, sampling_method, udd_bias_weight=None,
+                    udd_bias_eps=1e-12, configuration=None, properties_list=None, device=None):
+    """Exercise the separated physical evaluator and sampling force pipeline."""
+    from alframework.ml_interfaces.sampling_inference import adapt_physical_evaluator
+    from alframework.samplers.force_controls import build_sampling_model
+
+    config = copy.deepcopy(configuration or {})
+    # Keep the original configuration separately as provenance. Execution uses
+    # the explicit CLI selections, not conflicting inactive legacy aliases.
+    for key in ("dynamics", "alchemi_baoab", "udd_bias_weight", "udd_bias_eps",
+                "uncertainty_policy", "return_top_k", "max_candidates_per_replica"):
+        config.pop(key, None)
+    config["driver"] = {"strategy": driver, "engine": engine}
+    config["sampling"] = {"propagator": "langevin", "biases": []}
+    if sampling_method == "udd":
+        config["sampling"]["biases"] = [{"strategy": "udd", "weight": udd_bias_weight,
+                                          "epsilon": udd_bias_eps}]
+    strategy = "summed" if dict(config.get("score") or {}).get("mode") == "sum" else "uncertainty"
+    config["acquisition"] = {"strategy": strategy, "trajectory_policy": "stop",
+                              "selection": {"mode": "first_trigger"}}
+    wrapped = build_sampling_model(
+        adapt_physical_evaluator(model, device=device), config,
+        properties_list=properties_list, selected_state_value=getattr(model, "selected_state_value", None),
+        device=device,
+    )
+    return wrapped, config
 
 
 def verify_individual_predictions(model, atoms_list, device, *, rtol, atol):
@@ -165,13 +199,13 @@ class RunnerGroup:
     def __init__(self, runner_type, model, atoms_list, *, driver, **options):
         self.driver = driver
         self.runners = []
-        groups = [[atoms] for atoms in atoms_list] if driver == "ase" else [atoms_list]
+        groups = [[atoms] for atoms in atoms_list] if driver in {"ase", "single"} else [atoms_list]
         for index, group in enumerate(groups):
             current = dict(options)
             temperatures = np.asarray(options["temperature_K"], dtype=float)
             current["temperature_K"] = (np.full(len(group), float(temperatures))
                                           if temperatures.ndim == 0 else
-                                          temperatures[index:index+1] if driver == "ase" else temperatures)
+                                          temperatures[index:index+1] if driver in {"ase", "single"} else temperatures)
             current["random_seed"] = int(options["random_seed"]) + index
             self.runners.append(runner_type(model=model, atoms_list=group, **current))
 
@@ -180,7 +214,7 @@ class RunnerGroup:
             runner.run(steps)
 
     def _target(self, index):
-        return (self.runners[index], 0) if self.driver == "ase" else (self.runners[0], index)
+        return (self.runners[index], 0) if self.driver in {"ase", "single"} else (self.runners[0], index)
 
     def sync_graph_to_atoms(self, index, atoms):
         runner, graph = self._target(index)
@@ -195,7 +229,7 @@ class RunnerGroup:
         runner.set_cell(graph, cell)
 
     def set_temperature(self, temperatures):
-        if self.driver == "ase":
+        if self.driver in {"ase", "single"}:
             for runner, temperature in zip(self.runners, temperatures):
                 runner.set_temperature([temperature])
         else:
@@ -254,7 +288,7 @@ def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iteration
                      if analytic_stiffness is not None else None)
     batch = PackedBatch.from_atoms(atoms_list, device=device)
     inference_batches = ([PackedBatch.from_atoms([atoms], device=device) for atoms in atoms_list]
-                         if driver == "ase" else [batch])
+                         if driver in {"ase", "single"} else [batch])
 
     def evaluate():
         for current in inference_batches:
@@ -308,7 +342,7 @@ def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iteration
     return {
         "systems": len(atoms_list), "atoms": sum(len(atoms) for atoms in atoms_list),
         "execution_driver": driver,
-        "inference_execution": "serial_systems" if driver == "ase" else "packed_systems",
+        "inference_execution": "serial_systems" if driver in {"ase", "single"} else "packed_systems",
         "inference_dtype": str(batch.positions.dtype),
         "inference_iterations": iterations, "inference_seconds": inference_seconds,
         "inference_systems_per_second": len(atoms_list) * iterations / inference_seconds,
@@ -324,9 +358,11 @@ def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iteration
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--driver", choices=("ase", "batched"), default="batched")
+    parser.add_argument("--driver", choices=("single", "batched", "ase"), default="batched",
+                        help="Execution grouping; ase is the retained alias for single + ASE engine")
+    parser.add_argument("--engine", choices=("ase", "alchemi", "torchsim"))
     parser.add_argument("--backend", choices=("alchemi", "torchsim"),
-                        help="Required for batched execution; ignored for ASE")
+                        help="Retained alias for --engine; ignored by legacy --driver ase")
     parser.add_argument("--sampling-method", choices=("mlmd", "udd"), default="mlmd")
     parser.add_argument("--udd-bias-weight", type=float,
                         help="Explicit signed energy-uncertainty bias weight, required for UDD")
@@ -344,13 +380,25 @@ def main(argv=None):
                         help="Absolute tolerance in each checked quantity's units (default: 1e-5)")
     parser.add_argument("--master", help="Existing ALF master configuration for a real HIPPYNN checkpoint")
     parser.add_argument("--ensemble-directory", help="Directory containing model-* HIPPYNN members")
+    parser.add_argument("--model-generation", default="acceptance-artifact",
+                        help="Opaque model-generation identity recorded in the acceptance reference")
     parser.add_argument("--selected-state", type=int)
     parser.add_argument("--structures", help="ASE-readable single/multiframe structure file")
     parser.add_argument("--periodic", action="store_true", help="Use periodic structures in analytic mode")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    if args.driver == "batched" and args.backend is None:
-        parser.error("Batched execution requires --backend alchemi or torchsim")
+    if args.driver == "ase":
+        if args.engine not in (None, "ase"):
+            parser.error("--driver ase is the alias for --driver single --engine ase")
+        args.driver, args.engine = "single", "ase"
+    else:
+        if args.engine and args.backend and args.engine != args.backend:
+            parser.error("Conflicting --engine and --backend selections")
+        args.engine = args.engine or args.backend
+    if args.engine is None:
+        parser.error("Select --engine ase, torchsim, or alchemi (legacy --backend remains accepted)")
+    if args.driver == "batched" and args.engine == "ase":
+        parser.error("Batched dynamics requires --engine alchemi or torchsim")
     if args.sampling_method == "udd" and args.udd_bias_weight is None:
         parser.error("UDD acceptance requires an explicit --udd-bias-weight")
     if args.udd_bias_weight is not None and not math.isfinite(args.udd_bias_weight):
@@ -372,27 +420,29 @@ def main(argv=None):
         parser.error("The requested GPU is unavailable; use --device cpu for an explicit CPU check")
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    if args.driver == "batched" and args.backend == "alchemi" and torch.version.hip:
+    if args.engine == "alchemi" and torch.version.hip:
         parser.error("ALCHEMI uses NVIDIA GPU operations; select torchsim for ROCm acceptance")
     if torch.version.hip:
         import hippynn
         hippynn.custom_kernels.set_custom_kernels(False)
-    if args.driver == "ase":
+    if args.engine == "ase":
         from alframework.samplers.ase_sampling import ASEDynamicsRunner as Runner
-    elif args.backend == "alchemi":
+    elif args.engine == "alchemi":
         from alframework.samplers.alchemi_sampling import AlchemiDynamicsRunner as Runner
     else:
         from alframework.samplers.torchsim_sampling import TorchSimDynamicsRunner as Runner
     structures = read(args.structures, index=":") if args.structures else synthetic_structures(args.periodic)
     model = (load_checkpoint(args, device) if args.master else
              synthetic_model(device, sampling_method=args.sampling_method))
-    if args.sampling_method == "udd":
-        configuration = getattr(args, "_configuration", {})
-        if configuration.get("sampler_config", {}).get("gap_seeking", {}).get("enabled"):
-            parser.error("UDD combined with LCM switching is outside this acceptance milestone")
-        model.configure_sampling_method("udd", {
-            "udd_bias_weight": args.udd_bias_weight, "udd_bias_eps": args.udd_bias_eps,
-        })
+    configuration = getattr(args, "_configuration", {})
+    if args.sampling_method == "udd" and configuration.get("sampler_config", {}).get("gap_seeking", {}).get("enabled"):
+        parser.error("UDD combined with LCM switching is outside this acceptance milestone")
+    model, execution_configuration = execution_model(
+        model, driver=args.driver, engine=args.engine, sampling_method=args.sampling_method,
+        udd_bias_weight=args.udd_bias_weight, udd_bias_eps=args.udd_bias_eps,
+        configuration=configuration.get("sampler_config"),
+        properties_list=configuration.get("master", {}).get("properties_list"), device=device,
+    )
     records = []
     for size in args.batch_sizes:
         atoms_list = [structures[index % len(structures)].copy() for index in range(size)]
@@ -405,10 +455,12 @@ def main(argv=None):
                                     1 + (.1 * args.udd_bias_weight if args.sampling_method == "udd" else 0.))))
     result = {
         "schema": "alf.portable_batched_acceptance.v1",
-        "backend": args.backend if args.driver == "batched" else "ase",
+        "backend": args.engine, "engine": args.engine,
         "execution_driver": args.driver, "sampling_method": args.sampling_method,
+        "sampling_force_pipeline": True, "execution_configuration": execution_configuration,
         "model": "hippynn_checkpoint" if args.master else "synthetic_harmonic",
         "ensemble_directory": str(Path(args.ensemble_directory).resolve()) if args.ensemble_directory else None,
+        "model_reference": getattr(args, "_model_reference", None),
         "hardware_validation": device.type == "cuda", "environment": environment(torch, device),
         "source": source_revision(),
         "parameters": {"dt_fs": args.dt_fs, "temperature_K": args.temperature_K,
@@ -419,7 +471,7 @@ def main(argv=None):
                        "parity_rtol": args.parity_rtol, "parity_atol": args.parity_atol},
         "configuration": getattr(args, "_configuration", None),
         "structures": fingerprint(args.structures) if args.structures else None,
-        "checkpoint_files": [fingerprint(path) for path in sorted(Path(args.ensemble_directory).glob("model-*/*.pt"))] if args.ensemble_directory else [],
+        "checkpoint_files": [fingerprint(path) for path in sorted(Path(args.ensemble_directory).rglob("*")) if path.is_file()] if args.ensemble_directory else [],
         "records": records,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

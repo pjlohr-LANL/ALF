@@ -230,11 +230,11 @@ Reactive sampler fields
 
 .. _unified-sampling:
 
-Unified sampling and execution
-------------------------------
+Independent execution, sampling, and acquisition
+------------------------------------------------
 
-Use the unified task to choose a scientific method independently of the
-execution driver:
+Select the unified task while retaining the usual master, sampler, and ML
+configuration files:
 
 .. code-block:: json
 
@@ -243,69 +243,84 @@ execution driver:
      "sampler_config_path": "sampler_config.json"
    }
 
-The sampler configuration separates the selections:
+The sampler configuration separates scientific choices from execution:
 
 .. code-block:: json
 
    {
-     "sampling": {"method": "udd"},
-     "acquisition": {"method": "uncertainty", "policy": "continue"},
-     "dynamics": {"driver": "batched", "backend": "torchsim"},
+     "driver": {"strategy": "batched", "engine": "torchsim"},
+     "sampling": {
+       "propagator": "langevin",
+       "biases": [{"strategy": "udd", "weight": 0.45, "epsilon": 1e-12}]
+     },
+     "acquisition": {
+       "strategy": "uncertainty",
+       "trajectory_policy": "continue",
+       "selection": {"mode": "cohort_top_k", "cohort_size": 50, "k": 16}
+     },
      "inference": {
        "interface": "native",
        "loader": "alframework.ml_interfaces.batched_inference.load_hippynn_batched_model",
        "options": {}
      },
-     "batching": {"batch_size": 50, "partial_policy": "timeout", "max_wait_seconds": 5.0},
-     "udd_bias_weight": 0.45
+     "batching": {"batch_size": 8, "partial_policy": "timeout", "max_wait_seconds": 5.0}
    }
 
-Retain the ordinary timestep, duration, temperature, density, uncertainty, and
-candidate settings. Changing ``dynamics.driver`` to ``ase`` retains the method
-and acquisition selections; batching and backend settings become inactive.
-ASE receives one system per task. Batched execution requires an explicit
-``torchsim`` or ``alchemi`` backend and groups compatible systems as described
-below.
+Retain ordinary timestep, duration, uncertainty cutoffs, score weights,
+temperature/density, and state-selection settings. This example executes a
+logical cohort of 50 trajectories in physical tasks of at most eight systems.
+Changing ``driver.strategy`` to ``single`` keeps the acquisition cohort and
+budget unchanged. Choose ``driver.engine`` independently from the supported
+``ase``, ``torchsim``, and ``alchemi`` combinations; batched ASE dynamics is not
+silently substituted for accelerated batching.
 
-The new task defaults to ``sampling.method: mlmd``,
-``acquisition.method: uncertainty``, ``acquisition.policy: stop``, and
-``dynamics.driver: ase``. Existing task entrypoints keep their legacy behavior.
-New unified configurations share the portable controller's screening,
-stop/continue, ranking, and metadata rules through either driver, including
-rejecting invalid geometry before acquisition.
+``sampling.biases: []`` gives unbiased Langevin sampling. UDD and existing LCM
+or confinement controls belong to the sampling force pipeline. Evaluators
+return physical predictions; they do not own these controls or acquisition
+thresholds. Actual member energies and forces are required for UDD. Its signed
+formula and epsilon behavior are preserved; padding and confinement do not
+contribute to ensemble moments. Unbiased diagnostics are used for screening
+and acquisition. UDD combined with LCM remains unsupported.
 
-``inference.interface: ase`` uses an existing ASE ensemble loader instead of
-native packed inference. This base ASE route does not require Torch unless
-the selected model itself requires it. Native HIPPYNN requires its optional
-Torch/HIPPYNN stack. Under batched dynamics, ASE calculator inference is
-sequential and is identified as a compatibility path in metadata. Existing
-calculator and options fields remain accepted as aliases; contradictory
-duplicate settings are rejected.
+``acquisition.strategy`` is ``uncertainty`` or ``summed``. Both retain the
+existing energy/force uncertainty trigger. Summed acquisition changes ranking,
+not eligibility; a high summed score alone cannot trigger acquisition.
 
-UDD requires actual member energies and forces. It preserves the existing
-signed bias and epsilon behavior independently per system, excludes
-confinement from the ensemble moments, and retains unbiased physical
-diagnostics for screening and acquisition. Aggregate uncertainty alone is
-insufficient for UDD. ``udd_bias_eps`` defaults to ``1e-12``. Combining UDD and
-enabled LCM switching is rejected in this milestone; existing molecular LCM
-sampling remains available with MLMD through either driver.
+``selection.mode: first_trigger`` stops each trajectory at its first eligible
+frame and routes that frame to QM immediately. ``cohort_top_k`` waits for a
+full logical cohort and ranks across its entire eligible candidate pool.
+Cohort size and K are explicit. The trajectory policy can stop at the first
+eligible frame or continue collecting frames. There is no forced contribution
+from each trajectory and no structural diversity filter in this milestone.
 
-Temperature and density schedule timing is shared across drivers. Density
-changes scale each active system's cell and positions isotropically, preserve
-velocities, and refresh forces. Batched periodic HIPPYNN requires a fully
-periodic ground-state checkpoint with the trained cell input. ASE constraints
-and boundary conditions are checked against the ASE driver and selected model
-capabilities rather than inheriting batched-only restrictions.
+A cohort has one pinned model generation and selected electronic state. State
+cycling advances by logical cohort instead of GPU task. Membership and frame
+identity are independent of physical grouping and completion order. Cohorts
+have no admission timeout: unfinished membership and candidates remain saved
+until more input arrives or the run resumes. Existing graceful shutdown is
+retained without adding new pause controls.
 
-Method and acquisition plugins may be selected by import path. Methods own
-algorithm state and declare required capabilities; the extension interface
-allows grouped evaluations and optimization progress without assuming an MD
-clock. Reactive NEB/dimer entrypoints remain available, with full reactive
-batching deferred. Unsupported combinations fail explicitly without silently
-substituting another method or driver.
+``inference.interface: ase`` selects the ASE calculator compatibility adapter.
+The single/ASE route does not require Torch unless the model requires it.
+Under batched dynamics, ASE inference remains sequential and is identified in
+metadata. Native inference and optional engines are imported only when chosen.
 
-See ``examples/unified_sampling/README.md`` for complete configurations, a
-Torch-free analytic ASE fixture, and the updated acceptance commands.
+Existing ``ML_task``/``ML_config`` APIs and training return conventions remain
+independent. A model reference carries an opaque artifact location, generation,
+adapter, and capabilities. Only the adapter interprets a model family's files;
+common strategies do not assume HIPPYNN graphs or checkpoint directory contents.
+
+Temperature/density timing, initial velocities, independent stopping, isotropic
+cell scaling, and force refresh retain their behavior. Batched periodic support
+covers capable fully periodic ground-state models. ASE constraints and boundary
+conditions are checked separately. Reactive entrypoints keep their existing
+ASE workflows; full reactive batching, NPT, periodic excited states, new model
+families, and distance/diversity selection remain later work.
+
+See ``examples/unified_sampling/README.md`` and ``docs/unified_sampling.md`` for
+configuration, callable extension contracts, and acceptance commands. Released
+legacy task names and configurations retain their compatibility behavior;
+legacy task-local ``return_top_k`` is not silently changed to a cohort budget.
 
 Portable batched sampling
 -------------------------

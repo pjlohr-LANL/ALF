@@ -1,8 +1,16 @@
 {
   "model_mode": "ground_state",
-  "sampling": {"method": "mlmd"},
-  "acquisition": {"method": "uncertainty", "policy": "stop"},
-  "dynamics": {"driver": "ase", "random_seed": 42},
+  "sampling": {
+    "propagator": "langevin",
+    "biases": []
+  },
+  "acquisition": {
+    "strategy": "uncertainty",
+    "trajectory_policy": "stop",
+    "selection": {
+      "mode": "first_trigger"
+    }
+  },
   "inference": {
     "interface": "ase",
     "loader": "examples.unified_sampling.models.load_harmonic_ensemble",
@@ -15,13 +23,30 @@
   "Ncheck": 5,
   "min_time": 0.0,
   "distcut": 0.3,
-  "srt_temp": [20.0, 20.0],
-  "end_temp": [20.0, 20.0],
-  "amp_temp": [0.0, 0.0],
-  "per_temp": [1.0, 1.0],
+  "srt_temp": [
+    20.0,
+    20.0
+  ],
+  "end_temp": [
+    20.0,
+    20.0
+  ],
+  "amp_temp": [
+    0.0,
+    0.0
+  ],
+  "per_temp": [
+    1.0,
+    1.0
+  ],
   "end_dens": null,
   "amp_dens": null,
   "per_dens": null,
   "friction_per_fs": 0.01,
-  "translate_to_center": false
+  "translate_to_center": false,
+  "driver": {
+    "strategy": "single",
+    "engine": "ase",
+    "random_seed": 42
+  }
 }

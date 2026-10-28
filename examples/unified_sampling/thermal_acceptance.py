@@ -17,7 +17,7 @@ import numpy as np
 from ase import Atoms, units
 
 from examples.portable_batched_sampling.benchmark import (
-    RunnerGroup, environment, source_revision, synthetic_model,
+    RunnerGroup, environment, source_revision, synthetic_model, execution_model,
 )
 
 
@@ -44,7 +44,8 @@ def temperature_statistics(values, target, relative_tolerance):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--driver", choices=("ase", "batched"), default="batched")
+    parser.add_argument("--driver", choices=("single", "batched", "ase"), default="batched")
+    parser.add_argument("--engine", choices=("ase", "torchsim", "alchemi"))
     parser.add_argument("--backend", choices=("torchsim", "alchemi"))
     parser.add_argument("--sampling-method", choices=("mlmd", "udd"), default="mlmd")
     parser.add_argument("--udd-bias-weight", type=float)
@@ -61,8 +62,16 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=91423)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    if args.driver == "batched" and args.backend is None:
-        parser.error("Batched execution requires --backend")
+    if args.driver == "ase":
+        if args.engine not in (None, "ase"):
+            parser.error("--driver ase is the alias for single + ASE engine")
+        args.driver, args.engine = "single", "ase"
+    else:
+        if args.engine and args.backend and args.engine != args.backend:
+            parser.error("Conflicting --engine and --backend selections")
+        args.engine = args.engine or args.backend
+    if args.engine is None or (args.driver == "batched" and args.engine == "ase"):
+        parser.error("Select an engine; batched dynamics requires torchsim or alchemi")
     if args.sampling_method == "udd" and args.udd_bias_weight is None:
         parser.error("UDD requires --udd-bias-weight")
     positive = [*args.temperatures_K, args.dt_fs, args.friction_per_fs, args.relative_tolerance]
@@ -88,19 +97,19 @@ def main(argv=None):
         if not torch.cuda.is_available():
             parser.error("The requested GPU is unavailable; select --device cpu explicitly for a CPU check")
         torch.cuda.set_device(device)
-    if args.driver == "batched" and args.backend == "alchemi" and torch.version.hip:
+    if args.engine == "alchemi" and torch.version.hip:
         parser.error("ALCHEMI requires NVIDIA; use TorchSim on ROCm")
-    if args.driver == "ase":
+    if args.engine == "ase":
         from alframework.samplers.ase_sampling import ASEDynamicsRunner as Runner
-    elif args.backend == "alchemi":
+    elif args.engine == "alchemi":
         from alframework.samplers.alchemi_sampling import AlchemiDynamicsRunner as Runner
     else:
         from alframework.samplers.torchsim_sampling import TorchSimDynamicsRunner as Runner
     model = synthetic_model(device, sampling_method=args.sampling_method)
-    if args.sampling_method == "udd":
-        model.configure_sampling_method("udd", {
-            "udd_bias_weight": args.udd_bias_weight, "udd_bias_eps": 1e-12,
-        })
+    model, execution_configuration = execution_model(
+        model, driver=args.driver, engine=args.engine, sampling_method=args.sampling_method,
+        udd_bias_weight=args.udd_bias_weight, device=device,
+    )
     structures = []
     for _ in range(args.systems):
         atoms = Atoms("Ar" * args.atoms_per_system,
@@ -142,7 +151,8 @@ def main(argv=None):
         "schema": "alf.unified_thermal_acceptance.v1",
         "hardware_validation": device.type == "cuda",
         "execution_driver": args.driver,
-        "backend": args.backend if args.driver == "batched" else "ase",
+        "backend": args.engine, "engine": args.engine,
+        "execution_configuration": execution_configuration, "sampling_force_pipeline": True,
         "sampling_method": args.sampling_method,
         "model": "analytic_harmonic_ensemble", "source": source_revision(),
         "environment": environment(torch, device),

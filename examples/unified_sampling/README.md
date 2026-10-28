@@ -1,6 +1,7 @@
-# Independent sampling, acquisition, and execution
+# Independent ALF strategies
 
-Select the unified task in your master configuration:
+Keep ALF's usual master, sampler, builder, QM, and ML configuration files.
+Select the unified task in the master:
 
 ```json
 {
@@ -9,81 +10,127 @@ Select the unified task in your master configuration:
 }
 ```
 
-The four choices in the sampler configuration are independent:
+Keep the existing `ML_task` and `ML_config_path` selections. Training remains a
+separate task; only the inference adapter interprets a model family's files.
 
-| Configuration | Selection |
+| Choice | Configuration |
 | --- | --- |
-| `sampling.method` | `mlmd` or `udd`, or an import-path method plugin |
-| `acquisition.method` | `uncertainty`, or an import-path acquisition plugin |
-| `acquisition.policy` | `stop` at the first eligible event, or `continue` and rank candidates |
-| `dynamics.driver` | `ase` or `batched` |
-| `dynamics.backend` | `torchsim` or `alchemi` when the driver is batched |
-| `inference.interface` | `native` ensemble evaluation or `ase` calculator compatibility |
+| Single or batched grouping | `driver.strategy` |
+| ASE, TorchSim, or ALCHEMI engine | `driver.engine` |
+| Langevin or a future propagator | `sampling.propagator` |
+| No bias, UDD, or existing force controls | `sampling.biases` |
+| Uncertainty or summed ranking | `acquisition.strategy` |
+| Stop at first eligible frame or continue | `acquisition.trajectory_policy` |
+| Immediate frame or cohort-wide top-K | `acquisition.selection` |
+| Native evaluation or ASE compatibility | `inference.interface`, `loader`, `options` |
 
-`sampling.method: "udd"` applies the existing signed uncertainty bias to the
-propagation energy and forces. It does not choose acquisition behavior.
-`udd_bias_weight` is required for UDD; `udd_bias_eps` defaults to `1e-12`.
-A positive weight retains the existing `mean_energy + weight * energy_std`
-convention. Physical screening and acquisition diagnostics use the unbiased
-ensemble. Confinement is excluded from the uncertainty and bias calculation.
-Combining UDD with enabled LCM switching is rejected in this milestone.
+## Examples
 
-The `sampler_udd_batched.json` example uses native HIPPYNN with TorchSim.
-Set `dynamics.driver` to `ase` to run the same method and acquisition through
-ASE; the existing batching and engine settings then become inactive. Native
-HIPPYNN inference still requires its Torch/HIPPYNN environment. Set the backend
-to `alchemi` for the validated NVIDIA ALCHEMI environment. Use separate worker
-environments for TorchSim 0.6.2 and ALCHEMI.
+- `sampler_ase.json`: single/ASE, analytic ASE ensemble, unbiased Langevin,
+  first-trigger return. It needs neither Torch nor a trained model.
+- `sampler_udd_batched.json`: batched/TorchSim, native HIPPYNN, Langevin + UDD,
+  a full 50-trajectory cohort and 16 selected frames, with physical width 8.
+- `sampler_udd_single.json`: the same cohort and acquisition choices through
+  single/ASE execution. Physical batching settings are inactive, not the
+  acquisition cohort.
+- `sampler_summed_cohort.json`: the batched UDD example with summed ranking.
+  Its supplied weights illustrate syntax; choose scientific values for the
+  intended model and application.
 
-The `sampler_ase.json` example uses a two-member analytic ASE ensemble from
-`models.py`. This checks the base ASE path without Torch or a checkpoint;
-it is not a physical potential. Replace its loader with your model's ASE
-ensemble loader for a real calculation. An ASE inference adapter under
-batched dynamics evaluates systems sequentially and is identified as a
-compatibility path in metadata.
+All scientific choices are explicit in these examples. An empty bias list
+means no added exploration bias. A UDD bias contains its signed `weight` and
+`epsilon`. Its force bias uses real ordered member energies/forces; aggregate
+uncertainty alone is insufficient. The existing positive-weight convention
+adds `weight * energy_std` to propagation energy. Confinement is excluded from
+ensemble moments; screening and acquisition use unbiased physical outputs.
+UDD combined with LCM is rejected in this milestone.
 
-Run the analytic task directly from the repository root:
+The analytic `models.py` fixture is an integration check, not a physical
+potential. Use the appropriate inference loader and worker environment for a
+real model. TorchSim 0.6.2 and ALCHEMI retain separate environments; ROCm uses a
+ROCm PyTorch build and the logical device name `cuda:0`. Native evaluation can
+be used with a single engine too. An ASE adapter under batched dynamics remains
+sequential inference and is identified in metadata.
+
+## Immediate returns and logical cohorts
+
+`selection.mode: first_trigger` stops at the first eligible frame and returns
+one frame per trajectory immediately. It preserves the usual ALF sampling
+pattern. A physical batch contains independent trajectories, not a single
+larger interacting system.
+
+`selection.mode: cohort_top_k` requires `cohort_size` and `k`. It waits until
+all configured trajectories finish and ranks across their eligible frames.
+`trajectory_policy` may be `stop` or `continue`; there is no required quota
+per trajectory and no structural diversity filter. The existing energy/force
+uncertainty gate remains the eligibility rule even for `strategy: summed`;
+the weighted sum changes ranking only.
+
+A cohort has one pinned model generation and one selected electronic state.
+State cycling advances by logical cohort. Cohort IDs, trajectory IDs, frame
+IDs, and ranking ties are independent of GPU grouping and completion order.
+If K exceeds the number of eligible frames, all eligible frames are selected.
+Empty/rejected trajectories still count as completed members.
+
+Cohorts require full membership. There is no admission timeout or implicit
+partial-cohort selection. Physical timeout batching still submits groups after
+`batching.max_wait_seconds` and does not close a cohort. Incomplete cohorts and
+candidates survive restart; the existing graceful-shutdown support adds no new
+pause-control feature. Candidate ingestion and QM handoff are journaled
+separately from physical worker-capacity accounting.
+
+A direct analytic demonstration is available from the repository root:
 
 ```bash
 PYTHONPATH="$PWD" python examples/unified_sampling/demo.py --method mlmd
-PYTHONPATH="$PWD" python examples/unified_sampling/demo.py --method udd --acquisition-policy continue
+PYTHONPATH="$PWD" python examples/unified_sampling/demo.py --method udd
 PYTHONPATH="$PWD" python examples/unified_sampling/demo.py --method proposals --acquisition-policy continue
+PYTHONPATH="$PWD" python examples/unified_sampling/demo.py --method udd --physical-evaluator
+PYTHONPATH="$PWD" python examples/unified_sampling/demo.py --method proposals --acquisition geometry --acquisition-policy continue
 ```
 
-The last command uses the small `ScaledProposalMethod` plugin in `plugins.py`.
-It proposes two structures, evaluates them as a group, applies the same
-acquisition and screening, and returns normal ALF candidates. It requires no
-MD clock or timestep. This is an interface example rather than an optimizer.
+`ScaledProposalMethod` in `plugins.py` demonstrates grouped proposals without
+an MD clock. The example program uses the same evaluation, screening, and
+acquisition context. It is not an optimizer. New strategies use small callable
+interfaces and import paths, following upstream ALF rather than a new workflow
+framework. See [the strategy contracts](../../docs/unified_sampling.md).
 
-Existing scientific settings remain in the sampler configuration: `dt` in fs,
-`maxt` in ps, `Ncheck`, uncertainty cutoffs, state selection, candidate limits,
-confinement, and temperature/density schedules. The supplied values illustrate
-syntax; retain validated settings for the intended model and application.
+The physical-evaluator command uses a bare NumPy evaluator that inherits neither an
+ALF scientific-controller class nor a Torch module. Its loader accepts an
+opaque model reference and requested predictions. The same sampling and
+acquisition configuration works through either evaluator interface. This
+analytic fixture demonstrates the adapter boundary, not a new production
+model family or training implementation.
 
-Compatible batched systems may differ in size and composition, but share model,
-electronic-state, and boundary-condition compatibility. Full batches launch
-immediately; timeout batches launch after the oldest queued member waits five
-seconds by default. ASE dispatches one system per task.
+The geometry command uses the translation-invariant distance to a structure's
+geometric centroid, with an explicit threshold, and removes the uncertainty
+cutoffs. This isolated-system toy demonstrates a callable acquisition strategy
+with its own gate and scalar score. It does not implement a production novelty
+metric, periodic descriptor, or structural diversity selector.
 
-Temperature and density schedules are independent per system. Their two-element
-arrays specify parameter ranges, not values assigned to the first two systems.
-Density schedules scale the cell and positions isotropically, preserve
-velocities, and refresh forces. Periodic ground-state HIPPYNN checkpoints must
-contain a trained cell input identified by `ML_config.cell_key`. NPT, periodic
-excited states, and full reactive NEB/dimer batching are subsequent milestones.
+## Schedules and model capabilities
 
-Existing sampler task paths and calculator fields remain compatible. Use this
-new task to opt into the shared screening and acquisition behavior across
-drivers. It rejects invalid geometry before acquisition; legacy task behavior
-is preserved through the legacy entrypoints.
+Retain `dt` in fs, `maxt` in ps, `Ncheck`, thresholds, state selection,
+confinement, and temperature/density settings. Two-element schedule arrays
+are parameter ranges, not values for the first two systems. Density updates
+scale cells and positions isotropically, preserve velocities, and refresh
+forces. Batched periodic models must support fully periodic ground-state
+inputs; HIPPYNN checkpoints need the trained cell input. ASE constraints and
+partial PBC are checked separately against engine/model capabilities.
+
+Reactive entrypoints retain their existing ASE optimizer workflows. Full
+reactive batching, NPT, periodic excited states, UDD–LCM composition,
+production distance/diversity methods, and new model families are later work.
+Released legacy configurations retain their semantics; an old task-local
+`return_top_k` is not silently changed to a cohort-wide budget.
 
 ## Acceptance and performance
 
-The existing harness now accepts independent execution and method selections:
+The runner harness separates grouping, engine, and force controls:
 
 ```bash
 python examples/portable_batched_sampling/benchmark.py \
-  --driver batched --backend torchsim --device cuda:0 \
+  --driver batched --engine torchsim --device cuda:0 \
   --sampling-method udd --udd-bias-weight 0.45 \
   --master /path/to/master_config.json \
   --ensemble-directory /path/to/models/model-0003 \
@@ -91,41 +138,66 @@ python examples/portable_batched_sampling/benchmark.py \
   --batch-sizes 1 2 8 32 50 --output /path/to/udd-torchsim.json
 ```
 
-Repeat with `--driver ase` for sequential singleton ASE execution. Repeat the
-batched command with `--backend alchemi` in its NVIDIA environment. Select
-`--sampling-method mlmd` to omit the UDD bias. For an excited-state model,
-include `--selected-state N` and repeat for each intended surface. UDD requires
-an ensemble exposing actual member contributions; aggregate uncertainty alone
-is insufficient.
+Repeat with `--driver single --engine ase`, or a supported singleton GPU
+engine. Use `--engine alchemi` in its NVIDIA environment. `--sampling-method
+mlmd` omits the UDD bias. For excited models, add `--selected-state N` and
+repeat each intended surface. Existing `--driver ase` and `--backend` command
+forms remain accepted compatibility aliases.
 
-The harness compares total propagated energies/forces and unbiased diagnostics
-between packed and individual evaluations, checks independently stopped
-systems and periodic cell scaling, and records throughput and peak allocated
-Torch memory. ASE timing evaluates singleton systems sequentially; it does not
-time packed inference under the ASE label. Artifacts record method, driver,
-inference execution, bias parameters, source revision, checkpoint fingerprints,
-package versions, hardware identity, and parity tolerances.
+The harness retains `--sampling-method mlmd|udd` as convenient mechanics-test
+presets. ALF runtime configuration uses separate propagator and bias selections.
 
-The analytic thermal check starts all velocities at zero, equilibrates two
-groups at different target temperatures, then swaps their targets and repeats:
+The harness exercises the separate physical evaluator and sampling force
+pipeline. It compares propagated energies/forces and unbiased diagnostics,
+checks one-step analytic motion and velocity/kinetic-energy round trips,
+independent freezing, and periodic cell scaling. Single timings evaluate
+systems serially; they do not report packed inference under a single label.
+Artifacts retain exact configuration, source, fingerprints, versions,
+errors, throughput, GPU memory, and hardware identity.
+
+The analytic thermal check starts from zero velocities, equilibrates two
+system groups at 200/400 K, swaps their targets, and repeats:
 
 ```bash
 python examples/unified_sampling/thermal_acceptance.py \
-  --driver batched --backend torchsim --device cuda:0 \
+  --driver batched --engine torchsim --device cuda:0 \
   --sampling-method udd --udd-bias-weight 0.45 \
   --output /path/to/udd-thermal.json
 ```
 
-It uses eight independent 32-atom harmonic systems by default. Each phase
-equilibrates for 500 steps and collects 20 blocks of 25 steps, at 2 fs and
-friction `0.02 fs^-1`. Both windows span 20 friction relaxation times. The
-mean kinetic temperature of each group must agree with its target within
-the larger of 8% or four lag-one-adjusted block standard errors. The JSON
-records the observed errors, correlations, effective block counts, and both
-temperature phases. This checks thermostat units and per-system updates;
-it does not establish long-term stability of a trained potential.
+It uses eight 32-atom harmonic systems. Each phase has 500 equilibration steps
+and 20 blocks of 25 steps at 2 fs and friction `0.02 fs^-1`, spanning 20
+relaxation times for both equilibration and measurement. Group means must
+agree with targets within the larger of 8% or four lag-one-adjusted block
+standard errors. JSON records errors, correlations, effective blocks, and both
+phases. This checks thermostat behavior, not trained-potential stability.
 
-Float32 parity uses the approved `rtol=1e-5` and `atol=1e-5`, separately from
-sampling thresholds. CPU artifacts do not establish GPU acceptance. Repeat the
-same trained-checkpoint and policy checks on the intended MI350-family system
-with its supported ROCm/PyTorch build before production deployment.
+Cohort acceptance must replay identical candidate observations across widths
+1, 2, 8, 32, and 50, including reversed arrival order and restart boundaries,
+and compare exact membership, state assignment, scores, and selected IDs.
+Stochastic trajectories across engines need not be bitwise identical.
+
+The standalone replay harness records physical observations once, then tests
+the production coordinator without introducing different stochastic paths:
+
+```bash
+python examples/unified_sampling/cohort_acceptance.py \
+  --device cuda:0 --sampling-method udd --udd-bias-weight 0.45 \
+  --strategy summed --trajectory-policy continue \
+  --master /path/to/master_config.json \
+  --ensemble-directory /path/to/model-artifact \
+  --structures /path/to/representative.extxyz --selected-state 0 \
+  --cohort-size 50 --top-k 16 --physical-widths 1 2 8 32 50 \
+  --output /path/to/cohort-replay.json
+```
+
+It also checks duplicate delivery, partial-ingestion restart, and a persisted
+QM-handoff receipt. It does not execute MD, QM, or training and records
+`dynamics_executed: false`; combine its evidence with the mechanics, thermal,
+and end-to-end workflow tests. Omit checkpoint arguments for an analytic CPU
+check. Journals are retained beside the output in a unique directory.
+
+Float32 parity uses approved `rtol=1e-5, atol=1e-5`, independently of acquisition
+thresholds. CPU results do not establish GPU acceptance or potential accuracy.
+Retain actual NVIDIA/MI250 results separately and repeat on intended MI350
+hardware before production deployment.

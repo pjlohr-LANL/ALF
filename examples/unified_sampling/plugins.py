@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from alframework.samplers.sampling_methods import SamplingObservation
+from alframework.samplers.sampling_methods import SamplingObservation, AcquisitionDecision
 
 
 class ScaledProposalMethod:
@@ -44,3 +44,34 @@ class ScaledProposalMethod:
                 return context.finalize(candidates)
 
         return Program()
+
+
+class CoordinateExtentAcquisition:
+    """Translation-invariant geometry-only gate; not a production descriptor.
+
+    This toy uses the largest distance to the geometric centroid for isolated
+    systems. It requires no uncertainty values or model-family features.
+    """
+
+    required_signals = frozenset({"positions"})
+    retention = "scalar_top_k"
+
+    def decide(self, observation, context):
+        if np.any(observation.atoms.pbc):
+            raise ValueError("The toy extent policy supports nonperiodic structures only.")
+        settings = context.config["acquisition"]
+        threshold = float(settings.get("options", {})["min_extent_A"])
+        if not np.isfinite(threshold) or threshold <= 0:
+            raise ValueError("min_extent_A must be finite and positive.")
+        positions = observation.atoms.positions
+        extent = float(np.linalg.norm(positions-positions.mean(axis=0), axis=1).max())
+        capture = extent > threshold
+        policy = settings.get("trajectory_policy", settings.get("policy", "stop"))
+        return AcquisitionDecision(capture=capture, stop=capture and policy == "stop",
+            metadata={"ranking_score": extent/threshold, "score_mode": "geometry_extent",
+                      "geometry_extent_A": extent, "geometry_threshold_A": threshold})
+
+    def select(self, candidates, context, *, final=False):
+        # The coordinator owns cohort-wide selection; no trajectory quota or
+        # physical-task-local selection is introduced by this policy.
+        return candidates
