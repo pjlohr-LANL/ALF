@@ -75,6 +75,11 @@ def test_actual_driver_bootstrap_training_sampling_qm_and_retraining(tmp_path, m
     @python_app(executors=['alf_builder_executor'])
     def builder(moleculeid, moleculeids, builder_config, sampler_config, h5_path, current_h5_id, master_directory):
         if rdkit_seed:
+            # Ordinary ALF may request more builders while seed QM is still
+            # running. This finite test source has only two seed frames;
+            # report exhaustion as an empty builder result, not a task failure.
+            if moleculeid.startswith('mol-boot-') and int(moleculeid.rsplit('-', 1)[1]) >= 2:
+                return []
             return build_h5_replay_structures(
                 moleculeids=moleculeids, builder_config=builder_config,
                 sampler_config=sampler_config, h5_path=h5_path,
