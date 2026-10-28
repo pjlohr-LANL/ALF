@@ -7,6 +7,7 @@ tensor imports happen only after a native inference adapter is selected.
 from __future__ import annotations
 
 import copy
+import inspect
 import numpy as np
 from ase.calculators.calculator import all_changes
 
@@ -19,20 +20,8 @@ from alframework.tools.tools import load_module_from_string
 
 
 def validated_method_bias(method, options=None):
-    """Validate the existing UDD convention without changing its sign."""
-    values = dict(options or {})
-    if method != "udd":
-        return None, 1.e-12
-    weight = values.get("udd_bias_weight", values.get("bias_weight"))
-    if weight is None:
-        raise ValueError("UDD requires udd_bias_weight.")
-    weight = float(weight)
-    eps = float(values.get("udd_bias_eps", values.get("bias_eps", 1.e-12)))
-    if not np.isfinite(weight):
-        raise ValueError("udd_bias_weight must be finite.")
-    if not np.isfinite(eps) or eps < 0:
-        raise ValueError("udd_bias_eps must be finite and nonnegative.")
-    return weight, eps
+    from alframework.samplers.force_controls import validated_method_bias as validate
+    return validate(method, options)
 
 
 def _norm_max(values):
@@ -78,27 +67,12 @@ class NumpyASEEnsembleModel:
         self.physical_force_states = sorted(set(int(state) for state in states))
 
     def configure_sampling_method(self, method, options=None):
-        weight, epsilon = validated_method_bias(method, options)
-        if weight is not None and self.gap_seeking_settings.get("enabled", False):
-            raise ValueError("UDD combined with LCM switching is not supported.")
-        self.udd_bias_weight, self.udd_bias_eps = weight, epsilon
-        self._lcm_controls.clear()
+        from alframework.samplers.force_controls import configure_controls
+        return configure_controls(self, method, options)
 
     def set_lcm_mode(self, graph_index, *, pair, sigma, alpha_eV):
-        if self.udd_bias_weight is not None:
-            raise ValueError("UDD combined with LCM switching is not supported.")
-        if not self.gap_seeking_settings.get("enabled", False):
-            raise RuntimeError("Cannot enter LCM mode when gap_seeking is disabled.")
-        pair = tuple(int(value) for value in pair)
-        allowed = {(int(row["lower_state"]), int(row["upper_state"]))
-                   for row in self.gap_seeking_settings.get("rows", [])}
-        if pair not in allowed or int(graph_index) < 0:
-            raise ValueError("LCM pair or graph index is not eligible.")
-        control = {"pair": pair, "sigma": float(sigma), "alpha_eV": float(alpha_eV)}
-        existing = self._lcm_controls.get(int(graph_index))
-        if existing is not None and existing != control:
-            raise RuntimeError("Replica already entered stay-fixed LCM mode.")
-        self._lcm_controls[int(graph_index)] = control
+        from alframework.samplers.force_controls import set_numpy_lcm_mode
+        return set_numpy_lcm_mode(self, graph_index, pair=pair, sigma=sigma, alpha_eV=alpha_eV)
 
     def _states(self):
         states = set(self.physical_force_states)
@@ -212,94 +186,9 @@ class NumpyASEEnsembleModel:
         return prediction
 
     def evaluate_atoms(self, atoms_list):
-        atoms_list = list(atoms_list)
-        prediction = self.raw_ensemble_forward(atoms_list)
-        self.last_prediction = prediction
-        energy, forces = prediction["energy_contributions"], prediction["force_contributions"]
-        ptr = np.cumsum([0, *[len(atoms) for atoms in atoms_list]])
-        energy_mean, force_mean = energy.mean(axis=0), forces.mean(axis=0)
-        energy_std, force_std = energy.std(axis=0), forces.std(axis=0)
-        result_energy, result_forces = energy_mean.copy(), force_mean.copy()
-        state_members = prediction["state_contributions"]
-        state_means = {state: (values["energy_contributions"].mean(axis=0),
-                               values["force_contributions"].mean(axis=0))
-                       for state, values in state_members.items()}
-        diagnostics = []
-        for index, atoms in enumerate(atoms_list):
-            selection = slice(ptr[index], ptr[index + 1])
-            force_deviation = force_std[selection]
-            row = {"force_screen_schema": SCHEMA, "force_screen_source": SOURCE,
-                   "Es": float(energy_std[index]), "Fs": float(np.abs(force_deviation).mean()),
-                   "Fsmax": float(np.abs(force_deviation).max()), "Fsrms": float(np.sqrt(np.mean(force_deviation**2)))}
-            if "uncertainty" in prediction:
-                row.update({key: float(values[index]) for key, values in prediction["uncertainty"].items()})
-                row.pop("Fsrms", None)
-            for state, (state_e, state_f) in state_means.items():
-                values = state_members[state]
-                row.update({f"sE{state}": float(state_e[index]),
-                            f"sE{state}_stdev": float(values["energy_contributions"][:, index].std()),
-                            f"F{state}": state_f[selection].copy(),
-                            f"F{state}_stdev": values["force_contributions"][:, selection].std(axis=0),
-                            f"physical_F{state}_max": _norm_max(state_f[selection])})
-            missing = set(self.physical_force_states) - set(state_means)
-            if missing:
-                raise ValueError(f"Missing physical state forces: {sorted(missing)}.")
-            row["Fmeanmax"] = max(row[f"physical_F{state}_max"] for state in state_means)
-            for gap in self.gap_rows:
-                lo, hi = int(gap["lower_state"]), int(gap["upper_state"])
-                members = (prediction["state_energy_contributions"][hi][:, index]
-                           - prediction["state_energy_contributions"][lo][:, index])
-                row.update({gap["gap_key"]: float(members.mean()), f"{gap['gap_key']}_stdev": float(members.std()),
-                            f"{gap['gap_key']}_model_count": len(members)})
-            correction = np.zeros_like(force_mean[selection])
-            control = self._lcm_controls.get(index)
-            if control is not None:
-                lo, hi = control["pair"]
-                le, lf = state_means[lo]; ue, uf = state_means[hi]
-                gap = ue[index] - le[index]
-                smooth = np.sqrt(gap * gap + 1.e-12)
-                denominator = smooth + control["alpha_eV"]
-                derivative = control["sigma"] * (2 * gap * denominator - gap**3 / smooth) / denominator**2
-                result_energy[index] = .5 * (le[index] + ue[index]) + control["sigma"] * gap**2 / denominator
-                pair_mean = .5 * (lf[selection] + uf[selection])
-                result_forces[selection] = pair_mean + derivative * (uf[selection] - lf[selection])
-                correction = result_forces[selection] - pair_mean
-            row.update(lcm_bias_Fmax=_norm_max(result_forces[selection] - force_mean[selection]),
-                       lcm_correction_Fmax=_norm_max(correction))
-            if self.udd_bias_weight is not None:
-                if not prediction["has_raw_members"]:
-                    raise ValueError("UDD requires ordered ensemble-member energies and forces; aggregate uncertainty is insufficient.")
-                std = energy_std[index]
-                bias = np.zeros_like(force_mean[selection])
-                if std > self.udd_bias_eps:
-                    bias = self.udd_bias_weight * np.mean(
-                        (energy[:, index] - energy_mean[index])[:, None, None]
-                        * (forces[:, selection] - force_mean[selection]), axis=0) / std
-                energy_bias = self.udd_bias_weight * std
-                result_energy[index] += energy_bias
-                result_forces[selection] += bias
-                row.update(E_en_bias=float(energy_bias), F_en_bias=bias.copy(), udd_bias_Fmax=_norm_max(bias))
-            result_energy[index] += prediction["confinement_energy"][index]
-            well_force = prediction["confinement_forces"][selection].copy()
-            result_forces[selection] += well_force
-            if self.well_params is not None:
-                p = self.well_params
-                relative = atoms.positions - np.asarray(p.get("origin", [0., 0., 0.]))
-                radii = np.linalg.norm(relative, axis=1)
-                weights = atoms.get_masses() if p.get("mass_weighted", True) else np.ones(len(atoms))
-                depth = np.maximum(radii - float(p["r_start"]), 0.)
-                result_energy[index] += np.sum(weights * depth * float(p["force"]))
-                configured_force = -relative / np.maximum(radii[:, None], 1.e-12) * (
-                    weights * (radii > float(p["r_start"])) * float(p["force"]))[:, None]
-                well_force += configured_force
-                result_forces[selection] += configured_force
-            row.update(confinement_Fmax=_norm_max(well_force), propagation_Fmax=_norm_max(result_forces[selection]))
-            diagnostics.append(row)
-        if any(index >= len(atoms_list) for index in self._lcm_controls):
-            raise IndexError("LCM graph index is outside the evaluated batch.")
-        self.last_diagnostics = diagnostics
-        return {"energy": result_energy.reshape(-1, 1), "forces": result_forces,
-                "diagnostics": copy.deepcopy(diagnostics), **prediction}
+        # Compatibility facade; sampling controls are not inference internals.
+        from alframework.samplers.force_controls import numpy_forward
+        return numpy_forward(self, atoms_list)
 
     def diagnostics_for_graph(self, graph_index):
         return copy.deepcopy(self.last_diagnostics[int(graph_index)])
@@ -363,3 +252,130 @@ def load_sampling_calculator(*, sampler_config, ensemble_directory, model_mode,
         from alframework.ml_interfaces.batched_inference import ASEEnsembleModel
         return ASEEnsembleModel(calculators, **kwargs)
     return NumpyASEEnsembleModel(calculators, **kwargs)
+
+
+class LegacyPhysicalEvaluator:
+    """Expose legacy adapters' physical members without invoking their controls.
+
+    This is a compatibility bridge. New adapters can implement ``predict``
+    directly and do not inherit any ALF or Torch model base class.
+    """
+
+    def __init__(self, model, device=None):
+        self.model = model
+        self.array_backend = "numpy" if hasattr(model, "raw_ensemble_forward") else "torch"
+        self.calculator_interface = getattr(model, "calculator_interface", "native")
+        self.calculator_loader = getattr(model, "calculator_loader", type(model).__name__)
+        self.selected_state_value = int(getattr(model, "selected_state_value", 0))
+        self.capabilities = {
+            key: getattr(model, key, default) for key, default in (
+                ("supports_pbc", False), ("requires_pbc", False),
+                ("supports_partial_pbc", self.array_backend == "numpy"),
+                ("supports_constraints", self.array_backend == "numpy"),
+                ("supports_member_contributions", True))
+        }
+        self._device = device if device is not None else getattr(model, "_device", None)
+
+    def set_device(self, device):
+        self._device = device
+        if hasattr(self.model, "set_device"):
+            self.model.set_device(device)
+
+    def request_states(self, physical_states, gap_rows, seeking_rows=()):
+        # Translate prediction requirements for legacy adapters. No switching
+        # thresholds, bias weights, or acquisition decisions enter inference.
+        if hasattr(self.model, "require_physical_states"):
+            self.model.require_physical_states(physical_states)
+        if self.array_backend == "numpy":
+            self.model.gap_rows = list(gap_rows)
+            self.model.gap_seeking_settings = {"enabled": False, "rows": list(seeking_rows)}
+
+    def predict(self, data):
+        if self.array_backend == "numpy":
+            return self.model.raw_ensemble_forward(data)
+        return self.model.ensemble_forward(data)
+
+    def predict_atoms(self, atoms_list):
+        if self.array_backend == "numpy":
+            return self.predict(atoms_list)
+        from alframework.ml_interfaces.batched_inference import PackedBatch
+        return self.predict(PackedBatch.from_atoms(atoms_list, device=self._device))
+
+
+def adapt_physical_evaluator(model, device=None):
+    """Adapt a structural evaluator or an existing raw-member model."""
+    if getattr(model, "is_sampling_model", False):
+        return model.evaluator
+    if isinstance(model, LegacyPhysicalEvaluator):
+        return model
+    if callable(getattr(model, "ensemble_forward", None)) or callable(getattr(model, "raw_ensemble_forward", None)):
+        return LegacyPhysicalEvaluator(model, device=device)
+    if callable(getattr(model, "predict", None)) or callable(getattr(model, "predict_atoms", None)):
+        if getattr(model, "array_backend", None) not in {"numpy", "torch"}:
+            raise TypeError("A physical evaluator must declare array_backend='numpy' or 'torch'.")
+        return model
+    raise TypeError("Inference must provide physical predict()/predict_atoms() or raw ensemble outputs.")
+
+
+def load_physical_evaluator(model_reference, *, model_mode="ground_state", selected_state_value=None,
+                            ML_config=None, properties_list=None, requested_properties=None, device=None):
+    """Load physical inference from an opaque artifact reference.
+
+    New factories accept ``model_reference`` and ``requested_properties``.
+    Compatibility factories receive only prediction configuration; sampling
+    biases, acquisition scores, thresholds, and selection budgets are excluded.
+    """
+    from alframework.ml_interfaces.model_reference import ModelReference
+    reference = ModelReference.from_value(model_reference)
+    model_config = dict(reference.metadata.get("ML_config", ML_config or {}))
+    properties = dict(reference.metadata.get("properties_list", properties_list or {}))
+    request = dict(requested_properties or {})
+    request.setdefault("model_mode", model_mode)
+    request.setdefault("selected_state_value", selected_state_value)
+    request.setdefault("properties_list", properties)
+    request.setdefault("model_config", model_config)
+    if "ML_config" in reference.metadata:
+        request["model_config"] = model_config
+    if "properties_list" in reference.metadata:
+        request["properties_list"] = properties
+    options = dict(reference.options)
+    loader = load_module_from_string(reference.adapter)
+    parameters = inspect.signature(loader).parameters
+    new_api = "model_reference" in parameters or "requested_properties" in parameters or "reference" in parameters
+    if new_api:
+        evaluator = loader(reference, requested_properties=request, device=device, **options)
+    elif reference.interface == "ase":
+        if options.pop("use_potential_specific_code", None) == "neurochem":
+            calculators = loader({"model_path": reference.artifact_location.rstrip("/") + "/",
+                                  "Nn": 8, "gpu": "0", **options})
+            uncertainty_mode = "neurochem"
+        else:
+            options.setdefault("device", str(device or "cpu"))
+            calculators = loader(reference.artifact_location.rstrip("/") + "/", **options)
+            uncertainty_mode = None
+        evaluator = NumpyASEEnsembleModel(calculators, model_mode=model_mode,
+            selected_state_value=selected_state_value, device=device,
+            calculator_loader=reference.adapter, uncertainty_mode=uncertainty_mode)
+    else:
+        if reference.adapter.endswith(("load_hippynn_batched_model", "load_hippynn_alchemi_model")):
+            # The HIPPYNN compatibility adapter owns its checkpoint layout and
+            # does not load the NVIDIA engine when used by another driver.
+            from alframework.ml_interfaces.batched_inference import load_hippynn_batched_model
+            loader = load_hippynn_batched_model
+        evaluator = loader(reference.artifact_location, model_mode=model_mode,
+            selected_state_value=selected_state_value, ML_config=model_config,
+            properties_list=properties, sampler_config={"model_mode": model_mode},
+            device=device, **options)
+    evaluator = adapt_physical_evaluator(evaluator, device=device)
+    evaluator.model_reference = reference
+    if hasattr(evaluator, "set_device") and device is not None:
+        evaluator.set_device(device)
+    return evaluator
+
+
+def build_sampling_model(evaluator, sampler_config, *, properties_list=None,
+                         selected_state_value=None, device=None):
+    """Compatibility import for the sampling-owned force-pipeline factory."""
+    from alframework.samplers.force_controls import build_sampling_model as build
+    return build(evaluator, sampler_config, properties_list=properties_list,
+                 selected_state_value=selected_state_value, device=device)

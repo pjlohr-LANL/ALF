@@ -9,6 +9,7 @@ batching; other existing samplers receive one ``MoleculesObject`` at a time.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from collections import defaultdict
@@ -467,7 +468,13 @@ def selected_state(
             }
         else:
             sequence_index = _molecule_sequence_index(molecule)
-            batch_size = sampler_batch_size(dict(sampler_config or {}))
+            from alframework.tools.batched_config import canonical_sampling, cohort_selection
+            if canonical_sampling(dict(sampler_config or {})):
+                if cohort_selection(sampler_config):
+                    raise ValueError("Cohort state cycling requires logical admission before physical batching.")
+                batch_size = 1
+            else:
+                batch_size = sampler_batch_size(dict(sampler_config or {}))
             batch_ordinal = sequence_index // batch_size
             cycle_index = batch_ordinal % len(states)
             state = int(states[cycle_index])
@@ -517,9 +524,22 @@ def sampler_batch_key(
     if portable_batching(sampler_config):
         loader = (inference_settings(sampler_config)["loader"] if unified_sampling(sampler_config)
                   else configured_native_loader(sampler_config) or str(sampler_config.get("ase_calculator", "")))
-        return ("portable", mode, tuple(bool(value) for value in atoms.get_pbc()), state,
+        key = ("portable", mode, tuple(bool(value) for value in atoms.get_pbc()), state,
                 dynamics_settings(sampler_config)["backend"],
                 loader)
+        from alframework.tools.batched_config import canonical_sampling, cohort_selection
+        if canonical_sampling(sampler_config):
+            reference = molecule.get_metadata().get("acquisition_model_reference")
+            # A model promotion may occur while an older partial batch waits.
+            # Every member must retain its admitted model and adapter options.
+            identity = json.dumps(reference, sort_keys=True, separators=(",", ":"), default=str)
+            key += (hashlib.sha256(identity.encode()).hexdigest(),)
+        if cohort_selection(sampler_config):
+            identifier = molecule.get_metadata().get("acquisition_cohort_id")
+            if identifier is None:
+                raise ValueError("Cohort inputs must be admitted before physical batching.")
+            key += (identifier,)
+        return key
     return atomic_numbers, state
 
 
@@ -644,7 +664,7 @@ class SamplerBatchBuffer:
             oldest = min(entry.buffered_at for entry in entries)
             oldest_timestamp = oldest if oldest_timestamp is None else min(oldest_timestamp, oldest)
             if key[0] == "portable":
-                _, mode, pbc, state, backend, loader = key
+                _, mode, pbc, state, backend, loader = key[:6]
                 compatibility = {"pbc": list(pbc), "selected_state": state,
                                  "model_mode": mode, "backend": backend,
                                  "calculator_loader": loader,

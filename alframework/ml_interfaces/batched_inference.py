@@ -177,13 +177,8 @@ class BatchedEnsembleCalculator(torch.nn.Module):
         self.udd_bias_eps = 1.e-12
 
     def configure_sampling_method(self, method, options=None):
-        """Select propagation controls without changing physical diagnostics."""
-        from alframework.ml_interfaces.sampling_inference import validated_method_bias
-        weight, epsilon = validated_method_bias(method, options)
-        if weight is not None and self.gap_seeking_settings.get("enabled", False):
-            raise ValueError("UDD combined with LCM switching is not supported.")
-        self.udd_bias_weight, self.udd_bias_eps = weight, epsilon
-        self._lcm_controls.clear()
+        from alframework.samplers.force_controls import configure_controls
+        return configure_controls(self, method, options)
 
     def require_physical_states(self, states):
         self.physical_force_states = sorted(set(int(state) for state in states))
@@ -203,67 +198,17 @@ class BatchedEnsembleCalculator(torch.nn.Module):
         self._device = torch.device(device)
         self.to(self._device)
 
-    def set_lcm_mode(
-        self,
-        graph_index: int,
-        *,
-        pair: list[int] | tuple[int, int],
-        sigma: float,
-        alpha_eV: float,
-    ) -> None:
-        """Permanently switch one batch graph to its configured LCM pair."""
-
-        if not bool(self.gap_seeking_settings.get("enabled", False)):
-            raise RuntimeError(
-                "Cannot enter LCM mode when gap_seeking is disabled."
-            )
-        if self.udd_bias_weight is not None:
-            raise ValueError("UDD combined with LCM switching is not supported.")
-        index = int(graph_index)
-        if index < 0:
-            raise ValueError("LCM graph_index must be nonnegative.")
-        normalized_pair = (int(pair[0]), int(pair[1]))
-        allowed_pairs = {
-            (int(row["lower_state"]), int(row["upper_state"]))
-            for row in self.gap_seeking_settings["rows"]
-        }
-        if normalized_pair not in allowed_pairs:
-            raise ValueError(
-                f"LCM pair {normalized_pair} is not eligible for selected "
-                f"state {self.selected_state_value}."
-            )
-        control = {
-            "pair": normalized_pair,
-            "sigma": float(sigma),
-            "alpha_eV": float(alpha_eV),
-        }
-        existing = self._lcm_controls.get(index)
-        if existing is not None and existing != control:
-            raise RuntimeError(
-                f"Graph {index} already entered stay-fixed LCM mode with "
-                f"pair {existing['pair']}."
-            )
-        self._lcm_controls[index] = control
+    def set_lcm_mode(self, graph_index, *, pair, sigma, alpha_eV):
+        from alframework.samplers.force_controls import set_lcm_mode
+        return set_lcm_mode(self, graph_index, pair=pair, sigma=sigma, alpha_eV=alpha_eV)
 
     @staticmethod
     def _batch_shape(batch):
         return int(batch.num_graphs), int(batch.num_nodes_per_graph.max().item())
 
     def _well_energy_forces(self, batch, positions):
-        if self.well_params is None:
-            return None, None
-        params = dict(self.well_params)
-        r_start, force_constant = float(params["r_start"]), float(params["force"])
-        origin = torch.as_tensor(params.get("origin", [0., 0., 0.]), dtype=positions.dtype, device=positions.device)
-        relative = positions - origin.reshape(1, 3)
-        radius = torch.linalg.vector_norm(relative, dim=-1)
-        depth = torch.clamp(radius - r_start, min=0.)
-        weights = batch.atomic_masses if bool(params.get("mass_weighted", True)) else torch.ones_like(radius)
-        energy = _segment_sum(weights * depth * force_constant, batch).reshape(-1, 1)
-        unit_vectors = relative / torch.clamp(radius, min=1.e-12).unsqueeze(-1)
-        active = (radius > r_start).to(positions.dtype).unsqueeze(-1)
-        forces = -unit_vectors * active * weights.unsqueeze(-1) * force_constant
-        return energy, forces
+        from alframework.samplers.force_controls import torch_well_energy_forces
+        return torch_well_energy_forces(self, batch, positions)
 
     def ensemble_forward(self, batch) -> dict[str, Any]:
         """Return raw ensemble contributions for the current batch."""
@@ -280,140 +225,19 @@ class BatchedEnsembleCalculator(torch.nn.Module):
 
     @staticmethod
     def _reduce_contributions(batch, energy, forces):
-        energy_mean, force_mean = energy.mean(dim=0), forces.mean(dim=0)
-        energy_std = energy.std(dim=0, correction=0)
-        force_std = forces.std(dim=0, correction=0)
-        denominator = batch.num_nodes_per_graph.to(forces.dtype) * 3
-        return {
-            "energy": energy_mean, "forces": force_mean,
-            "energy_std": energy_std, "force_std": force_std,
-            "Fs": _segment_sum(force_std.abs().sum(-1), batch) / denominator,
-            "Fsmax": _segment_max(force_std.abs().amax(-1), batch),
-            "Fsrms": torch.sqrt(_segment_sum(force_std.square().sum(-1), batch) / denominator),
-        }
+        from alframework.samplers.force_controls import torch_reduce_contributions
+        return torch_reduce_contributions(batch, energy, forces)
 
     @staticmethod
-    def _lcm_energy_forces(
-        lower_energy,
-        upper_energy,
-        lower_forces,
-        upper_forces,
-        *,
-        sigma: float,
-        alpha_eV: float,
-    ):
-        """Return the fork-compatible smooth LCM mean and analytic force."""
-
-        gap = upper_energy - lower_energy
-        smooth_abs_gap = torch.sqrt(gap * gap + 1.0e-12)
-        denominator = smooth_abs_gap + float(alpha_eV)
-        correction = float(sigma) * gap * gap / denominator
-        gap_derivative = float(sigma) * (
-            (2.0 * gap * denominator)
-            - (gap * gap * gap / smooth_abs_gap)
-        ) / (denominator * denominator)
-        energy = 0.5 * (lower_energy + upper_energy) + correction
-        forces = (
-            0.5 * (lower_forces + upper_forces)
-            + gap_derivative * (upper_forces - lower_forces)
-        )
-        return energy, forces
+    def _lcm_energy_forces(lower_energy, upper_energy, lower_forces, upper_forces, *, sigma, alpha_eV):
+        from alframework.samplers.force_controls import torch_lcm_energy_forces
+        return torch_lcm_energy_forces(lower_energy, upper_energy, lower_forces, upper_forces,
+                                       sigma=sigma, alpha_eV=alpha_eV)
 
     def forward(self, batch):
-        prediction = dict(self.ensemble_forward(batch))
-        energy, forces = self._normalize_contributions(batch, prediction["energy_contributions"], prediction["force_contributions"])
-        self.last_prediction = {"energy_contributions": energy.detach(), "force_contributions": forces.detach()}
-        selected = self._reduce_contributions(batch, energy, forces)
-        self._graph_slices = batch_slices(batch)
-        self._diagnostic_force_keys = set()
-        diagnostics = {}
-        state_contributions = {int(state): values for state, values in dict(prediction.get("state_contributions") or {}).items()}
-        state_contributions.setdefault(self.selected_state_value, {"energy_contributions": energy, "force_contributions": forces})
-        validate_required_physical_states(state_contributions, self.physical_force_states)
-        state_results = {}
-        for state, values in state_contributions.items():
-            state_energy, state_forces = self._normalize_contributions(batch, values["energy_contributions"], values["force_contributions"])
-            validate_model_count(state_energy.shape[0], energy.shape[0], "Physical states must use the same ordered model count.")
-            result = self._reduce_contributions(batch, state_energy, state_forces)
-            state_results[state] = result
-            self.last_prediction.setdefault("state_contributions", {})[state] = {
-                "energy_contributions": state_energy.detach(), "force_contributions": state_forces.detach()}
-            diagnostics.update({f"sE{state}": result["energy"], f"sE{state}_stdev": result["energy_std"],
-                                f"F{state}": result["forces"], f"F{state}_stdev": result["force_std"]})
-            self._diagnostic_force_keys.update((f"F{state}", f"F{state}_stdev"))
-        state_energies = {int(state): value for state, value in dict(prediction.get("state_energy_contributions") or {}).items()}
-        for state, values in state_contributions.items():
-            state_energies.setdefault(state, values["energy_contributions"])
-        state_energies.setdefault(self.selected_state_value, energy)
-        self.last_prediction["state_energy_contributions"] = {
-            state: normalize_energy_contributions(batch, values).detach() for state, values in state_energies.items()}
-        model_count = int(energy.shape[0])
-        for row in self.gap_rows:
-            lower, upper = normalize_gap_contributions(batch, state_energies, row, model_count)
-            members = upper - lower
-            key = str(row["gap_key"])
-            diagnostics.update({key: members.mean(0), f"{key}_stdev": members.std(0, correction=0),
-                                f"{key}_model_count": torch.full((int(batch.num_graphs),), model_count, dtype=torch.long, device=batch.positions.device)})
-        override = prediction.get("uncertainty")
-        if override is None:
-            diagnostics.update({"Es": selected["energy_std"], "Fs": selected["Fs"], "Fsmax": selected["Fsmax"], "Fsrms": selected["Fsrms"]})
-        else:
-            diagnostics.update(normalize_uncertainty_override(batch, override))
-        ptr = batch_offsets(batch)
-        diagnostics.update(physical_force_diagnostics(state_results, int(batch.num_graphs), batch_ptr=ptr))
-        selected_energy = selected["energy"].reshape(-1, 1).clone()
-        selected_forces = selected["forces"].clone()
-        physical_forces = selected_forces.clone()
-        correction = torch.zeros_like(selected_forces)
-        for graph_index, control in sorted(self._lcm_controls.items()):
-            if graph_index >= int(batch.num_graphs):
-                raise IndexError(f"LCM graph index {graph_index} is outside batch size {batch.num_graphs}.")
-            lower, upper = control["pair"]
-            missing = [state for state in (lower, upper) if state not in state_results]
-            if missing:
-                raise KeyError(f"LCM pair {(lower, upper)} requires raw energy and force contributions for states {missing}.")
-            atom_slice = self._graph_slices[graph_index]
-            lo, hi = state_results[lower], state_results[upper]
-            lcm_energy, lcm_forces = self._lcm_energy_forces(
-                lo["energy"][graph_index], hi["energy"][graph_index],
-                lo["forces"][atom_slice], hi["forces"][atom_slice],
-                sigma=float(control["sigma"]), alpha_eV=float(control["alpha_eV"]))
-            selected_energy[graph_index, 0] = lcm_energy
-            selected_forces[atom_slice] = lcm_forces
-            correction[atom_slice] = lcm_forces - .5 * (lo["forces"][atom_slice] + hi["forces"][atom_slice])
-        diagnostics.update(lcm_force_diagnostics(selected_forces, physical_forces, correction, batch_ptr=ptr))
-        if self.udd_bias_weight is not None:
-            if prediction.get("uncertainty") is not None and not prediction.get("has_raw_members", False):
-                raise ValueError("UDD requires ordered ensemble-member energies and forces; aggregate uncertainty is insufficient.")
-            indices = torch.repeat_interleave(
-                torch.arange(int(batch.num_graphs), device=forces.device), batch.num_nodes_per_graph)
-            deviations = energy - selected["energy"].unsqueeze(0)
-            force_deviations = forces - selected["forces"].unsqueeze(0)
-            std = selected["energy_std"]
-            active = std > self.udd_bias_eps
-            denominator = torch.where(active, std, torch.ones_like(std))
-            bias_force = float(self.udd_bias_weight) * (
-                deviations[:, indices, None] * force_deviations).mean(dim=0)
-            bias_force = bias_force / denominator[indices, None] * active[indices, None]
-            bias_energy = float(self.udd_bias_weight) * std
-            selected_energy = selected_energy + bias_energy.reshape(-1, 1)
-            selected_forces = selected_forces + bias_force
-            from alframework.tools.force_screen import _force_maximum
-            diagnostics.update(E_en_bias=bias_energy, F_en_bias=bias_force,
-                               udd_bias_Fmax=_force_maximum(bias_force, ptr))
-            self._diagnostic_force_keys.add("F_en_bias")
-        well_energy, well_forces = self._well_energy_forces(batch, batch.positions)
-        if "confinement_energy" in prediction:
-            extra_energy = prediction["confinement_energy"].reshape(-1, 1)
-            extra_forces = prediction["confinement_forces"].reshape(-1, 3)
-            well_energy = extra_energy if well_energy is None else well_energy + extra_energy
-            well_forces = extra_forces if well_forces is None else well_forces + extra_forces
-        if well_energy is not None:
-            selected_energy += well_energy
-            selected_forces += well_forces
-        diagnostics.update(propagation_force_diagnostics(selected_forces, well_forces, batch_ptr=ptr))
-        self.last_diagnostics = {key: value.detach() for key, value in diagnostics.items()}
-        return {"energy": selected_energy, "forces": selected_forces}
+        # Compatibility facade: physical inference is ensemble_forward().
+        from alframework.samplers.force_controls import torch_forward
+        return torch_forward(self, batch)
 
     def diagnostics_for_graph(self, graph_index):
         index = int(graph_index)

@@ -157,6 +157,7 @@ if _ALCHEMI_IMPORT_ERROR is None:
             self.supports_pbc = model.supports_pbc
             self.udd_bias_weight = getattr(model, "udd_bias_weight", None)
             self.udd_bias_eps = getattr(model, "udd_bias_eps", 1.e-12)
+            self.force_controls = getattr(model, "force_controls", ())
             self.register_buffer("_input_cells", torch.as_tensor(
                 np.stack([atoms.cell.array for atoms in atoms_list]), dtype=torch.float32))
             self.register_buffer("_input_pbc", torch.as_tensor(

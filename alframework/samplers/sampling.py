@@ -7,28 +7,22 @@ screening, trajectory clocks, state selection, and ranking stay consistent.
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from typing import Any, Callable
 
 import numpy as np
-from ase import Atoms, units
-from ase.calculators.calculator import all_changes
+from ase import units
 from parsl import python_app
 
 from alframework.tools.sampling_validation import (
     _configured_replica_candidate_limit, _configured_return_top_k,
-    _physical_force_states, _validate_sampling_inputs, configured_alchemi_gap_rows,
+    _physical_force_states, _validate_sampling_inputs,
     configured_score,
-    normalize_energy_contributions, normalize_contributions, validated_batch_shape,
-    validate_required_physical_states, validate_model_count,
-    normalize_gap_contributions, normalize_uncertainty_override,
-    validate_ase_results, validate_ase_force_shape, native_state_contributions,
-    validate_native_results, hippynn_members_first, hippynn_state_table,
     validate_numeric_range, validate_temperature_period, uncertainty_cutoffs,
     validated_numpy_contributions, validate_dynamics_parameters, validate_friction,
-    validate_alchemi_device, validate_gap_model, gap_seeking_settings_for_model,
+    validate_gap_model, gap_seeking_settings_for_model, validate_topology_identities,
     validate_score_diagnostics, validated_seeking_gap, _gap_candidate_metadata,
-    validate_topology_identities, validate_native_models, validate_ase_calculators,
-    validate_hippynn_options,
 )
 # Public configuration helpers remain importable from this sampler module.
 from alframework.tools.sampling_validation import (
@@ -37,8 +31,7 @@ from alframework.tools.sampling_validation import (
     configured_gap_seeking as configured_gap_seeking,
 )
 from alframework.tools.force_screen import (
-    SCHEMA, SOURCE, ForceScreenAudit, force_screen_metadata, physical_force_exceeds,
-    physical_force_diagnostics, lcm_force_diagnostics, propagation_force_diagnostics,
+    ForceScreenAudit, force_screen_metadata, physical_force_exceeds,
 )
 from alframework.tools.atom_order import canonicalize_tagged_atoms, attach_topology_ids
 from alframework.tools.molecules_class import MoleculesObject
@@ -48,7 +41,7 @@ from alframework.tools.molecular_topology import (
     topology_metadata,
     validate_fixed_topology,
 )
-from alframework.tools.tools import annealing_schedule, load_module_from_string
+from alframework.tools.tools import annealing_schedule
 
 
 KB_EV_PER_K = 8.617333262145e-5
@@ -56,8 +49,7 @@ DEFAULT_FRICTION_PER_FS = 0.02 * units.fs
 
 
 from alframework.tools.batched_config import (
-    batching_settings, dynamics_settings, configured_native_loader,
-    configured_native_options,
+    dynamics_settings, canonical_sampling, driver_settings,
 )
 
 
@@ -221,6 +213,9 @@ def acquire_observation(observation, context):
         "distmin": distance, **observation.progress,
         **force_screen_metadata(observation.diagnostics), **decision.flags, **decision.metadata,
     }
+    for key, value in observation.molecule.get_metadata().items():
+        if key.startswith("acquisition_") or key in {"trajectory_id", "cohort_id"}:
+            record[key] = value
     for key in ("Es", "Fs", "Fsmax", "Fsrms", "E_en_bias", "udd_bias_Fmax"):
         if key in observation.diagnostics:
             record[key] = float(observation.diagnostics[key])
@@ -239,12 +234,35 @@ def finalize_candidates(candidates, context):
         molecule = MoleculesObject(candidate["atoms"], f"{record['parent_molecule_id']}-cand-{rank:04d}")
         molecule.update_metadata({**candidate["parent_metadata"], **record,
                                   "candidate_rank": rank, "candidate_count": len(candidates)})
+        if canonical_sampling(context.config):
+            stamp_candidate_identity(molecule)
         outputs.append(molecule)
     return outputs
 
 
+def stamp_candidate_identity(molecule):
+    """A frame is identified by its trajectory/proposal, never physical rank."""
+    metadata = molecule.get_metadata()
+    trajectory = metadata.get("acquisition_trajectory_id", metadata.get("parent_molecule_id"))
+    from alframework.tools.acquisition_identity import candidate_identity
+    identifier = candidate_identity(trajectory, metadata)
+    molecule._moleculeid = identifier
+    molecule.update_metadata({"candidate_id": identifier, "_workflow_origin": identifier})
+
+
+def trajectory_seed(molecule, base_seed):
+    metadata = molecule.get_metadata()
+    if "trajectory_seed" in metadata:
+        return int(metadata["trajectory_seed"])
+    identity = metadata.get("acquisition_trajectory_id", molecule.get_moleculeid())
+    return int.from_bytes(hashlib.sha256(f"{base_seed}:{identity}".encode()).digest()[:4], "big")
+
+
 def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     record = candidate["record"]
+    if "acquisition_trajectory_id" in record:
+        from alframework.tools.acquisition_identity import scalar_ranking_key
+        return scalar_ranking_key(record)
     return (
         -float(record["ranking_score"]),
         int(record["step"]),
@@ -461,6 +479,11 @@ def _candidate_record(
         **temperature_parameters,
     }
     record.update(force_screen_metadata(diagnostics))
+    parent_metadata = molecule.get_metadata()
+    for key in ("acquisition_cohort_id", "acquisition_cohort_ordinal", "acquisition_trajectory_id",
+                "acquisition_trajectory_ordinal", "trajectory_seed"):
+        if key in parent_metadata:
+            record[key] = parent_metadata[key]
     for key in ("E_en_bias", "udd_bias_Fmax"):
         if key in diagnostics:
             record[key] = float(diagnostics[key])
@@ -573,11 +596,13 @@ def _run_md_sampling(
                 "dynamics and uncertainty evaluation skipped."
             )
             return []
-        temperature_parameters = _temperature_parameters(
-            sampler_config,
-            count=len(molecule_objects),
-            random_seed=random_seed,
-        )
+        if canonical_sampling(sampler_config):
+            seeds = [trajectory_seed(molecule, random_seed) for molecule in molecule_objects]
+            temperature_parameters = [_temperature_parameters(sampler_config, count=1, random_seed=seed)[0]
+                                      for seed in seeds]
+        else:
+            temperature_parameters = _temperature_parameters(
+                sampler_config, count=len(molecule_objects), random_seed=random_seed)
         initial_temperatures = np.asarray(
             [
                 annealing_schedule(0.0, maxt, row["Tamp"], row["Tper"], row["Tsrt"], row["Tend"])
@@ -587,7 +612,11 @@ def _run_md_sampling(
         )
         if not np.isfinite(initial_temperatures).all() or np.any(initial_temperatures < 0):
             raise ValueError("Temperature schedules must produce finite nonnegative temperatures.")
-        density_parameters = _density_parameters(sampler_config, atoms_list, random_seed)
+        if canonical_sampling(sampler_config) and sampler_config.get("end_dens") is not None:
+            density_parameters = [_density_parameters(sampler_config, [atoms], seed)[0]
+                                  for atoms, seed in zip(atoms_list, seeds)]
+        else:
+            density_parameters = _density_parameters(sampler_config, atoms_list, random_seed)
         density_histories = [[] for _ in molecule_objects]
         friction_per_fs = float(
             sampler_config.get("friction_per_fs", backend.get("friction_per_fs", DEFAULT_FRICTION_PER_FS))
@@ -595,6 +624,9 @@ def _run_md_sampling(
         validate_friction(friction_per_fs)
         if runner_factory is None:
             runner_factory = dynamics_runner(backend["backend"])
+        if canonical_sampling(sampler_config):
+            random_seed = seeds[0] if len(seeds) == 1 else int.from_bytes(
+                hashlib.sha256(json.dumps(seeds).encode()).digest()[:4], "big")
         runner = runner_factory(
             model=model,
             atoms_list=atoms_list,
@@ -899,6 +931,9 @@ def _run_md_sampling(
                 }
             )
             molecule.update_metadata(metadata)
+            if canonical_sampling(sampler_config):
+                molecule.update_metadata({"dynamics_seed": random_seed})
+                stamp_candidate_identity(molecule)
             outputs.append(molecule)
         return outputs
     finally:
@@ -925,11 +960,18 @@ def run_sampling(molecule_objects, sampler_config, model, *, properties_list=Non
     from alframework.samplers.sampling_methods import SamplingContext, sampling_method, acquisition_policy
     config = normalize_sampling_config(sampler_config)
     mode, selected = _validate_sampling_inputs(molecule_objects, config, properties_list)
+    if canonical_sampling(config) and not getattr(model, "is_sampling_model", False):
+        from alframework.ml_interfaces.sampling_inference import adapt_physical_evaluator, build_sampling_model
+        model = build_sampling_model(adapt_physical_evaluator(model, device=device), config,
+                                     properties_list=properties_list, selected_state_value=selected, device=device)
     if properties_list is not None and hasattr(model, "require_physical_states"):
         model.require_physical_states(_physical_force_states(mode, selected, properties_list))
     selected_method = method_settings(config)["method"]
     method = sampling_method(selected_method)
     acquisition = acquisition_policy(acquisition_settings(config)["method"])
+    if canonical_sampling(config) and config["acquisition"]["selection"]["mode"] == "cohort_top_k":
+        if getattr(acquisition, "retention", None) != "scalar_top_k":
+            raise ValueError("Cohort acquisition must declare scalar_top_k retention; other selectors need their own retention implementation.")
     capabilities = {"grouped_evaluation", "dynamics", "temperature_updates", "cell_updates", "independent_systems"}
     if getattr(model, "supports_member_contributions", True):
         capabilities.add("member_contributions")
@@ -957,6 +999,13 @@ def run_sampling(molecule_objects, sampler_config, model, *, properties_list=Non
         "calculator_interface": str(getattr(model, "calculator_interface", "native")),
         "calculator_loader": str(getattr(model, "calculator_loader", type(model).__name__)),
     }
+    if canonical_sampling(config):
+        metadata.update(execution_driver=driver_settings(config)["strategy"],
+                        sampling_propagator=config["sampling"]["propagator"],
+                        sampling_biases=config["sampling"]["biases"],
+                        acquisition_selection=config["acquisition"]["selection"]["mode"])
+        if getattr(model, "udd_bias_weight", None) is not None:
+            metadata.update(udd_bias_weight=float(model.udd_bias_weight), udd_bias_eps=float(model.udd_bias_eps))
     if selected_method == "udd":
         metadata.update(udd_bias_weight=float(model.udd_bias_weight), udd_bias_eps=float(model.udd_bias_eps))
     for molecule in outputs:
@@ -1006,10 +1055,23 @@ def sampling_task(molecule_objects, sampler_config, model_path, current_model_id
     config = normalize_sampling_config(sampler_config)
     mode, selected = _validate_sampling_inputs(molecule_objects, config, properties_list)
     device, device_metadata = sampling_device(config, gpus_per_node)
-    model = load_sampling_calculator(
-        sampler_config=config, ensemble_directory=model_path.format(int(current_model_id)),
-        model_mode=mode, selected_state_value=selected, ML_config=ML_config,
-        properties_list=properties_list, device=device)
+    if canonical_sampling(config):
+        from alframework.ml_interfaces.sampling_inference import load_physical_evaluator, build_sampling_model
+        from alframework.tools.batched_config import inference_settings
+        selected_inference = inference_settings(config)
+        reference = molecule_objects[0].get_metadata().get("acquisition_model_reference") or {
+            "artifact_location": model_path.format(int(current_model_id)), "generation": int(current_model_id),
+            "adapter": selected_inference["loader"], "interface": selected_inference["interface"],
+            "options": selected_inference["options"], "capabilities": {}}
+        evaluator = load_physical_evaluator(reference, model_mode=mode, selected_state_value=selected,
+            ML_config=ML_config, properties_list=properties_list, device=device)
+        model = build_sampling_model(evaluator, config, properties_list=properties_list,
+                                     selected_state_value=selected, device=device)
+    else:
+        model = load_sampling_calculator(
+            sampler_config=config, ensemble_directory=model_path.format(int(current_model_id)),
+            model_mode=mode, selected_state_value=selected, ML_config=ML_config,
+            properties_list=properties_list, device=device)
     outputs = run_sampling(molecule_objects, config, model, properties_list=properties_list,
                           device=device, master_directory=master_directory)
     for molecule in outputs:

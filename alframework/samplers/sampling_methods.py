@@ -111,6 +111,14 @@ class MLMDMethod:
         return _MDProgram(context)
 
 
+class LangevinMethod:
+    """Canonical propagator; force controls were composed before program creation."""
+    required_capabilities = frozenset({"dynamics"})
+
+    def create_program(self, context):
+        return _MDProgram(context)
+
+
 class UDDMethod:
     required_capabilities = frozenset({"dynamics", "member_contributions"})
 
@@ -137,33 +145,7 @@ class UDDMethod:
         return _MDProgram(context)
 
 
-class UncertaintyAcquisition:
-    """Current portable ALF threshold, stop/continue, and ranking semantics."""
-
-    def decide(self, observation, context):
-        from alframework.samplers.sampling import uncertainty_flags, candidate_score
-        from alframework.tools.sampling_validation import configured_score
-        config = context.config
-        diagnostics = observation.diagnostics
-        flags = uncertainty_flags(diagnostics, Escut=config["Escut"], Fscut=config["Fscut"])
-        score = configured_score(config, context.properties_list, context.state.get("selected_state"))
-        metadata = candidate_score(diagnostics, flags, score,
-                                   Escut=config["Escut"], Fscut=config["Fscut"])
-        eligible = float(observation.progress.get("time_ps", 0.)) >= float(config.get("min_time", 0.))
-        capture = bool(eligible and flags["uncertain"])
-        return AcquisitionDecision(capture, capture and config["acquisition"]["policy"] == "stop",
-                                   flags, metadata)
-
-    def select(self, candidates, context, *, final=False):
-        from alframework.samplers.sampling import _prune_candidates
-        from alframework.tools.sampling_validation import (
-            _configured_return_top_k, _configured_replica_candidate_limit,
-        )
-        if context.config["acquisition"]["policy"] == "stop":
-            return sorted(candidates, key=lambda row: int(row["record"]["batch_index"])) if final else candidates
-        return _prune_candidates(candidates, _configured_return_top_k(context.config),
-                                 _configured_replica_candidate_limit(context.config))
-
+from alframework.samplers.acquisition import UncertaintyAcquisition, SummedAcquisition
 
 def _plugin(name, builtins, required):
     if name in builtins:
@@ -178,8 +160,8 @@ def _plugin(name, builtins, required):
 
 
 def sampling_method(name):
-    return _plugin(name, {"mlmd": MLMDMethod, "udd": UDDMethod}, ("create_program",))
+    return _plugin(name, {"mlmd": MLMDMethod, "udd": UDDMethod, "langevin": LangevinMethod}, ("create_program",))
 
 
 def acquisition_policy(name):
-    return _plugin(name, {"uncertainty": UncertaintyAcquisition}, ("decide", "select"))
+    return _plugin(name, {"uncertainty": UncertaintyAcquisition, "summed": SummedAcquisition}, ("decide", "select"))

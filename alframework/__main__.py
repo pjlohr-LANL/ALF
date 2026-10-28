@@ -51,8 +51,11 @@ from alframework.tools.sampler_batching import validate_batching_config_reload
 from alframework.tools.batched_config import (
     batching_settings, dynamics_settings, portable_batching,
     unified_sampling, normalize_sampling_config, method_settings,
-    acquisition_settings, inference_settings,
+    acquisition_settings, inference_settings, canonical_sampling, cohort_selection,
 )
+from alframework.tools.acquisition_driver import CohortRuntime, current_model_reference, first_trigger_input
+from alframework.tools.workflow_io import atomic_json
+from copy import deepcopy
 #import logging
 #logging.basicConfig(level=logging.DEBUG)
 
@@ -88,6 +91,7 @@ ML_config = load_config_file(master_config['ML_config_path'], master_config['mas
 all_configs = [master_config, builder_config, sampler_config, QM_config, ML_config]
 
 lifecycle = create_run_control(master_config, all_configs)
+cohort_runtime = None
 if lifecycle and (args.test_builder or args.test_qm or args.test_sampler or
                   (args.test_ml and lifecycle.mode != 'final_training')):
     lifecycle.close()
@@ -95,11 +99,12 @@ if lifecycle and (args.test_builder or args.test_qm or args.test_sampler or
 
 
 def save_driver_status():
+    if cohort_runtime is not None:
+        cohort_runtime.pool.flush()
     if lifecycle:
         lifecycle.save(status)
     else:
-        with open(master_config['status_path'], 'w') as outfile:
-            json.dump(status, outfile, indent=2)
+        atomic_json(master_config['status_path'], status)
 
 
 # Define queues:
@@ -157,7 +162,11 @@ for cur_Exec in sampler_task.executors:
 
 def submit_sampler_batch(molecule_objects):
     """Submit a legacy single input or a compatible full/partial batch."""
-    feed = sampler_task_feed(molecule_objects, sampler_config)
+    task_config = cohort_runtime.task_config(molecule_objects, sampler_config) if cohort_runtime else sampler_config
+    feed = sampler_task_feed(molecule_objects, task_config)
+    if cohort_runtime:
+        feed['current_model_id'] = molecule_objects[0].get_metadata()['acquisition_model_reference']['generation']
+        cohort_runtime.begin_sampler(molecule_objects)
     task_input = build_input_dict(
         sampler_task.func,
         [feed, {"ML_config": ML_config}, *all_configs, status],
@@ -166,6 +175,8 @@ def submit_sampler_batch(molecule_objects):
     task = sampler_task(**task_input)
     sampler_task_queue.add_task(task)
     sampler_task_replica_counts[id(task)] = len(molecule_objects)
+    if cohort_runtime:
+        cohort_runtime.submitted_sampler(task, molecule_objects)
 
 
 def route_molecule_to_sampler(molecule):
@@ -173,6 +184,14 @@ def route_molecule_to_sampler(molecule):
     if lifecycle and lifecycle.draining:
         lifecycle.unused(molecule)
         return
+    if canonical_sampling(sampler_config):
+        reference = current_model_reference(master_config, status, sampler_config, ML_config)
+        if cohort_runtime:
+            molecule = cohort_runtime.prepare(molecule, reference, sampler_config)
+            if molecule is None:
+                return
+        else:
+            molecule = first_trigger_input(molecule, reference, sampler_config)
     for submission_group in sampler_submission_groups(
         molecule,
         sampler_config,
@@ -197,6 +216,13 @@ def current_sampler_capacity_status():
     )
 
 
+def queued_acquisition_frames():
+    pending = QM_task_queue.get_queued_number()
+    if cohort_runtime:
+        pending += cohort_runtime.pool.status().get('selected_pending_qm', 0)
+    return pending
+
+
 def refresh_sampler_driver_status():
     """Refresh all sampler fields exposed in ALF's status file."""
     status['sampler_batching'] = sampler_batch_buffer.status()
@@ -218,6 +244,9 @@ def refresh_sampler_driver_status():
     else:
         status.pop('sampler_execution', None)
     status['sampler_capacity'] = current_sampler_capacity_status()
+    if cohort_runtime:
+        status['acquisition_cohorts'] = cohort_runtime.pool.status()
+        cohort_runtime.release_finished(sampler_task_queue, QM_task_queue)
     calculator_status = configured_sampler_calculator_status(sampler_config)
     if calculator_status is None:
         status.pop('sampler_calculator', None)
@@ -239,6 +268,32 @@ if lifecycle:
 for cur_Exec in ml_task.executors:
     if cur_Exec.replace('_executor', '_standby_executor') in executor_list:
         ml_task.executors.append(cur_Exec.replace('_executor', '_standby_executor'))
+
+def submit_training(task_input):
+    """Keep trainer signatures intact and pin their inference handoff."""
+    if canonical_sampling(sampler_config):
+        generation = str(task_input['current_training_id'])
+        status.setdefault('training_handoffs', {})[generation] = {
+            'inference': inference_settings(sampler_config),
+            'ML_config': deepcopy(task_input['ML_config']),
+            'properties_list': deepcopy(master_config['properties_list'])}
+        save_driver_status()
+    task = ml_task(**task_input)
+    ML_task_queue.add_task(task)
+    return task
+
+
+def promote_model_reference(result):
+    if canonical_sampling(sampler_config):
+        from alframework.ml_interfaces.model_reference import legacy_training_reference
+        handoff = status.get('training_handoffs', {}).get(str(result[1]), {})
+        reference = legacy_training_reference(result, model_path=master_config['model_path'],
+            inference=handoff.get('inference', inference_settings(sampler_config)),
+            metadata={'ML_config': handoff.get('ML_config', ML_config),
+                      'properties_list': handoff.get('properties_list', master_config['properties_list'])})
+        if reference is not None:
+            status['current_model_reference'] = reference.as_dict()
+
 
 ##########################################
 ## Step 3: Evaluate restart possibilites #
@@ -269,6 +324,10 @@ if lifecycle:
     lifecycle.bind(status, {'builder': builder_task_queue, 'sampler': sampler_task_queue,
                            'QM': QM_task_queue, 'ML': ML_task_queue}, sampler_batch_buffer,
                    sampler_replica_counts=sampler_task_replica_counts)
+
+if cohort_selection(sampler_config) and not (args.test_builder or args.test_qm or args.test_sampler or args.test_ml):
+    cohort_runtime = CohortRuntime(master_config, sampler_config)
+    cohort_runtime.reconcile_status(master_config, status)
 
 refresh_sampler_driver_status()
 save_driver_status()
@@ -380,7 +439,7 @@ if args.test_ml:
     task_input = build_input_dict(ml_task.func,
                                   [{"ML_config": ML_config}, *all_configs, status],
                                   raise_on_fail=True)
-    ML_task_queue.add_task(ml_task(**task_input))
+    submit_training(task_input)
     status['current_training_id'] = status['current_training_id'] + 1
     save_driver_status()
     ml_result = ML_task_queue.task_list[0].result()
@@ -392,6 +451,7 @@ if args.test_ml:
         if all(network[0]) and (network[1] > status['current_model_id']):
             print('New Model: {:04d}'.format(network[1]))
             status['current_model_id'] = network[1]
+        promote_model_reference(network)
     save_driver_status()
     testing=True
     
@@ -422,6 +482,8 @@ if lifecycle.bootstrap_required if lifecycle else status['current_h5_id'] == 0 a
                                                 "sampler_config": sampler_config},
                                                *all_configs, status],
                                               raise_on_fail=True)
+                if cohort_runtime:
+                    cohort_runtime.reserve_builder(status['current_model_id'], status['current_molecule_id'] + bootstrap_width)
                 builder_task_queue.add_task(builder_task(**task_input))
                 status['current_molecule_id'] = status['current_molecule_id'] + bootstrap_width
         
@@ -491,12 +553,13 @@ if status['current_model_id'] < 0 and (not lifecycle or not lifecycle.draining):
                                   [{"ML_config": ML_config}, *all_configs, status],
                                   raise_on_fail=True)
     if not lifecycle or ML_task_queue.get_number() == 0:
-        ML_task_queue.add_task(ml_task(**task_input))
+        submit_training(task_input)
         status['current_training_id'] = status['current_training_id'] + 1
     save_driver_status()
     network = ML_task_queue.task_list[0].result()
     if all(network[0]):
         status['current_model_id'] = network[1]
+        promote_model_reference(network)
     else:
         print("Bootstrap network failed to train")
         print("User Investigation Required")
@@ -541,6 +604,8 @@ while True:
             sampler_config_new,
             sampler_batch_buffer,
         )
+        if cohort_runtime:
+            cohort_runtime.validate_reload(sampler_config_new)
         sampler_task_new = sampler_task
         if master_config_new['sampler_task'] != master_config['sampler_task']:
             sampler_task_new = load_module_from_string(
@@ -559,18 +624,36 @@ while True:
         print("Failed to re-load configuration files:")
         print(e)
     else:
+        if cohort_selection(sampler_config_new) != (cohort_runtime is not None):
+            if cohort_runtime:
+                if cohort_runtime.pool.has_open_work():
+                    raise ValueError('Cannot replace an acquisition coordinator with unfinished work.')
+                cohort_runtime.pool.close()
+                cohort_runtime = None
+            if cohort_selection(sampler_config_new):
+                cohort_runtime = CohortRuntime(master_config_new, sampler_config_new)
         master_config = master_config_new
         builder_config = builder_config_new
         sampler_config = sampler_config_new
+        if cohort_runtime and not cohort_runtime.pool.has_open_work():
+            selection = sampler_config['acquisition']['selection']
+            cohort_runtime.pool.cohort_size, cohort_runtime.pool.k = selection['cohort_size'], selection['k']
         QM_config = QM_config_new
         ML_config = ML_config_new
         sampler_task = sampler_task_new
         all_configs = [master_config, builder_config, sampler_config, QM_config, ML_config]
         refresh_sampler_driver_status()
 	
+    if cohort_runtime and (not lifecycle or lifecycle.allow_acquisition):
+        for recovered in cohort_runtime.recover_inputs(sampler_task_queue, sampler_batch_buffer):
+            capacity = current_sampler_capacity_status()
+            if capacity['available_replica_slots'] <= 0:
+                break
+            route_molecule_to_sampler(recovered)
+
     # Run more builders
     if (not lifecycle or lifecycle.allow_acquisition) and \
-            (QM_task_queue.get_queued_number() < master_config['target_queued_QM']) and \
+            (queued_acquisition_frames() < master_config['target_queued_QM']) and \
             (QM_task_queue.get_number() < master_config.get('maximum_completed_QM', 1e12)):
         while sampler_has_builder_capacity(
             current_sampler_capacity_status(),
@@ -584,6 +667,8 @@ while True:
                                             "sampler_config": sampler_config},
                                            *all_configs, status],
                                           raise_on_fail=True)
+            if cohort_runtime:
+                cohort_runtime.reserve_builder(status['current_model_id'], status['current_molecule_id'] + master_config.get('maximum_builder_structures', 1))
             builder_task_queue.add_task(builder_task(**task_input))
             status['current_molecule_id'] = status['current_molecule_id'] + master_config.get('maximum_builder_structures',1)
             
@@ -615,6 +700,8 @@ while True:
         # release its input capacity even if it returned no candidates.
         sampler_outputs_ready = True
     if sampler_outputs_ready:
+        if cohort_runtime:
+            cohort_runtime.ingest_samplers(sampler_task_queue, lifecycle=lifecycle)
         previous_sampler_tasks = list(sampler_task_queue.task_list)
         sampler_results, failed = sampler_task_queue.get_task_results()
         remaining_sampler_task_ids = {
@@ -624,7 +711,7 @@ while True:
             if id(task) not in remaining_sampler_task_ids:
                 sampler_task_replica_counts.pop(id(task), None)
         status['lifetime_failed_sampler_tasks'] = status['lifetime_failed_sampler_tasks'] + failed
-        for sampler_output in sampler_results:
+        for sampler_output in ([] if cohort_runtime else sampler_results):
             for structure in flatten_molecule_output(sampler_output):
                 if structure.get_atoms() is not None:
                     task_input = build_input_dict(qm_task.func,
@@ -633,8 +720,23 @@ while True:
                                                   raise_on_fail=True)
                     QM_task_queue.add_task(qm_task(**task_input))
 
+    if cohort_runtime and (not lifecycle or lifecycle.allow_acquisition):
+        for selected in cohort_runtime.qm_ready(QM_task_queue, recover=True):
+            if QM_task_queue.get_queued_number() >= master_config['target_queued_QM']:
+                break
+            cohort_runtime.begin_qm(selected)
+            task_input = build_input_dict(qm_task.func,
+                [{'molecule_object': selected, 'QM_config': QM_config}, master_config, *all_configs, status],
+                raise_on_fail=True)
+            future = qm_task(**task_input)
+            QM_task_queue.add_task(future)
+            cohort_runtime.submitted_qm(future, selected)
+    if cohort_runtime:
+        cohort_runtime.ingest_qm(QM_task_queue, lifecycle=lifecycle)
+
     # Train more models
     if ((QM_task_queue.get_completed_number() >= master_config['save_h5_threshold']) or
+            (cohort_runtime and cohort_runtime.pool.ready_qm_results() and QM_task_queue.get_number() == 0) or
             (lifecycle and lifecycle.draining and QM_task_queue.get_completed_number() > 0)) and (ML_task_queue.get_number() < 1):
         #print(QM_task_queue.task_list[0].result())
     	  #store_current_data(h5path, system_data, properties):
@@ -645,6 +747,9 @@ while True:
             for task_output in results_list
             for molecule in flatten_molecule_output(task_output)
         ]
+        if cohort_runtime:
+            results_list = cohort_runtime.storage_results(results_list)
+        offered_results = list(results_list)
         stored, results_list, screening_summary = (lifecycle.store if lifecycle else screen_and_store_dataset)(
             master_config['h5_path'].format(status['current_h5_id']),
             results_list,
@@ -652,6 +757,8 @@ while True:
             sampler_config,
             master_directory=master_config.get('master_directory'),
         )
+        if cohort_runtime:
+            cohort_runtime.stored(offered_results, results_list)
         status['last_dataset_screening'] = screening_summary
         print_dataset_screening_summary(screening_summary)
         if not stored:
@@ -672,7 +779,7 @@ while True:
         task_input = build_input_dict(ml_task.func,
                                       [{"ML_config": ML_config}, *all_configs, status],
                                       raise_on_fail=True)
-        ML_task_queue.add_task(ml_task(**task_input))
+        submit_training(task_input)
         status['current_training_id'] = status['current_training_id'] + 1
         
     # Update Model
@@ -683,6 +790,7 @@ while True:
             if all(network[0]) and (network[1] > status['current_model_id']):
                 print('New Model: {:04d}'.format(network[1]))
                 status['current_model_id'] = network[1]
+                promote_model_reference(network)
                 status['current_molecule_id'] = 0
     
     # Construct analysis plots
@@ -694,6 +802,9 @@ while True:
     print("builder status:")
     builder_task_queue.print_status()
     print("sampling status:")
+    if (cohort_runtime and lifecycle and lifecycle.accepted >= lifecycle.target
+            and sampler_task_queue.get_number() == 0 and builder_task_queue.get_number() == 0):
+        cohort_runtime.pool.abandon('retained-frame target reached')
     sampler_task_queue.print_status()
     refresh_sampler_driver_status()
     if sampler_uses_batches(sampler_config):

@@ -10,10 +10,19 @@ from typing import Any
 _BATCH_KEYS = frozenset({"batch_size", "partial_policy", "max_wait_seconds"})
 
 
+def canonical_sampling(config: dict[str, Any]) -> bool:
+    """Explicit independent strategy selections, distinct from draft aliases."""
+    return "driver" in config or (
+        isinstance(config.get("sampling"), dict)
+        and any(key in config["sampling"] for key in ("propagator", "biases"))
+    ) or (isinstance(config.get("acquisition"), dict) and any(
+        key in config["acquisition"] for key in ("strategy", "trajectory_policy", "selection")))
+
+
 def unified_sampling(config: dict[str, Any]) -> bool:
     """Return whether a configuration selects the independent sampler API."""
 
-    return any(name in config for name in ("sampling", "acquisition", "inference")) or (
+    return canonical_sampling(config) or any(name in config for name in ("sampling", "acquisition", "inference")) or (
         isinstance(config.get("dynamics"), dict) and "driver" in config["dynamics"]
     )
 
@@ -92,6 +101,24 @@ def dynamics_settings(config: dict[str, Any]) -> dict[str, Any]:
     """Return backend options, requiring explicit selection for portable use."""
 
     current = _block(config, "dynamics")
+    if "driver" in config:
+        selected = _block(config, "driver")
+        strategy = str(selected.get("strategy", "")).lower().strip()
+        engine = str(selected.get("engine", "")).lower().strip()
+        if strategy not in {"single", "batched"}:
+            raise ValueError("driver.strategy must explicitly select 'single' or 'batched'.")
+        if engine not in {"ase", "torchsim", "alchemi"}:
+            raise ValueError("driver.engine must explicitly select 'ase', 'torchsim', or 'alchemi'.")
+        if strategy == "batched" and engine == "ase":
+            raise ValueError("Batched execution requires TorchSim or ALCHEMI; ASE supports the single strategy.")
+        old_driver = "ase" if strategy == "single" else "batched"
+        if "driver" in current and current["driver"] != old_driver:
+            raise ValueError("Conflicting driver.strategy and dynamics.driver aliases.")
+        if "backend" in current and current["backend"] != engine:
+            raise ValueError("Conflicting driver.engine and dynamics.backend aliases.")
+        options = {key: value for key, value in selected.items() if key not in {"strategy", "engine"}}
+        return {**_merge_options(current, options, "driver"),
+                "driver": old_driver, "backend": engine, "strategy": strategy}
     if unified_sampling(config):
         driver = str(current.get("driver", "ase")).strip().lower()
         if driver not in {"ase", "batched"}:
@@ -163,12 +190,87 @@ def _named_settings(config, name, default):
 def method_settings(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve a method without importing its implementation."""
 
-    return _named_settings(config, "sampling", "mlmd")
+    if not canonical_sampling(config):
+        return _named_settings(config, "sampling", "mlmd")
+    raw = _block(config, "sampling")
+    propagator = raw.get("propagator")
+    alias = raw.get("method")
+    if propagator is None and alias in {"mlmd", "udd"}:
+        propagator = "langevin"
+    elif propagator is None and alias:
+        propagator = alias
+    if not isinstance(propagator, str) or not propagator.strip():
+        raise ValueError("sampling.propagator must explicitly select a propagator or import path.")
+    propagator = propagator.strip()
+    if alias and alias not in {"mlmd", "udd", propagator}:
+        raise ValueError("Conflicting sampling.method and sampling.propagator.")
+    biases = raw.get("biases", [])
+    if not isinstance(biases, list) or any(not isinstance(bias, dict) for bias in biases):
+        raise ValueError("sampling.biases must be a list of strategy dictionaries.")
+    biases = deepcopy(biases)
+    names = []
+    for bias in biases:
+        name = bias.get("strategy")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Each sampling bias requires a strategy name or import path.")
+        name = name.strip()
+        bias["strategy"] = name
+        names.append(name)
+        if name == "udd":
+            weight = bias.get("weight", config.get("udd_bias_weight"))
+            epsilon = bias.get("epsilon", config.get("udd_bias_eps", 1.e-12))
+            if weight is None or not math.isfinite(float(weight)):
+                raise ValueError("The UDD bias requires a finite explicit weight.")
+            if not math.isfinite(float(epsilon)) or float(epsilon) < 0:
+                raise ValueError("UDD epsilon must be finite and nonnegative.")
+            bias["weight"], bias["epsilon"] = float(weight), float(epsilon)
+    if len(names) != len(set(names)):
+        raise ValueError("Sampling bias strategies must not be duplicated.")
+    if alias == "udd" and "udd" not in names:
+        weight = config.get("udd_bias_weight", dict(raw.get("options") or {}).get("udd_bias_weight"))
+        if weight is None or not math.isfinite(float(weight)):
+            raise ValueError("UDD sampling requires udd_bias_weight or sampling.biases[].weight.")
+        biases.append({"strategy": "udd", "weight": float(weight),
+                       "epsilon": float(config.get("udd_bias_eps", 1.e-12))})
+    return {**raw, "method": propagator, "propagator": propagator, "biases": biases,
+            "options": deepcopy(raw.get("options") or {})}
 
 
 def acquisition_settings(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve acquisition independently from sampling and execution."""
 
+    if canonical_sampling(config):
+        raw = _block(config, "acquisition")
+        strategy = raw.get("strategy", raw.get("method"))
+        if not isinstance(strategy, str) or not strategy.strip():
+            raise ValueError("acquisition.strategy must explicitly select uncertainty, summed, or an import path.")
+        if raw.get("method") and raw["method"] != strategy:
+            raise ValueError("Conflicting acquisition.strategy and acquisition.method.")
+        settings = _named_settings({"acquisition": {**raw, "method": strategy}}, "acquisition", strategy)
+        settings["strategy"] = strategy
+        policy = raw.get("trajectory_policy", raw.get("policy", config.get("uncertainty_policy")))
+        if policy not in {"stop", "continue"}:
+            raise ValueError("acquisition.trajectory_policy must explicitly select 'stop' or 'continue'.")
+        for alias in (raw.get("policy"), config.get("uncertainty_policy")):
+            if alias is not None and alias != policy:
+                raise ValueError("Conflicting acquisition trajectory-policy aliases.")
+        selection = raw.get("selection")
+        if not isinstance(selection, dict):
+            raise ValueError("Explicit acquisition.selection is required; legacy return_top_k is task-local.")
+        mode = selection.get("mode")
+        if mode not in {"first_trigger", "cohort_top_k"}:
+            raise ValueError("acquisition.selection.mode must be 'first_trigger' or 'cohort_top_k'.")
+        if mode == "first_trigger" and policy != "stop":
+            raise ValueError("First-trigger selection requires trajectory_policy='stop'.")
+        if mode == "cohort_top_k":
+            for key in ("cohort_size", "k"):
+                value = selection.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(f"acquisition.selection.{key} must be an explicit positive integer.")
+            if config.get("max_candidates_per_replica") is not None:
+                raise ValueError("Cohort top-K does not apply per-trajectory quotas; remove max_candidates_per_replica.")
+        settings.update(policy=policy, trajectory_policy=policy, selection=deepcopy(selection))
+        return settings
     settings = _named_settings(config, "acquisition", "uncertainty")
     legacy = config.get("uncertainty_policy")
     current = settings.get("policy")
@@ -231,8 +333,29 @@ def normalize_sampling_config(config: dict[str, Any]) -> dict[str, Any]:
     result["uncertainty_policy"] = result["acquisition"]["policy"]
     result["dynamics"] = dynamics_settings(result)
     result["inference"] = inference_settings(config)
+    if canonical_sampling(config):
+        acquisition = result["acquisition"]
+        if acquisition["strategy"] in {"uncertainty", "summed"}:
+            mode = "sum" if acquisition["strategy"] == "summed" else "max"
+            score = dict(result.get("score") or {})
+            if "mode" in score and score["mode"] != mode:
+                raise ValueError("Conflicting acquisition.strategy and score.mode.")
+            result["score"] = {**score, "mode": mode}
+        if (any(bias["strategy"] == "udd" for bias in result["sampling"]["biases"])
+                and bool(_block(result, "gap_seeking").get("enabled", False))):
+            raise ValueError("UDD and LCM gap seeking cannot be combined in this milestone.")
     batching_settings(result)
     if (result["sampling"]["method"] == "udd" and
             bool(_block(result, "gap_seeking").get("enabled", False))):
         raise ValueError("UDD and LCM gap seeking cannot be combined in this milestone.")
     return result
+
+
+def driver_settings(config: dict[str, Any]) -> dict[str, Any]:
+    settings = dynamics_settings(config)
+    return {"strategy": "batched" if settings.get("driver", "batched") == "batched" else "single",
+            "engine": settings["backend"]}
+
+
+def cohort_selection(config: dict[str, Any]) -> bool:
+    return canonical_sampling(config) and acquisition_settings(config)["selection"]["mode"] == "cohort_top_k"

@@ -511,7 +511,7 @@ def _validate_sampling_inputs(
     from alframework.tools.batched_config import batching_settings, dynamics_settings, unified_sampling, acquisition_settings
     settings = batching_settings(sampler_config)
     portable = settings["portable"]
-    ase_driver = unified_sampling(sampler_config) and dynamics_settings(sampler_config)["driver"] == "ase"
+    ase_driver = unified_sampling(sampler_config) and dynamics_settings(sampler_config)["backend"] == "ase"
     if portable:
         dynamics_settings(sampler_config)
     if not isinstance(molecule_objects, list) or not molecule_objects:

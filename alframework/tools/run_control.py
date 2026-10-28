@@ -132,7 +132,9 @@ class JournalFuture:
                     self.control.validate_model_result(output,pickle.loads(row['input']))
                 else:
                     for index,molecule in enumerate(flatten_molecule_output(output)):
-                        molecule.update_metadata({'_workflow_origin':f'{self.key}:{index}',
+                        identity = molecule.get_metadata().get('acquisition_candidate_id',
+                                   molecule.get_metadata().get('candidate_id', f'{self.key}:{index}'))
+                        molecule.update_metadata({'_workflow_origin':identity,
                                                   '_workflow_submission':self.key,
                                                   '_workflow_phase':row['phase']})
                 self.control.db.execute('UPDATE tasks SET output=?,state=?,updated=? WHERE key=?',
