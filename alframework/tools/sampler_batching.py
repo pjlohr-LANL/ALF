@@ -18,6 +18,8 @@ from typing import Any, Iterable
 from alframework.tools.molecules_class import MoleculesObject
 from alframework.tools.batched_config import (
     batching_settings, configured_native_loader, dynamics_settings, portable_batching,
+    unified_sampling, normalize_sampling_config, method_settings,
+    acquisition_settings, inference_settings,
 )
 
 
@@ -26,8 +28,10 @@ _MISSING = object()
 
 
 def sampler_uses_batches(sampler_config: dict[str, Any]) -> bool:
-    """Return whether the configured sampler consumes molecule lists."""
+    """Return whether execution groups multiple replicas into a task."""
 
+    if unified_sampling(sampler_config):
+        return dynamics_settings(sampler_config)["driver"] == "batched"
     return portable_batching(sampler_config) or isinstance(sampler_config.get("alchemi_baoab"), dict)
 
 
@@ -185,9 +189,10 @@ def sampler_batching_signature(
         raise ValueError(
             "model_mode must be either 'ground_state' or 'excited_state'."
         )
-    if batched:
+    unified = unified_sampling(sampler_config)
+    if batched or unified:
         batch_size = sampler_batch_size(sampler_config)
-        partial_policy = sampler_partial_policy(sampler_config)
+        partial_policy = sampler_partial_policy(sampler_config) if batched else None
         selection = _configured_state_selection(sampler_config)
         state_selection = (
             None
@@ -214,12 +219,23 @@ def sampler_batching_signature(
             portable=True,
             backend=dynamics_settings(sampler_config)["backend"],
             calculator_loader=configured_native_loader(sampler_config) or sampler_config.get("ase_calculator"),
-            max_wait_seconds=sampler_max_wait_seconds(sampler_config),
+            max_wait_seconds=sampler_max_wait_seconds(sampler_config) if batched else None,
         )
     else:
         signature.update(portable=False, backend="alchemi" if batched else None,
                          calculator_loader=(configured_native_loader(sampler_config) or sampler_config.get("ase_calculator")) if batched else None,
                          max_wait_seconds=None)
+    if unified:
+        inference = inference_settings(sampler_config)
+        signature.update(
+            driver=dynamics_settings(sampler_config)["driver"],
+            sampling=method_settings(sampler_config),
+            acquisition=acquisition_settings(sampler_config),
+            inference=inference,
+            calculator_loader=inference["loader"],
+            udd_bias_weight=sampler_config.get("udd_bias_weight"),
+            udd_bias_eps=sampler_config.get("udd_bias_eps"),
+        )
     return signature
 
 
@@ -238,7 +254,8 @@ def changed_batching_signature_fields(
         new_master_config, new_sampler_config
     )
     return sorted(
-        key for key in current if current[key] != proposed[key]
+        key for key in current.keys() | proposed.keys()
+        if current.get(key, _MISSING) != proposed.get(key, _MISSING)
     )
 
 
@@ -373,6 +390,16 @@ def configured_sampler_calculator_status(
 ) -> dict[str, str] | None:
     """Describe the configured calculator for status output."""
 
+    if unified_sampling(sampler_config):
+        inference = inference_settings(sampler_config)
+        dynamics = dynamics_settings(sampler_config)
+        return {"interface": ("native" if inference["interface"] == "native" else "ase_fallback")
+                             if inference["loader"] else "unconfigured",
+                "loader": inference["loader"] or "", "driver": dynamics["driver"],
+                "backend": dynamics["backend"],
+                "sampling_method": method_settings(sampler_config)["method"],
+                "acquisition_method": acquisition_settings(sampler_config)["method"],
+                "acquisition_policy": acquisition_settings(sampler_config)["policy"]}
     if not sampler_uses_batches(sampler_config):
         return None
     native_loader = configured_native_loader(sampler_config)
@@ -488,9 +515,11 @@ def sampler_batch_key(
             "model_mode must be either 'ground_state' or 'excited_state'."
         )
     if portable_batching(sampler_config):
+        loader = (inference_settings(sampler_config)["loader"] if unified_sampling(sampler_config)
+                  else configured_native_loader(sampler_config) or str(sampler_config.get("ase_calculator", "")))
         return ("portable", mode, tuple(bool(value) for value in atoms.get_pbc()), state,
                 dynamics_settings(sampler_config)["backend"],
-                configured_native_loader(sampler_config) or str(sampler_config.get("ase_calculator", "")))
+                loader)
     return atomic_numbers, state
 
 
@@ -519,6 +548,8 @@ def sampler_task_feed(
     """Build the task feed for a legacy or strict-full sampler."""
 
     molecules = list(molecule_objects)
+    if unified_sampling(sampler_config):
+        sampler_config = normalize_sampling_config(sampler_config)
     if sampler_uses_batches(sampler_config):
         expected = sampler_batch_size(sampler_config)
         if not molecules or len(molecules) > expected or (
@@ -534,7 +565,10 @@ def sampler_task_feed(
             "sampler_config": sampler_config,
         }
     if len(molecules) != 1:
-        raise ValueError("Legacy sampler tasks accept exactly one molecule.")
+        label = "ASE" if unified_sampling(sampler_config) else "Legacy"
+        raise ValueError(f"{label} sampler tasks accept exactly one molecule.")
+    if unified_sampling(sampler_config):
+        return {"molecule_objects": molecules, "sampler_config": sampler_config}
     return {
         "molecule_object": molecules[0],
         "sampler_config": sampler_config,

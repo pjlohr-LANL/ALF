@@ -173,6 +173,17 @@ class BatchedEnsembleCalculator(torch.nn.Module):
         )
         self.supports_pbc = bool(getattr(model_config_template, "supports_pbc", False))
         self.last_diagnostics: dict[str, Any] = {}
+        self.udd_bias_weight = None
+        self.udd_bias_eps = 1.e-12
+
+    def configure_sampling_method(self, method, options=None):
+        """Select propagation controls without changing physical diagnostics."""
+        from alframework.ml_interfaces.sampling_inference import validated_method_bias
+        weight, epsilon = validated_method_bias(method, options)
+        if weight is not None and self.gap_seeking_settings.get("enabled", False):
+            raise ValueError("UDD combined with LCM switching is not supported.")
+        self.udd_bias_weight, self.udd_bias_eps = weight, epsilon
+        self._lcm_controls.clear()
 
     def require_physical_states(self, states):
         self.physical_force_states = sorted(set(int(state) for state in states))
@@ -206,6 +217,8 @@ class BatchedEnsembleCalculator(torch.nn.Module):
             raise RuntimeError(
                 "Cannot enter LCM mode when gap_seeking is disabled."
             )
+        if self.udd_bias_weight is not None:
+            raise ValueError("UDD combined with LCM switching is not supported.")
         index = int(graph_index)
         if index < 0:
             raise ValueError("LCM graph_index must be nonnegative.")
@@ -309,6 +322,7 @@ class BatchedEnsembleCalculator(torch.nn.Module):
     def forward(self, batch):
         prediction = dict(self.ensemble_forward(batch))
         energy, forces = self._normalize_contributions(batch, prediction["energy_contributions"], prediction["force_contributions"])
+        self.last_prediction = {"energy_contributions": energy.detach(), "force_contributions": forces.detach()}
         selected = self._reduce_contributions(batch, energy, forces)
         self._graph_slices = batch_slices(batch)
         self._diagnostic_force_keys = set()
@@ -322,6 +336,8 @@ class BatchedEnsembleCalculator(torch.nn.Module):
             validate_model_count(state_energy.shape[0], energy.shape[0], "Physical states must use the same ordered model count.")
             result = self._reduce_contributions(batch, state_energy, state_forces)
             state_results[state] = result
+            self.last_prediction.setdefault("state_contributions", {})[state] = {
+                "energy_contributions": state_energy.detach(), "force_contributions": state_forces.detach()}
             diagnostics.update({f"sE{state}": result["energy"], f"sE{state}_stdev": result["energy_std"],
                                 f"F{state}": result["forces"], f"F{state}_stdev": result["force_std"]})
             self._diagnostic_force_keys.update((f"F{state}", f"F{state}_stdev"))
@@ -329,6 +345,8 @@ class BatchedEnsembleCalculator(torch.nn.Module):
         for state, values in state_contributions.items():
             state_energies.setdefault(state, values["energy_contributions"])
         state_energies.setdefault(self.selected_state_value, energy)
+        self.last_prediction["state_energy_contributions"] = {
+            state: normalize_energy_contributions(batch, values).detach() for state, values in state_energies.items()}
         model_count = int(energy.shape[0])
         for row in self.gap_rows:
             lower, upper = normalize_gap_contributions(batch, state_energies, row, model_count)
@@ -364,7 +382,32 @@ class BatchedEnsembleCalculator(torch.nn.Module):
             selected_forces[atom_slice] = lcm_forces
             correction[atom_slice] = lcm_forces - .5 * (lo["forces"][atom_slice] + hi["forces"][atom_slice])
         diagnostics.update(lcm_force_diagnostics(selected_forces, physical_forces, correction, batch_ptr=ptr))
+        if self.udd_bias_weight is not None:
+            if prediction.get("uncertainty") is not None and not prediction.get("has_raw_members", False):
+                raise ValueError("UDD requires ordered ensemble-member energies and forces; aggregate uncertainty is insufficient.")
+            indices = torch.repeat_interleave(
+                torch.arange(int(batch.num_graphs), device=forces.device), batch.num_nodes_per_graph)
+            deviations = energy - selected["energy"].unsqueeze(0)
+            force_deviations = forces - selected["forces"].unsqueeze(0)
+            std = selected["energy_std"]
+            active = std > self.udd_bias_eps
+            denominator = torch.where(active, std, torch.ones_like(std))
+            bias_force = float(self.udd_bias_weight) * (
+                deviations[:, indices, None] * force_deviations).mean(dim=0)
+            bias_force = bias_force / denominator[indices, None] * active[indices, None]
+            bias_energy = float(self.udd_bias_weight) * std
+            selected_energy = selected_energy + bias_energy.reshape(-1, 1)
+            selected_forces = selected_forces + bias_force
+            from alframework.tools.force_screen import _force_maximum
+            diagnostics.update(E_en_bias=bias_energy, F_en_bias=bias_force,
+                               udd_bias_Fmax=_force_maximum(bias_force, ptr))
+            self._diagnostic_force_keys.add("F_en_bias")
         well_energy, well_forces = self._well_energy_forces(batch, batch.positions)
+        if "confinement_energy" in prediction:
+            extra_energy = prediction["confinement_energy"].reshape(-1, 1)
+            extra_forces = prediction["confinement_forces"].reshape(-1, 3)
+            well_energy = extra_energy if well_energy is None else well_energy + extra_energy
+            well_forces = extra_forces if well_forces is None else well_forces + extra_forces
         if well_energy is not None:
             selected_energy += well_energy
             selected_forces += well_forces
@@ -604,49 +647,28 @@ class ASEEnsembleModel(BatchedEnsembleCalculator):
         return energy, forces, uncertainty, state_energies, state_forces
 
     def ensemble_forward(self, batch):
+        from alframework.ml_interfaces.sampling_inference import NumpyASEEnsembleModel
         positions = batch.positions.detach().cpu().numpy()
         numbers = batch.atomic_numbers.detach().cpu().numpy()
         masses = batch.atomic_masses.detach().cpu().numpy()
-        cells = getattr(batch, "cell", None)
-        pbc = getattr(batch, "pbc", None)
-        energy_members = [[] for _ in self.calculators]
-        force_members = [[] for _ in self.calculators]
-        state_energy_members = {state: [[] for _ in self.calculators] for state in self.gap_energy_keys}
-        state_force_members = {state: [[] for _ in self.calculators] for state in self.gap_force_keys}
-        uncertainty_rows = []
-        for graph_index, atom_slice in enumerate(batch_slices(batch)):
-            cell_value = None if cells is None else cells[graph_index].detach().cpu().numpy()
-            pbc_value = False if pbc is None else pbc[graph_index].detach().cpu().numpy()
-            atoms = Atoms(numbers=numbers[atom_slice], positions=positions[atom_slice],
-                          masses=masses[atom_slice], cell=cell_value, pbc=pbc_value)
-            graph_uncertainty = None
-            for model_index, calculator in enumerate(self.calculators):
-                energy, forces, uncertainty, state_energies, state_forces = self._evaluate_one(calculator, atoms)
-                validate_ase_force_shape(forces, len(atoms), self.force_key)
-                energy_members[model_index].append(energy)
-                force_members[model_index].append(forces)
-                for state, value in state_energies.items():
-                    state_energy_members[state][model_index].append(value)
-                for state, value in state_forces.items():
-                    validate_ase_force_shape(value, len(atoms), f"F{state}")
-                    state_force_members[state][model_index].append(value)
-                if uncertainty is not None:
-                    graph_uncertainty = uncertainty
-            uncertainty_rows.append(graph_uncertainty)
+        cells, pbc = getattr(batch, "cell", None), getattr(batch, "pbc", None)
+        atoms_list = []
+        for index, selection in enumerate(batch_slices(batch)):
+            atoms_list.append(Atoms(numbers=numbers[selection], positions=positions[selection],
+                masses=masses[selection], cell=None if cells is None else cells[index].detach().cpu().numpy(),
+                pbc=False if pbc is None else pbc[index].detach().cpu().numpy()))
+        raw = NumpyASEEnsembleModel(self.calculators,
+            model_mode="ground_state" if self.energy_key == "energy" else "excited_state",
+            selected_state_value=self.selected_state_value, physical_force_states=self.physical_force_states,
+            gap_rows=self.gap_rows, gap_seeking_settings=self.gap_seeking_settings,
+            uncertainty_mode=self.uncertainty_mode).raw_ensemble_forward(atoms_list)
         def tensor(value):
-            return torch.as_tensor(value, dtype=batch.positions.dtype, device=batch.positions.device)
-        def packed_forces(members):
-            return tensor(np.stack([np.concatenate(systems, axis=0) for systems in members]))
-        prediction = {"energy_contributions": tensor(energy_members), "force_contributions": packed_forces(force_members)}
-        if state_energy_members:
-            prediction["state_energy_contributions"] = {state: tensor(values) for state, values in state_energy_members.items()}
-        if state_force_members:
-            prediction["state_contributions"] = {
-                state: {"energy_contributions": tensor(state_energy_members[state]), "force_contributions": packed_forces(values)}
-                for state, values in state_force_members.items()}
-        if all(value is not None for value in uncertainty_rows):
-            prediction["uncertainty"] = {key: [row[key] for row in uncertainty_rows] for key in ("Es", "Fs", "Fsmax")}
-        return prediction
+            if isinstance(value, dict):
+                return {key: tensor(item) for key, item in value.items()}
+            if isinstance(value, np.ndarray):
+                return torch.as_tensor(value, dtype=batch.positions.dtype, device=batch.positions.device)
+            return value
+        return tensor(raw)
 
 
 class HippynnEnsembleModel(BatchedEnsembleCalculator):

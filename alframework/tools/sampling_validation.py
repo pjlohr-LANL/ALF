@@ -508,9 +508,10 @@ def _validate_sampling_inputs(
     sampler_config: dict[str, Any],
     properties_list: dict[str, Any] | None = None,
 ) -> tuple[str, int | None]:
-    from alframework.tools.batched_config import batching_settings, dynamics_settings
+    from alframework.tools.batched_config import batching_settings, dynamics_settings, unified_sampling, acquisition_settings
     settings = batching_settings(sampler_config)
     portable = settings["portable"]
+    ase_driver = unified_sampling(sampler_config) and dynamics_settings(sampler_config)["driver"] == "ase"
     if portable:
         dynamics_settings(sampler_config)
     if not isinstance(molecule_objects, list) or not molecule_objects:
@@ -530,7 +531,7 @@ def _validate_sampling_inputs(
         raise ValueError("model_mode must be 'ground_state' or 'excited_state'.")
     validate_state_selection(sampler_config, properties_list)
     policy = str(sampler_config.get("uncertainty_policy", "stop")).strip().lower()
-    if policy not in {"stop", "continue"}:
+    if (not unified_sampling(sampler_config) or acquisition_settings(sampler_config)["method"] == "uncertainty") and policy not in {"stop", "continue"}:
         raise ValueError("uncertainty_policy must be 'stop' or 'continue'.")
     _configured_return_top_k(sampler_config)
     _configured_replica_candidate_limit(sampler_config)
@@ -546,15 +547,21 @@ def _validate_sampling_inputs(
             raise ValueError("Sampling requires nonempty systems with finite positions.")
         if not np.isfinite(atoms.get_masses()).all() or np.any(atoms.get_masses() <= 0):
             raise ValueError("Sampling requires finite positive atomic masses.")
-        if atoms.constraints:
+        if atoms.constraints and not ase_driver:
             raise NotImplementedError("Batched sampling does not yet support atom constraints.")
         boundary_conditions.add(tuple(bool(value) for value in atoms.pbc))
         if bool(np.any(atoms.get_pbc())):
             if not portable:
                 raise NotImplementedError("ALCHEMI sampling currently supports only nonperiodic systems.")
-            if not np.all(atoms.pbc) or mode != "ground_state":
+            if (not np.all(atoms.pbc) and not ase_driver) or mode != "ground_state":
                 raise NotImplementedError("Periodic batched sampling supports fully periodic ground states only.")
-            if not np.isfinite(atoms.cell).all() or not np.isfinite(atoms.get_volume()) or atoms.get_volume() <= 0:
+            if not np.isfinite(atoms.cell).all():
+                raise ValueError("Periodic sampling requires finite cell vectors.")
+            if ase_driver and not np.all(atoms.pbc):
+                vectors = np.asarray(atoms.cell)[atoms.pbc]
+                if np.linalg.matrix_rank(vectors) != int(np.sum(atoms.pbc)):
+                    raise ValueError("Periodic cell vectors must be linearly independent.")
+            elif not np.isfinite(atoms.get_volume()) or atoms.get_volume() <= 0:
                 raise ValueError("Periodic sampling requires a finite nonsingular cell.")
         numbers = tuple(int(value) for value in atoms.get_atomic_numbers())
         if reference_numbers is None:

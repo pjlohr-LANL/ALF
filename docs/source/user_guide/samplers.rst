@@ -13,8 +13,8 @@ In a master configuration, the selected sampler is specified with the
 .. code-block:: json
 
    {
-     "sampler_task": "alframework.samplers.mlmd_sampling.simple_mlmd_sampling_task",
-     "sampler_config_path": "mlmd_config.json"
+     "sampler_task": "alframework.samplers.sampling.sampling_task",
+     "sampler_config_path": "sampler_config.json"
    }
 
 Sampler tasks usually run on the ``alf_sampler_executor`` Parsl executor. GPU
@@ -31,16 +31,19 @@ Supported Sampler Tasks
    * - Sampler task
      - What it does
      - Typical use
+   * - ``alframework.samplers.sampling.sampling_task``
+     - Selects sampling method, acquisition, execution driver, and model
+       inference independently, with shared screening and candidate behavior.
+     - MLMD or UDD through ASE or batched TorchSim/ALCHEMI execution.
    * - ``alframework.samplers.mlmd_sampling.simple_mlmd_sampling_task``
      - Runs Langevin molecular dynamics with an ensemble ML calculator,
        monitors energy and force uncertainty, and returns configurations that
        exceed uncertainty or distance criteria.
      - General active-learning loops based on MD exploration.
    * - ``alframework.samplers.udd_sampling.simple_udd_sampling_task``
-     - Runs MLMD with an uncertainty-driven dynamics bias that steers
-       trajectories toward high ensemble energy uncertainty while retaining the
-       usual QM-selection threshold checks.
-     - Exploration runs where biasing MD toward model disagreement is desired.
+     - Runs legacy MLMD with a signed ensemble energy-uncertainty bias while
+       retaining the usual QM-selection threshold checks.
+     - Existing uncertainty-biased MD workflows.
    * - ``alframework.samplers.reactive_sampler.reactive_sampling``
      - Uses NEB and/or dimer-style searches from reaction metadata, monitors
        ensemble uncertainty along reaction pathways, and returns uncertain
@@ -151,12 +154,14 @@ ML calculator fields
           near the origin before sampling.
 
 Uncertainty-driven dynamics
-   Uncertainty-driven dynamics (UDD) is a biased MLMD sampler that steers
-   dynamics toward regions where the model committee has high ensemble energy
-   uncertainty. The usual ``Escut`` and ``Fscut`` threshold logic still decides
+   Uncertainty-driven dynamics (UDD) adds a configured signed ensemble
+   energy-uncertainty bias to the MD propagation energy and forces.
+   The usual ``Escut`` and ``Fscut`` threshold logic still decides
    whether a sampled configuration is returned for QM labeling.
 
-   Select UDD in ``master_config.json`` with a separate sampler task:
+   New unified configurations select ``sampling.method: udd`` while choosing
+   acquisition and execution independently; see :ref:`unified-sampling`.
+   Existing configurations can retain the legacy UDD task:
 
    .. code-block:: json
 
@@ -175,7 +180,10 @@ Uncertainty-driven dynamics
         }
       }
 
-   ``udd_bias_weight`` controls the strength of the energy-uncertainty bias.
+   ``udd_bias_weight`` controls the signed energy-uncertainty bias. The existing
+   convention is ``mean_energy + udd_bias_weight * energy_std``; a positive
+   weight adds an uncertainty energy penalty. The unified sampler preserves
+   this convention and makes UDD independent of execution and acquisition.
    Use ``simple_mlmd_sampling_task`` instead when no UDD bias is desired.
 
 Output and trajectory fields
@@ -220,8 +228,91 @@ Reactive sampler fields
         - Multiplier applied to ``Fscut`` for maximum force uncertainty. The
           default is ``3.0``.
 
+.. _unified-sampling:
+
+Unified sampling and execution
+------------------------------
+
+Use the unified task to choose a scientific method independently of the
+execution driver:
+
+.. code-block:: json
+
+   {
+     "sampler_task": "alframework.samplers.sampling.sampling_task",
+     "sampler_config_path": "sampler_config.json"
+   }
+
+The sampler configuration separates the selections:
+
+.. code-block:: json
+
+   {
+     "sampling": {"method": "udd"},
+     "acquisition": {"method": "uncertainty", "policy": "continue"},
+     "dynamics": {"driver": "batched", "backend": "torchsim"},
+     "inference": {
+       "interface": "native",
+       "loader": "alframework.ml_interfaces.batched_inference.load_hippynn_batched_model",
+       "options": {}
+     },
+     "batching": {"batch_size": 50, "partial_policy": "timeout", "max_wait_seconds": 5.0},
+     "udd_bias_weight": 0.45
+   }
+
+Retain the ordinary timestep, duration, temperature, density, uncertainty, and
+candidate settings. Changing ``dynamics.driver`` to ``ase`` retains the method
+and acquisition selections; batching and backend settings become inactive.
+ASE receives one system per task. Batched execution requires an explicit
+``torchsim`` or ``alchemi`` backend and groups compatible systems as described
+below.
+
+The new task defaults to ``sampling.method: mlmd``,
+``acquisition.method: uncertainty``, ``acquisition.policy: stop``, and
+``dynamics.driver: ase``. Existing task entrypoints keep their legacy behavior.
+New unified configurations share the portable controller's screening,
+stop/continue, ranking, and metadata rules through either driver, including
+rejecting invalid geometry before acquisition.
+
+``inference.interface: ase`` uses an existing ASE ensemble loader instead of
+native packed inference. This base ASE route does not require Torch unless
+the selected model itself requires it. Native HIPPYNN requires its optional
+Torch/HIPPYNN stack. Under batched dynamics, ASE calculator inference is
+sequential and is identified as a compatibility path in metadata. Existing
+calculator and options fields remain accepted as aliases; contradictory
+duplicate settings are rejected.
+
+UDD requires actual member energies and forces. It preserves the existing
+signed bias and epsilon behavior independently per system, excludes
+confinement from the ensemble moments, and retains unbiased physical
+diagnostics for screening and acquisition. Aggregate uncertainty alone is
+insufficient for UDD. ``udd_bias_eps`` defaults to ``1e-12``. Combining UDD and
+enabled LCM switching is rejected in this milestone; existing molecular LCM
+sampling remains available with MLMD through either driver.
+
+Temperature and density schedule timing is shared across drivers. Density
+changes scale each active system's cell and positions isotropically, preserve
+velocities, and refresh forces. Batched periodic HIPPYNN requires a fully
+periodic ground-state checkpoint with the trained cell input. ASE constraints
+and boundary conditions are checked against the ASE driver and selected model
+capabilities rather than inheriting batched-only restrictions.
+
+Method and acquisition plugins may be selected by import path. Methods own
+algorithm state and declare required capabilities; the extension interface
+allows grouped evaluations and optimization progress without assuming an MD
+clock. Reactive NEB/dimer entrypoints remain available, with full reactive
+batching deferred. Unsupported combinations fail explicitly without silently
+substituting another method or driver.
+
+See ``examples/unified_sampling/README.md`` for complete configurations, a
+Torch-free analytic ASE fixture, and the updated acceptance commands.
+
 Portable batched sampling
 -------------------------
+
+The portable task remains available for existing configurations. New workflows
+can select the unified task above to keep method and acquisition choices
+independent of execution.
 
 ``alframework.samplers.batched_sampling.batched_sampling_task`` runs ALF's shared
 acquisition policies with either ALCHEMI or TorchSim. The native HIPPYNN loader
@@ -273,6 +364,9 @@ intended AMD platform; CPU conformance alone does not establish GPU performance.
 
 ALCHEMI batched sampling
 ------------------------
+
+This section describes the legacy strict-full ALCHEMI entrypoint. The unified
+task supports ALCHEMI as a selectable batched execution backend.
 
 Select the dedicated ALCHEMI task in the master configuration. Existing MLMD,
 UDD, reactive, and NeuroChem task names continue to use their original

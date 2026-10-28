@@ -48,7 +48,11 @@ from alframework.tools.sampler_batching import sampler_task_replicas
 from alframework.tools.sampler_batching import sampler_task_feed
 from alframework.tools.sampler_batching import sampler_uses_batches
 from alframework.tools.sampler_batching import validate_batching_config_reload
-from alframework.tools.batched_config import batching_settings, dynamics_settings, portable_batching
+from alframework.tools.batched_config import (
+    batching_settings, dynamics_settings, portable_batching,
+    unified_sampling, normalize_sampling_config, method_settings,
+    acquisition_settings, inference_settings,
+)
 #import logging
 #logging.basicConfig(level=logging.DEBUG)
 
@@ -70,6 +74,9 @@ builder_config = load_config_file(master_config['builder_config_path'], master_c
 
 # Load the sampler config:
 sampler_config = load_config_file(master_config['sampler_config_path'], master_config['master_directory'])
+if (unified_sampling(sampler_config) or
+        master_config['sampler_task'] == 'alframework.samplers.sampling.sampling_task'):
+    sampler_config = normalize_sampling_config(sampler_config)
 
 # Load the QM config:
 QM_config = load_config_file(master_config['QM_config_path'], master_config['master_directory'])
@@ -200,6 +207,16 @@ def refresh_sampler_driver_status():
             max_wait_seconds=settings['max_wait_seconds'],
             backend=dynamics_settings(sampler_config)['backend'],
         )
+    if unified_sampling(sampler_config):
+        status['sampler_execution'] = {
+            'sampling': method_settings(sampler_config),
+            'acquisition': acquisition_settings(sampler_config),
+            'driver': dynamics_settings(sampler_config)['driver'],
+            'backend': dynamics_settings(sampler_config)['backend'],
+            'inference': inference_settings(sampler_config),
+        }
+    else:
+        status.pop('sampler_execution', None)
     status['sampler_capacity'] = current_sampler_capacity_status()
     calculator_status = configured_sampler_calculator_status(sampler_config)
     if calculator_status is None:
@@ -293,12 +310,7 @@ if args.test_sampler:
                 "batching.batch_size (or legacy alchemi_baoab.batch_size) "
                 "to 1 in the debug sampler config."
             )
-        sampler_feed = sampler_task_feed([test_configuration], sampler_config)
-    else:
-        sampler_feed = {
-            "molecule_object": test_configuration,
-            "sampler_config": sampler_config,
-        }
+    sampler_feed = sampler_task_feed([test_configuration], sampler_config)
     task_input = build_input_dict(sampler_task.func,
                                   [sampler_feed, {"ML_config": ML_config},
                                    *all_configs, status],
@@ -512,6 +524,9 @@ while True:
         
         # Load the sampler config:
         sampler_config_new = load_config_file(master_config_new['sampler_config_path'], master_config_new['master_directory'])
+        if (unified_sampling(sampler_config_new) or
+                master_config_new['sampler_task'] == 'alframework.samplers.sampling.sampling_task'):
+            sampler_config_new = normalize_sampling_config(sampler_config_new)
         
         # Load the QM config:
         QM_config_new = load_config_file(master_config_new['QM_config_path'], master_config_new['master_directory'])

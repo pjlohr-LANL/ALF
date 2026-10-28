@@ -9,7 +9,7 @@ from alframework.samplers.ASE_ensemble_constructor import (
     Well_Potential,
 )
 import alframework.samplers.alchemi_sampling as alchemi_module
-import alframework.samplers.batched_sampling as shared_sampling
+import alframework.samplers.sampling as shared_sampling
 from alframework.samplers.alchemi_sampling import (
     ALFASEAlchemiModel,
     ALFAlchemiCalculator,

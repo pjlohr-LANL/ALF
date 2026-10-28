@@ -19,7 +19,7 @@ import subprocess
 import time
 
 import numpy as np
-from ase import Atoms
+from ase import Atoms, units
 from ase.io import read
 
 
@@ -59,7 +59,7 @@ def fingerprint(path):
     return {"path": str(Path(path).resolve()), "sha256": digest.hexdigest()}
 
 
-def synthetic_model(device):
+def synthetic_model(device, *, sampling_method="mlmd"):
     import torch
     from alframework.ml_interfaces.batched_inference import BatchedEnsembleCalculator
 
@@ -67,9 +67,14 @@ def synthetic_model(device):
         def ensemble_forward(self, batch):
             energies = batch.positions.new_zeros(batch.num_graphs)
             energies.index_add_(0, batch.system_idx, .5 * batch.positions.square().sum(dim=1))
+            # UDD acceptance needs disagreement in forces as well as energies;
+            # constant member offsets alone would produce a zero bias force.
+            spread = .1 if sampling_method == "udd" else 0.
             return {
-                "energy_contributions": torch.stack([energies - .01, energies + .01]),
-                "force_contributions": torch.stack([-batch.positions, -batch.positions]),
+                "energy_contributions": torch.stack([(1-spread)*energies - .01,
+                                                       (1+spread)*energies + .01]),
+                "force_contributions": torch.stack([-(1-spread)*batch.positions,
+                                                      -(1+spread)*batch.positions]),
             }
 
     return HarmonicEnsemble(selected_state_value=0, device=device)
@@ -105,7 +110,8 @@ def load_checkpoint(args, device):
         str(Path(args.ensemble_directory).resolve()), model_mode=mode,
         selected_state_value=selected, ML_config=ml_config,
         properties_list=master["properties_list"], sampler_config=sampler_config,
-        device=device, **dict(sampler_config.get("batched_calculator_options") or {}),
+        device=device, **dict(sampler_config.get("inference", {}).get("options") or
+                              sampler_config.get("batched_calculator_options") or {}),
     )
     return model
 
@@ -153,8 +159,80 @@ def verify_individual_predictions(model, atoms_list, device, *, rtol, atol):
             "max_diagnostic_errors": max_diagnostic_errors}
 
 
+class RunnerGroup:
+    """Serial singleton ASE tasks or one native batched trajectory group."""
+
+    def __init__(self, runner_type, model, atoms_list, *, driver, **options):
+        self.driver = driver
+        self.runners = []
+        groups = [[atoms] for atoms in atoms_list] if driver == "ase" else [atoms_list]
+        for index, group in enumerate(groups):
+            current = dict(options)
+            temperatures = np.asarray(options["temperature_K"], dtype=float)
+            current["temperature_K"] = (np.full(len(group), float(temperatures))
+                                          if temperatures.ndim == 0 else
+                                          temperatures[index:index+1] if driver == "ase" else temperatures)
+            current["random_seed"] = int(options["random_seed"]) + index
+            self.runners.append(runner_type(model=model, atoms_list=group, **current))
+
+    def run(self, steps):
+        for runner in self.runners:
+            runner.run(steps)
+
+    def _target(self, index):
+        return (self.runners[index], 0) if self.driver == "ase" else (self.runners[0], index)
+
+    def sync_graph_to_atoms(self, index, atoms):
+        runner, graph = self._target(index)
+        runner.sync_graph_to_atoms(graph, atoms)
+
+    def freeze_graph(self, index):
+        runner, graph = self._target(index)
+        runner.freeze_graph(graph)
+
+    def set_cell(self, index, cell):
+        runner, graph = self._target(index)
+        runner.set_cell(graph, cell)
+
+    def set_temperature(self, temperatures):
+        if self.driver == "ase":
+            for runner, temperature in zip(self.runners, temperatures):
+                runner.set_temperature([temperature])
+        else:
+            self.runners[0].set_temperature(temperatures)
+
+
+def verify_analytic_step(model, atoms_list, runner_type, *, driver, device, dt_fs,
+                         stiffness, rtol, atol):
+    """Check physical eV/Å/amu/fs dynamics independently of prediction parity."""
+    runner = RunnerGroup(runner_type, model, atoms_list, driver=driver,
+                         dt_fs=dt_fs, temperature_K=0., friction_per_fs=0.,
+                         random_seed=42, device=device)
+    h = dt_fs * units.fs
+    max_position_error = max_velocity_error = 0.
+    for index, initial in enumerate(atoms_list):
+        restored = initial.copy()
+        runner.sync_graph_to_atoms(index, restored)
+        np.testing.assert_allclose(restored.get_kinetic_energy(), initial.get_kinetic_energy(),
+                                   rtol=rtol, atol=atol)
+    runner.run(1)
+    for index, initial in enumerate(atoms_list):
+        restored = initial.copy()
+        runner.sync_graph_to_atoms(index, restored)
+        masses = initial.get_masses()[:, None]
+        first_force = -stiffness * initial.positions
+        expected_positions = initial.positions + h * initial.get_velocities() + .5 * h*h * first_force / masses
+        expected_velocities = initial.get_velocities() + .5 * h * (first_force - stiffness*expected_positions) / masses
+        np.testing.assert_allclose(restored.positions, expected_positions, rtol=rtol, atol=atol)
+        np.testing.assert_allclose(restored.get_velocities(), expected_velocities, rtol=rtol, atol=atol)
+        max_position_error = max(max_position_error, float(np.max(np.abs(restored.positions-expected_positions))))
+        max_velocity_error = max(max_velocity_error, float(np.max(np.abs(restored.get_velocities()-expected_velocities))))
+    return {"max_position_error_A": max_position_error,
+            "max_velocity_error_ASE": max_velocity_error, "kinetic_energy_roundtrip": True}
+
+
 def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iterations, dt_fs,
-             temperature_K, parity_rtol, parity_atol):
+             temperature_K, parity_rtol, parity_atol, driver="batched", analytic_stiffness=None):
     import torch
     from alframework.ml_interfaces.batched_inference import PackedBatch
 
@@ -170,21 +248,32 @@ def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iteration
         return torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
 
     parity = verify_individual_predictions(model, atoms_list, device, rtol=parity_rtol, atol=parity_atol)
+    analytic_step = (verify_analytic_step(model, atoms_list, runner_type, driver=driver,
+                                         device=device, dt_fs=dt_fs, stiffness=analytic_stiffness,
+                                         rtol=parity_rtol, atol=parity_atol)
+                     if analytic_stiffness is not None else None)
     batch = PackedBatch.from_atoms(atoms_list, device=device)
+    inference_batches = ([PackedBatch.from_atoms([atoms], device=device) for atoms in atoms_list]
+                         if driver == "ase" else [batch])
+
+    def evaluate():
+        for current in inference_batches:
+            model(current)
+
     for _ in range(warmup):
-        model(batch)
+        evaluate()
     synchronize()
     reset_peak()
     start = time.perf_counter()
     for _ in range(iterations):
-        model(batch)
+        evaluate()
     synchronize()
     inference_seconds = time.perf_counter() - start
     inference_peak = peak()
     start = time.perf_counter()
-    runner = runner_type(model=model, atoms_list=atoms_list, dt_fs=dt_fs,
-                         temperature_K=np.full(len(atoms_list), temperature_K),
-                         friction_per_fs=.01, random_seed=42, device=device)
+    runner = RunnerGroup(runner_type, model, atoms_list, driver=driver, dt_fs=dt_fs,
+                         temperature_K=temperature_K, friction_per_fs=.01,
+                         random_seed=42, device=device)
     synchronize()
     initialization_seconds = time.perf_counter() - start
     runner.run(warmup)
@@ -218,6 +307,8 @@ def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iteration
         density_checked = True
     return {
         "systems": len(atoms_list), "atoms": sum(len(atoms) for atoms in atoms_list),
+        "execution_driver": driver,
+        "inference_execution": "serial_systems" if driver == "ase" else "packed_systems",
         "inference_dtype": str(batch.positions.dtype),
         "inference_iterations": iterations, "inference_seconds": inference_seconds,
         "inference_systems_per_second": len(atoms_list) * iterations / inference_seconds,
@@ -227,13 +318,19 @@ def run_case(model, atoms_list, runner_type, *, device, steps, warmup, iteration
         "inference_peak_allocated_bytes": inference_peak,
         "dynamics_peak_allocated_bytes": dynamics_peak,
         "acceptance": {"prediction_parity": parity, "independent_freeze": True,
-                       "density_scaling": density_checked},
+                       "density_scaling": density_checked, "analytic_one_step": analytic_step},
     }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("alchemi", "torchsim"), required=True)
+    parser.add_argument("--driver", choices=("ase", "batched"), default="batched")
+    parser.add_argument("--backend", choices=("alchemi", "torchsim"),
+                        help="Required for batched execution; ignored for ASE")
+    parser.add_argument("--sampling-method", choices=("mlmd", "udd"), default="mlmd")
+    parser.add_argument("--udd-bias-weight", type=float,
+                        help="Explicit signed energy-uncertainty bias weight, required for UDD")
+    parser.add_argument("--udd-bias-eps", type=float, default=1e-12)
     parser.add_argument("--device", default="cuda:0", help="PyTorch device; cuda:0 also names an AMD ROCm GPU")
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 2, 8, 32, 50])
     parser.add_argument("--steps", type=int, default=20)
@@ -252,6 +349,14 @@ def main(argv=None):
     parser.add_argument("--periodic", action="store_true", help="Use periodic structures in analytic mode")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.driver == "batched" and args.backend is None:
+        parser.error("Batched execution requires --backend alchemi or torchsim")
+    if args.sampling_method == "udd" and args.udd_bias_weight is None:
+        parser.error("UDD acceptance requires an explicit --udd-bias-weight")
+    if args.udd_bias_weight is not None and not math.isfinite(args.udd_bias_weight):
+        parser.error("UDD bias weight must be finite")
+    if not math.isfinite(args.udd_bias_eps) or args.udd_bias_eps < 0:
+        parser.error("UDD bias epsilon must be finite and nonnegative")
     if bool(args.master) != bool(args.ensemble_directory):
         parser.error("--master and --ensemble-directory must be provided together")
     if args.master and not args.structures:
@@ -267,26 +372,41 @@ def main(argv=None):
         parser.error("The requested GPU is unavailable; use --device cpu for an explicit CPU check")
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    if args.backend == "alchemi" and torch.version.hip:
+    if args.driver == "batched" and args.backend == "alchemi" and torch.version.hip:
         parser.error("ALCHEMI uses NVIDIA GPU operations; select torchsim for ROCm acceptance")
     if torch.version.hip:
         import hippynn
         hippynn.custom_kernels.set_custom_kernels(False)
-    if args.backend == "alchemi":
+    if args.driver == "ase":
+        from alframework.samplers.ase_sampling import ASEDynamicsRunner as Runner
+    elif args.backend == "alchemi":
         from alframework.samplers.alchemi_sampling import AlchemiDynamicsRunner as Runner
     else:
         from alframework.samplers.torchsim_sampling import TorchSimDynamicsRunner as Runner
     structures = read(args.structures, index=":") if args.structures else synthetic_structures(args.periodic)
-    model = load_checkpoint(args, device) if args.master else synthetic_model(device)
+    model = (load_checkpoint(args, device) if args.master else
+             synthetic_model(device, sampling_method=args.sampling_method))
+    if args.sampling_method == "udd":
+        configuration = getattr(args, "_configuration", {})
+        if configuration.get("sampler_config", {}).get("gap_seeking", {}).get("enabled"):
+            parser.error("UDD combined with LCM switching is outside this acceptance milestone")
+        model.configure_sampling_method("udd", {
+            "udd_bias_weight": args.udd_bias_weight, "udd_bias_eps": args.udd_bias_eps,
+        })
     records = []
     for size in args.batch_sizes:
         atoms_list = [structures[index % len(structures)].copy() for index in range(size)]
         records.append(run_case(model, atoms_list, Runner, device=device, steps=args.steps,
                                 warmup=args.warmup, iterations=args.inference_iterations,
                                 dt_fs=args.dt_fs, temperature_K=args.temperature_K,
-                                parity_rtol=args.parity_rtol, parity_atol=args.parity_atol))
+                                parity_rtol=args.parity_rtol, parity_atol=args.parity_atol,
+                                driver=args.driver,
+                                analytic_stiffness=(None if args.master else
+                                    1 + (.1 * args.udd_bias_weight if args.sampling_method == "udd" else 0.))))
     result = {
-        "schema": "alf.portable_batched_acceptance.v1", "backend": args.backend,
+        "schema": "alf.portable_batched_acceptance.v1",
+        "backend": args.backend if args.driver == "batched" else "ase",
+        "execution_driver": args.driver, "sampling_method": args.sampling_method,
         "model": "hippynn_checkpoint" if args.master else "synthetic_harmonic",
         "ensemble_directory": str(Path(args.ensemble_directory).resolve()) if args.ensemble_directory else None,
         "hardware_validation": device.type == "cuda", "environment": environment(torch, device),
@@ -294,6 +414,8 @@ def main(argv=None):
         "parameters": {"dt_fs": args.dt_fs, "temperature_K": args.temperature_K,
                        "warmup_steps": args.warmup, "selected_state": args.selected_state,
                        "inference_dtype": records[0]["inference_dtype"],
+                       "udd_bias_weight": args.udd_bias_weight if args.sampling_method == "udd" else None,
+                       "udd_bias_eps": args.udd_bias_eps if args.sampling_method == "udd" else None,
                        "parity_rtol": args.parity_rtol, "parity_atol": args.parity_atol},
         "configuration": getattr(args, "_configuration", None),
         "structures": fingerprint(args.structures) if args.structures else None,
